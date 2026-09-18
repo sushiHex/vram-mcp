@@ -17,18 +17,38 @@ from ._util import run_capture
 from .observations import Observation
 from . import nvml as _nvml
 
+# One CIM filter clause is ~20 characters, and a Windows command line is capped
+# near 32 KiB. A selected GPU has tens of processes, so this ceiling is far
+# above anything real; it exists so that a caller passing something absurd
+# truncates into the module's ordinary "identity unavailable" state instead of
+# failing the whole subprocess with an opaque argument error.
+_MAX_FILTER_PIDS = 512
+
+
+def _filter_pids(pids) -> list[int]:
+    """The PIDs one identity query may carry: real integers, bounded, sorted.
+
+    Non-integers are DROPPED rather than coerced. This module promises never to
+    raise, and ``int("abc")`` would break that promise for a value NVML cannot
+    produce — a caller who hands us junk should get identity-less rows, which is
+    already a supported outcome, not a traceback. ``bool`` is excluded because
+    ``isinstance(True, int)`` is True and ``ProcessId=1`` is not what was meant.
+    """
+    real = {p for p in pids
+            if isinstance(p, int) and not isinstance(p, bool) and p >= 0}
+    return sorted(real)[:_MAX_FILTER_PIDS]
+
+
 # The query is deliberately identity-only: Windows GPU Process Memory counters
 # aggregate adapters and cannot prove attribution to the selected GPU. NVML owns
 # the selected-GPU PID set; this one bounded CIM query only enriches those PIDs.
-def _win_gpu_identity_ps(pids) -> str:
-    pid_filter = " OR ".join(
-        f"ProcessId={int(pid)}" for pid in sorted(set(pids))
-    )
+def _win_gpu_identity_ps(pids: list[int]) -> str:
+    pid_filter = " OR ".join(f"ProcessId={pid}" for pid in pids)
     return (
         f"Get-CimInstance Win32_Process -Filter '{pid_filter}' "
         "-EA SilentlyContinue | "
         "ForEach-Object { "
-        "'{0}||||{1}|{2}' -f $_.ProcessId,$_.Name,$_.CommandLine }"
+        "'{0}|{1}|{2}' -f $_.ProcessId,$_.Name,$_.CommandLine }"
     )
 
 
@@ -45,18 +65,21 @@ def win_gpu_procs(pids=(), timeout: int = 10) -> list[dict]:
     an empty set performs no subprocess call. Missing or failed identity data
     returns ``[]`` so callers retain the known NVML inventory with null names.
     """
-    if sys.platform != "win32" or not pids:
+    if sys.platform != "win32":
         return []
-    out_text = _run_powershell(_win_gpu_identity_ps(pids), timeout)
+    wanted = _filter_pids(pids)
+    if not wanted:
+        return []
+    out_text = _run_powershell(_win_gpu_identity_ps(wanted), timeout)
     if not out_text:
         return []
     procs = []
     for line in out_text.splitlines():
         # cmdline is last and unsplit: a command line may itself contain '|'.
-        parts = line.strip().split("|", 5)
-        if len(parts) != 6 or not parts[0].isdigit():
+        parts = line.strip().split("|", 2)
+        if len(parts) != 3 or not parts[0].isdigit():
             continue
-        pid, _dedicated, _shared, _non_local, name, cmdline = parts
+        pid, name, cmdline = parts
         procs.append({
             "pid": int(pid),
             "size_mb": None,

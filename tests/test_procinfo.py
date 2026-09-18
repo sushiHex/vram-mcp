@@ -139,8 +139,8 @@ def test_observe_processes_propagates_nvml_query_coverage():
 
 
 def test_win_gpu_procs_queries_only_selected_pids(monkeypatch):
-    fake = ("11924||||python.exe|python.exe train_lora_kg.py\n"
-            "1336||||dwm.exe|dwm.exe\n")
+    fake = ("11924|python.exe|python.exe train_lora_kg.py\n"
+            "1336|dwm.exe|dwm.exe\n")
     calls = []
     monkeypatch.setattr(procinfo, "_run_powershell",
                         lambda cmd, timeout: calls.append(cmd) or fake)
@@ -161,8 +161,8 @@ def test_win_gpu_procs_empty_pid_set_skips_reader(monkeypatch):
 
 
 def test_win_gpu_procs_keeps_pipe_in_cmdline(monkeypatch):
-    # cmdline is last so split("|", 5) leaves its own pipes intact.
-    out = "42|1048576|0|0|sh.exe|sh -c 'a | b | c'\n"
+    # cmdline is last so split("|", 2) leaves its own pipes intact.
+    out = "42|sh.exe|sh -c 'a | b | c'\n"
     monkeypatch.setattr(procinfo, "_run_powershell", lambda cmd, timeout: out)
     monkeypatch.setattr(procinfo.sys, "platform", "win32")
     (row,) = procinfo.win_gpu_procs([42])
@@ -170,10 +170,41 @@ def test_win_gpu_procs_keeps_pipe_in_cmdline(monkeypatch):
 
 
 def test_win_gpu_procs_skips_malformed_lines(monkeypatch):
-    out = "not-a-pid|1|2|3|x|y\n7|1048576|0|0|a.exe|a\nshort|line\n"
+    out = "not-a-pid|x|y\n7|a.exe|a\nshort-line\n"
     monkeypatch.setattr(procinfo, "_run_powershell", lambda cmd, timeout: out)
     monkeypatch.setattr(procinfo.sys, "platform", "win32")
     assert [r["pid"] for r in procinfo.win_gpu_procs([7])] == [7]
+
+
+def test_win_gpu_procs_never_raises_on_non_integer_pids(monkeypatch):
+    """The module promises to degrade, not raise. Coercing would break that
+    for values NVML cannot produce, so junk PIDs are dropped instead."""
+    monkeypatch.setattr(procinfo.sys, "platform", "win32")
+    monkeypatch.setattr(procinfo, "_run_powershell",
+                        lambda *args: (_ for _ in ()).throw(AssertionError(
+                            "no query should run when nothing is usable")))
+    for junk in (["abc"], [None], [1.5], [{}], [True], [-1]):
+        assert procinfo.win_gpu_procs(junk) == []
+
+
+def test_win_gpu_procs_queries_only_the_usable_pids(monkeypatch):
+    """A usable PID alongside junk still gets its identity."""
+    calls = []
+    monkeypatch.setattr(procinfo, "_run_powershell",
+                        lambda cmd, timeout: calls.append(cmd) or "7|a.exe|a\n")
+    monkeypatch.setattr(procinfo.sys, "platform", "win32")
+    (row,) = procinfo.win_gpu_procs([7, "abc", None])
+    assert row["pid"] == 7
+    assert calls[0].count("ProcessId=") == 1
+
+
+def test_win_gpu_identity_filter_is_bounded(monkeypatch):
+    """Past the cap the query truncates into "identity unavailable" for the
+    excess, rather than building a command line Windows will reject."""
+    pids = list(range(1000, 1000 + procinfo._MAX_FILTER_PIDS + 50))
+    command = procinfo._win_gpu_identity_ps(procinfo._filter_pids(pids))
+    assert command.count("ProcessId=") == procinfo._MAX_FILTER_PIDS
+    assert len(command) < 32767
 
 
 def test_win_gpu_procs_empty_off_windows(monkeypatch):
