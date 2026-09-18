@@ -47,8 +47,23 @@ def _operation_scope(record: dict) -> str:
     return nonblank_text(record.get("scope", _DEFAULT_SCOPE), "scope")
 
 
-def _valid_operation(record: object) -> bool:
-    """Check one operation without making the rest of the ledger unusable."""
+_LIFECYCLES = ("in_flight", "unknown")
+_OUTCOMES = ("succeeded", "refused", "failed", "unknown")
+
+
+def _identifiable_operation(record: object) -> bool:
+    """Can this record be HONOURED — do we know what it protects, until when?
+
+    Deliberately narrower than "do we understand it". A record written by a
+    newer version may use a lifecycle or outcome this one has never heard of,
+    which makes it uninterpretable, not ignorable: it still names a model, a
+    scope and a lease. Dropping it would delete another process's in-flight
+    protection and let this process evict straight past it — the one thing a
+    ledger shared across versions must never do.
+
+    Only a record whose identity or lease cannot be read at all is discarded,
+    because there is then nothing left to honour.
+    """
     try:
         if not isinstance(record, dict):
             raise ValueError
@@ -63,29 +78,36 @@ def _valid_operation(record: object) -> bool:
         expires_at = _parse_iso(record["expires_at"])
         if expires_at.tzinfo is None:
             raise ValueError
-        pending_until = record.get("pending_until")
-        if pending_until is not None and not isinstance(pending_until, str):
-            raise ValueError
-        lifecycle = record.get("lifecycle")
-        if lifecycle is not None and lifecycle not in ("in_flight", "unknown"):
-            raise ValueError
-        retry_count = record.get("retry_count", 0)
-        if isinstance(retry_count, bool) or not isinstance(retry_count, int) or retry_count < 0:
-            raise ValueError
-        outcome = record.get("outcome")
-        if outcome is not None and outcome not in ("succeeded", "refused", "failed", "unknown"):
-            raise ValueError
-        for key in ("reason", "retry_after"):
-            value = record.get(key)
-            if value is not None and not isinstance(value, str):
-                raise ValueError
     except (KeyError, TypeError, ValueError):
         return False
     return True
 
 
+def _interpretable_operation(record: dict) -> bool:
+    """Does THIS version understand the record's lifecycle vocabulary?
+
+    False means a newer writer used terms we do not have. The record is still
+    honoured; we decline to describe its lifecycle, outcome and retry state
+    rather than guess at them — reporting a foreign state as ``in_flight``
+    would be a claim about work we cannot actually see.
+    """
+    if record.get("lifecycle") not in (None, *_LIFECYCLES):
+        return False
+    if record.get("outcome") not in (None, *_OUTCOMES):
+        return False
+    retry_count = record.get("retry_count", 0)
+    if isinstance(retry_count, bool) or not isinstance(retry_count, int) or retry_count < 0:
+        return False
+    return all(isinstance(record.get(key), (str, type(None)))
+               for key in ("pending_until", "reason", "retry_after"))
+
+
 def _load(path: Path) -> dict:
-    """Read the ledger, retaining claims when an operation record is bad."""
+    """Read the ledger, retaining claims when an operation record is bad.
+
+    Operations survive on identity alone, so a record this version cannot
+    interpret round-trips intact instead of being erased by the next write.
+    """
     try:
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -101,7 +123,7 @@ def _load(path: Path) -> dict:
     operations = data.get("operations", [])
     if not isinstance(operations, list):
         raise ValueError(f"claim ledger has invalid operations: {path}")
-    data["operations"] = [record for record in operations if _valid_operation(record)]
+    data["operations"] = [r for r in operations if _identifiable_operation(r)]
     return data
 
 
@@ -158,27 +180,34 @@ def _operation_is_live(path: Path, record: dict) -> bool:
 
 
 def _operation_view(path: Path, record: dict, now: datetime) -> dict:
-    """Project a ledger operation into the stable agent-facing status shape."""
+    """Project a ledger operation into the stable agent-facing status shape.
+
+    ``lifecycle`` is ``"unrecognized"`` for a record this version cannot
+    interpret. Its identity, scope and lease are still reported — that is what
+    a caller needs in order to wait — while the interpretive fields stay null
+    rather than being coerced into a state we did not observe.
+    """
     expires_at = _parse_iso(record["expires_at"])
     owner_live = _operation_is_live(path, record)
-    lifecycle = record.get("lifecycle")
-    if lifecycle not in ("in_flight", "unknown"):
+    if not _interpretable_operation(record):
+        lifecycle = "unrecognized"
+    elif record.get("lifecycle") in _LIFECYCLES:
+        lifecycle = record["lifecycle"]
+    else:
         lifecycle = "in_flight"
     pending_until = record.get("pending_until")
     if not isinstance(pending_until, str) or not pending_until.strip():
         pending_until = record["expires_at"]
-    outcome = record.get("outcome")
-    if lifecycle == "unknown":
-        outcome = "unknown"
-    else:
-        outcome = None
+    outcome = "unknown" if lifecycle == "unknown" else None
     retry_count = record.get("retry_count", 0)
     if isinstance(retry_count, bool) or not isinstance(retry_count, int) or retry_count < 0:
         retry_count = 0
-    if lifecycle == "unknown":
-        retry_after = pending_until
-    else:
-        retry_after = None
+    retry_after = pending_until if lifecycle == "unknown" else None
+    reason = record.get("reason")
+    if not isinstance(reason, str):
+        # A foreign record may carry any shape here; the schema promises a
+        # string or null, and guessing at a translation would be worse.
+        reason = None
     return {
         "operation_id": record["operation_id"],
         "model": canonical_model(record["model"]),
@@ -191,7 +220,7 @@ def _operation_view(path: Path, record: dict, now: datetime) -> dict:
         "owner_live": owner_live,
         "lease_expired": now >= expires_at,
         "outcome": outcome,
-        "reason": record.get("reason"),
+        "reason": reason,
         "retry_count": retry_count,
         "retry_after": retry_after,
     }
