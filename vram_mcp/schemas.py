@@ -12,7 +12,10 @@ from typing_extensions import TypedDict
 
 
 Outcome = Literal["succeeded", "refused", "failed", "unknown"]
-OperationLifecycle = Literal["in_flight", "unknown"]
+# "unrecognized" is a record this version cannot interpret — written by a newer
+# protocol, and reported rather than hidden so a caller can see what is holding
+# the model even when its state vocabulary is foreign.
+OperationLifecycle = Literal["in_flight", "unknown", "unrecognized"]
 
 
 class ClaimEntry(TypedDict):

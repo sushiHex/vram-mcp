@@ -226,6 +226,29 @@ def test_nested_attempts_match_the_residency_schema(monkeypatch):
         assert set(attempt) == declared
 
 
+def test_foreign_operation_validates_against_the_published_schema(monkeypatch, tmp_path):
+    """A lifecycle value claims.py can emit but schemas.py does not declare
+    would be rejected at call time, turning a preserved record into a failed
+    tool call. Pin the two together on the path that carries them."""
+    import json
+
+    ledger = tmp_path / "claims.json"
+    ledger.write_text(json.dumps({"claims": [], "operations": [{
+        "operation_id": "future-op", "model": "m:1", "kind": "unload",
+        "scope": "gpu:index=0", "started_at": "2026-09-18T00:00:00Z",
+        "expires_at": "2099-01-01T00:00:00Z",
+        "lifecycle": "draining", "outcome": "partially_evicted",
+        "reason": {"structured": "not a string"}, "retry_count": "three",
+    }]}), encoding="utf-8")
+    monkeypatch.setattr(server._claims, "_DEFAULT_PATH", ledger)
+
+    result = server._list_claims_impl(None)
+    (operation,) = result["operations"]
+    assert operation["lifecycle"] == "unrecognized"
+    tool = server.mcp._tool_manager.get_tool("list_claims")
+    tool.fn_metadata.output_model.model_validate(result)
+
+
 def test_every_schema_bearing_tool_is_covered():
     """A new coordination tool cannot ship without a contract case here."""
     with_schemas = {

@@ -81,7 +81,7 @@ entry has this stable shape:
 | `operation_id` | Stable identifier for the mutation attempt. |
 | `model`, `kind`, `scope` | Canonical model, mutation kind (`warm` or `unload`), and selected GPU scope. |
 | `started_at`, `expires_at`, `pending_until` | ISO timestamps. `pending_until` is the current retry boundary and normally equals `expires_at`. |
-| `lifecycle` | `in_flight` while the owner may still be doing backend work; `unknown` after the backend result could not be established. |
+| `lifecycle` | `in_flight` while the owner may still be doing backend work; `unknown` after the backend result could not be established; `unrecognized` for a record written by a newer vram-mcp whose state vocabulary this version lacks. |
 | `owner_live` | Whether the operation's OS owner lock is currently held. |
 | `lease_expired` | Whether the wall-clock lease has elapsed; this never overrides `owner_live`. |
 | `outcome`, `reason` | `null` while in flight; `unknown` and the retained reason for an uncertain operation. |
@@ -167,6 +167,15 @@ If the returned operation has `lifecycle="unknown"`, `outcome="unknown"`, and
 retry only if the operation is gone or no longer blocks the model. If it has
 `lifecycle="in_flight"` and `owner_live=true`, wait for the live owner even when
 `lease_expired=true`.
+
+`lifecycle="unrecognized"` means another vram-mcp version wrote the record and
+this one cannot read its state vocabulary. Treat it exactly like `in_flight`:
+the operation still holds the model, `owner_live` and `expires_at` are still
+accurate, and its lease still expires normally. Only the interpretive fields
+(`outcome`, `reason`, `retry_count`, `retry_after`) are withheld, because this
+version would be guessing at them. A record is never discarded merely for being
+unrecognized — deleting it would release protection another process is relying
+on, and this version's write-back preserves it untouched.
 
 Warm admission also consumes shared selected-GPU capacity, so only one warm may
 pass admission at a time per GPU scope, even when the model names differ. A new

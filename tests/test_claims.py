@@ -500,6 +500,90 @@ def test_malformed_existing_operation_is_discarded_without_losing_claims(tmp_pat
     assert [r["claim_id"] for r in on_disk["claims"]] == ["claim"]
 
 
+# A record written by a LATER protocol version: identity and lease are readable,
+# but its lifecycle, outcome and retry vocabulary are ones this version lacks.
+_FOREIGN_OPERATION = {
+    "operation_id": "future-op", "model": "model:latest", "kind": "unload",
+    "scope": "gpu:index=0", "started_at": "2026-07-13T17:59:00Z",
+    "expires_at": "2026-07-13T19:00:00Z",
+    "lifecycle": "draining", "outcome": "partially_evicted",
+    "reason": {"structured": "not a string"}, "retry_count": "three",
+    "some_future_field": {"nested": 1},
+}
+
+
+def _ledger_with_foreign_operation(path):
+    path.write_text(json.dumps({"claims": [], "operations": [_FOREIGN_OPERATION]}),
+                    encoding="utf-8")
+    return path
+
+
+def test_foreign_operation_survives_a_load_mutate_save_cycle(tmp_path):
+    """Erasing another version's in-flight lease is the one thing a shared
+    ledger must never do: the writer is still holding that model."""
+    path = _ledger_with_foreign_operation(tmp_path / "claims.json")
+    started = claims.begin_operation("other:model", "unload", force=True,
+                                     path=path, now_fn=lambda: _T0)
+    claims.finish_operation(started["operation_id"], path=path, now_fn=lambda: _T0)
+    on_disk = json.loads(path.read_text(encoding="utf-8"))["operations"]
+    assert [r["operation_id"] for r in on_disk] == ["future-op"]
+    assert on_disk[0] == _FOREIGN_OPERATION      # byte-for-byte, fields included
+
+
+def test_foreign_operation_still_blocks_its_model(tmp_path):
+    path = _ledger_with_foreign_operation(tmp_path / "claims.json")
+    refused = claims.begin_operation("model:latest", "unload", force=True,
+                                     path=path, now_fn=lambda: _T0)
+    assert refused["ok"] is False
+    assert refused["reason"] == "operation_pending"
+    # Refusing without naming the holder leaves a caller no way to recover.
+    assert [op["operation_id"] for op in refused["operations"]] == ["future-op"]
+
+
+def test_foreign_operation_is_reported_without_being_interpreted(tmp_path):
+    """Identity, scope and lease are facts we can read; lifecycle and outcome
+    are a vocabulary we do not have, so they are null rather than guessed."""
+    path = _ledger_with_foreign_operation(tmp_path / "claims.json")
+    (op,) = claims.list_coordination(path=path, now_fn=lambda: _T0)["operations"]
+    assert op["lifecycle"] == "unrecognized"
+    assert (op["operation_id"], op["model"], op["kind"], op["scope"]) == (
+        "future-op", "model:latest", "unload", "gpu:index=0")
+    assert op["expires_at"] == "2026-07-13T19:00:00Z"
+    assert op["lease_expired"] is False
+    assert (op["outcome"], op["reason"], op["retry_after"]) == (None, None, None)
+    assert op["retry_count"] == 0
+
+
+def test_foreign_operation_lease_still_expires(tmp_path):
+    """Preserving a record is not exempting it: the lease rules are version
+    independent, so a lapsed lease with no live owner is still reclaimed."""
+    path = _ledger_with_foreign_operation(tmp_path / "claims.json")
+    later = datetime(2026, 7, 13, 19, 0, 1, tzinfo=timezone.utc)
+    assert claims.list_coordination(path=path, now_fn=lambda: later)["operations"] == []
+    started = claims.begin_operation("model:latest", "unload", force=True,
+                                     path=path, now_fn=lambda: later)
+    assert started["ok"] is True
+    claims.finish_operation(started["operation_id"], path=path, now_fn=lambda: later)
+
+
+@pytest.mark.parametrize("operation", [
+    "bad",                                                    # not a record
+    {"operation_id": "op"},                                   # no model or lease
+    {"operation_id": "", "model": "m", "kind": "unload",      # no identity
+     "started_at": "2026-07-13T17:59:00Z",
+     "expires_at": "2026-07-13T19:00:00Z"},
+    {"operation_id": "op", "model": "m", "kind": "unload",    # unreadable lease
+     "started_at": "2026-07-13T17:59:00Z", "expires_at": "not-a-timestamp"},
+])
+def test_operation_without_identity_or_lease_is_still_discarded(tmp_path, operation):
+    """Preserving the uninterpretable does not mean preserving the unusable:
+    with no model or no expiry there is nothing left to honour."""
+    path = tmp_path / "claims.json"
+    path.write_text(json.dumps({"claims": [], "operations": [operation]}),
+                    encoding="utf-8")
+    assert claims.list_coordination(path=path, now_fn=lambda: _T0)["operations"] == []
+
+
 def test_warm_operations_serialize_capacity_admission_by_scope(tmp_path):
     path = tmp_path / "claims.json"
     first = claims.begin_operation("one", "warm", force=True, path=path, now_fn=lambda: _T0)
