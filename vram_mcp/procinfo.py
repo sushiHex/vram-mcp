@@ -1,12 +1,11 @@
 """Sized + named process table of GPU VRAM holders.
 
 NVML gives per-process VRAM directly on Linux/TCC but returns ``None`` on
-Windows/WDDM. There, the ``\\GPU Process Memory(*)`` performance counters (the
-source Task Manager uses), summed per PID and joined with ``Get-CimInstance
-Win32_Process``, can label holders. Their memory totals aggregate adapters, so
-they are never assigned to a selected GPU without an adapter mapping. Pure
-module: every external reader is injected; each degrades to ``[]``/``{}`` on any
-failure and never raises.
+Windows/WDDM. There, NVML's selected-GPU PID set is enriched with one bounded
+``Get-CimInstance Win32_Process`` identity query. Windows GPU Process Memory
+counters aggregate adapters and are deliberately not sampled or attributed to a
+selected device. Pure module: every external reader is injected; each degrades
+to ``[]``/``{}`` on any failure and never raises.
 """
 from __future__ import annotations
 
@@ -14,49 +13,41 @@ import re
 import sys
 from typing import Optional
 
-from ._util import bytes_to_mb, run_capture
+from ._util import run_capture
 from .observations import Observation
 from . import nvml as _nvml
 
-# ONE Get-Counter call sampling all three counters, so the ~1 s perf-counter
-# cost is paid once. Samples are discriminated by their Path (which the counter
-# subsystem lowercases; -match is case-insensitive anyway).
-_WIN_GPU_PS = (
-    "$paths=@('\\GPU Process Memory(*)\\Dedicated Usage',"
-    "'\\GPU Process Memory(*)\\Shared Usage',"
-    "'\\GPU Process Memory(*)\\Non Local Usage');"
-    "$d=@{};$s=@{};$n=@{};"
-    "(Get-Counter -Counter $paths -EA SilentlyContinue).CounterSamples | "
-    "Where-Object { $_.CookedValue -gt 0 -and $_.InstanceName -match 'pid_(\\d+)' } | "
-    "ForEach-Object { "
-    "$id=[int]($_.InstanceName -replace '.*pid_(\\d+).*','$1'); "
-    "$v=[int64]$_.CookedValue; "
-    "if($_.Path -match 'non local usage'){ $n[$id]=[int64]$n[$id]+$v } "
-    "elseif($_.Path -match 'shared usage'){ $s[$id]=[int64]$s[$id]+$v } "
-    "else { $d[$id]=[int64]$d[$id]+$v } };"
-    "$ids=@($d.Keys)+@($s.Keys)+@($n.Keys) | Sort-Object -Unique;"
-    "foreach($id in $ids){ $p=Get-CimInstance Win32_Process -Filter "
-    "\"ProcessId=$id\" -EA SilentlyContinue; "
-    "'{0}|{1}|{2}|{3}|{4}|{5}' -f "
-    "$id,[int64]$d[$id],[int64]$s[$id],[int64]$n[$id],$p.Name,$p.CommandLine }"
-)
+# The query is deliberately identity-only: Windows GPU Process Memory counters
+# aggregate adapters and cannot prove attribution to the selected GPU. NVML owns
+# the selected-GPU PID set; this one bounded CIM query only enriches those PIDs.
+def _win_gpu_identity_ps(pids) -> str:
+    pid_filter = " OR ".join(
+        f"ProcessId={int(pid)}" for pid in sorted(set(pids))
+    )
+    return (
+        f"Get-CimInstance Win32_Process -Filter '{pid_filter}' "
+        "-EA SilentlyContinue | "
+        "ForEach-Object { "
+        "'{0}||||{1}|{2}' -f $_.ProcessId,$_.Name,$_.CommandLine }"
+    )
 
 
 def _run_powershell(command: str, timeout: int) -> Optional[str]:
     return run_capture(["powershell", "-NoProfile", "-Command", command], timeout)
 
 
-def win_gpu_procs(timeout: int = 10) -> list[dict]:
-    """Return adapter-aggregated Windows GPU counters and process identity.
+def win_gpu_procs(pids=(), timeout: int = 10) -> list[dict]:
+    """Return identity for the selected NVML PIDs on Windows.
 
-    ``size_mb`` is Dedicated Usage and ``non_local_mb`` is Non Local Usage, but
-    neither identifies an adapter. Selected-device callers may use `name` and
-    `cmdline`; they must leave these memory fields unavailable. Returns ``[]``
-    off-Windows or on any failure. All counters come from one ~1-second sample.
+    Windows GPU counters aggregate adapters, so they are not sampled here and
+    their values can never be attributed to the selected GPU. ``pids`` is the
+    authoritative NVML PID set. A nonempty set performs one bounded CIM query;
+    an empty set performs no subprocess call. Missing or failed identity data
+    returns ``[]`` so callers retain the known NVML inventory with null names.
     """
-    if sys.platform != "win32":
+    if sys.platform != "win32" or not pids:
         return []
-    out_text = _run_powershell(_WIN_GPU_PS, timeout)
+    out_text = _run_powershell(_win_gpu_identity_ps(pids), timeout)
     if not out_text:
         return []
     procs = []
@@ -65,12 +56,12 @@ def win_gpu_procs(timeout: int = 10) -> list[dict]:
         parts = line.strip().split("|", 5)
         if len(parts) != 6 or not parts[0].isdigit():
             continue
-        pid, dedicated, shared, non_local, name, cmdline = parts
+        pid, _dedicated, _shared, _non_local, name, cmdline = parts
         procs.append({
             "pid": int(pid),
-            "size_mb": bytes_to_mb(dedicated, default=None),
-            "shared_mb": bytes_to_mb(shared, default=None),
-            "non_local_mb": bytes_to_mb(non_local, default=None),
+            "size_mb": None,
+            "shared_mb": None,
+            "non_local_mb": None,
             "name": name.strip() or None,
             "cmdline": cmdline.strip() or None,
         })
@@ -117,14 +108,13 @@ def _enrich_processes(
 ) -> list[dict]:
     """Attach process identity without weakening selected-GPU attribution.
 
-    Windows GPU Process Memory counters aggregate a PID across adapters. Their
-    name and command line are useful, but their memory values cannot be assigned
-    to one selected GPU. Consequently they never fill memory fields or add a
-    PID that NVML did not report for the selected device.
+    Windows GPU Process Memory counters aggregate a PID across adapters and
+    are not queried. Identity is useful, but no Windows fallback may fill
+    memory fields or add a PID that NVML did not report for the selected device.
     """
     table = _base_table(rows)
     if platform == "win32" and win_gpu_reader is not None:
-        for windows_row in win_gpu_reader():
+        for windows_row in win_gpu_reader(list(table.keys())):
             entry = table.get(windows_row["pid"])
             if entry is None:
                 continue
@@ -154,7 +144,7 @@ def observe_processes(
     win_gpu_reader = win_gpu_procs if win_gpu_reader is None else win_gpu_reader
     posix_reader = posix_name_reader if posix_reader is None else posix_reader
     nvml_observation = nvml_observer(index, nvml=nvml)
-    source = "nvml+windows-process-counters" if platform == "win32" else "nvml+ps"
+    source = "nvml+windows-process-identity" if platform == "win32" else "nvml+ps"
     scope = f"gpu:index={index}"
     coverage = {**(nvml_observation.coverage or {}), "non_local_memory": False}
     if not nvml_observation.known:
@@ -179,9 +169,9 @@ def process_table(*, nvml_processes, win_gpu_reader=None,
     holders.
 
     Starts from selected-device NVML rows. Platform dispatch is explicit:
-    Windows counters supply names only, while POSIX uses ``ps``. Memory fields
-    from adapter-aggregated Windows counters remain ``None`` unless a future
-    collector can prove adapter attribution.
+    Windows uses one bounded identity lookup for those PIDs, while POSIX uses
+    ``ps``. Windows memory fields remain ``None`` because adapter-aggregated
+    counters cannot prove selected-device attribution.
     """
     selected_platform = sys.platform if platform is None else platform
     return _enrich_processes(

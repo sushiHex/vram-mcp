@@ -19,8 +19,8 @@ def test_process_table_windows_counters_only_fill_identity():
     # WDDM counters aggregate adapters, so they cannot size one selected GPU.
     nvml = lambda: [{"pid": 100, "size_mb": None, "kind": "compute"},
                     {"pid": 200, "size_mb": None, "kind": "graphics"}]
-    win = lambda: [{"pid": 100, "size_mb": 14492, "name": "python.exe",
-                    "cmdline": "python.exe train_lora_kg.py"}]
+    win = lambda pids: [{"pid": 100, "size_mb": None, "name": "python.exe",
+                         "cmdline": "python.exe train_lora_kg.py"}]
     out = procinfo.process_table(
         nvml_processes=nvml, win_gpu_reader=win, platform="win32",
     )
@@ -37,9 +37,9 @@ def test_process_table_windows_counters_only_fill_identity():
 def test_process_table_windows_reader_does_not_add_unattributed_pid():
     # A counter-only PID cannot be attributed to the selected adapter.
     nvml = lambda: []
-    win = lambda: [{"pid": 300, "size_mb": 2048, "shared_mb": 0,
-                    "non_local_mb": 0, "name": "UnrealEditor.exe",
-                    "cmdline": "UnrealEditor.exe Project.uproject"}]
+    win = lambda pids: [{"pid": 300, "size_mb": 2048, "shared_mb": 0,
+                         "non_local_mb": 0, "name": "UnrealEditor.exe",
+                         "cmdline": "UnrealEditor.exe Project.uproject"}]
     out = procinfo.process_table(
         nvml_processes=nvml, win_gpu_reader=win, platform="win32",
     )
@@ -57,7 +57,7 @@ def test_process_table_no_readers_returns_nvml_only_unnamed():
 def test_process_table_does_not_assign_adapter_aggregated_spill_fields():
     rows = procinfo.process_table(
         nvml_processes=lambda: [{"pid": 7, "size_mb": None, "kind": "compute"}],
-        win_gpu_reader=lambda: [
+        win_gpu_reader=lambda pids: [
             {"pid": 7, "size_mb": 500, "shared_mb": 12, "non_local_mb": 300,
              "name": "a.exe", "cmdline": "a"},
         ],
@@ -81,7 +81,7 @@ def test_process_table_defaults_spill_fields_to_none():
 def test_process_table_dispatches_reader_for_actual_platform():
     calls = {"windows": 0, "posix": 0}
 
-    def windows():
+    def windows(pids):
         calls["windows"] += 1
         return [{"pid": 7, "name": "win.exe", "cmdline": "win"}]
 
@@ -138,33 +138,26 @@ def test_observe_processes_propagates_nvml_query_coverage():
     }
 
 
-def test_win_gpu_procs_parses_pipe_lines(monkeypatch):
-    # pid|dedicated|shared|non-local|name|cmdline from the combined reader.
-    fake = ("11924|15196000000|0|0|python.exe|python.exe train_lora_kg.py\n"
-            "1336|1841000000|0|0|dwm.exe|dwm.exe\n")
-    monkeypatch.setattr(procinfo, "_run_powershell", lambda cmd, timeout: fake)
+def test_win_gpu_procs_queries_only_selected_pids(monkeypatch):
+    fake = ("11924||||python.exe|python.exe train_lora_kg.py\n"
+            "1336||||dwm.exe|dwm.exe\n")
+    calls = []
+    monkeypatch.setattr(procinfo, "_run_powershell",
+                        lambda cmd, timeout: calls.append(cmd) or fake)
     monkeypatch.setattr(procinfo.sys, "platform", "win32")
-    out = {p["pid"]: p for p in procinfo.win_gpu_procs()}
-    assert out[11924]["size_mb"] == 14492  # 15.196e9 // 1MB
+    out = {p["pid"]: p for p in procinfo.win_gpu_procs([11924, 1336])}
+    assert set(out) == {11924, 1336}
+    assert out[11924]["size_mb"] is None
     assert out[11924]["name"] == "python.exe"
-    assert out[1336]["name"] == "dwm.exe"
+    assert "Get-Counter" not in calls[0]
+    assert "ProcessId=1336 OR ProcessId=11924" in calls[0]
 
 
-def test_win_gpu_procs_parses_three_counters(monkeypatch):
-    # One sample covers Dedicated + Shared + Non Local, so spill is visible.
-    out = (
-        "1328|948961280|104857600|0|dwm.exe|C:\\Windows\\dwm.exe\n"
-        "28384|18229198848|2097152|1073741824|python.exe|python train.py --a b\n"
-    )
-    monkeypatch.setattr(procinfo, "_run_powershell", lambda cmd, timeout: out)
+def test_win_gpu_procs_empty_pid_set_skips_reader(monkeypatch):
     monkeypatch.setattr(procinfo.sys, "platform", "win32")
-    rows = {r["pid"]: r for r in procinfo.win_gpu_procs()}
-    assert rows[1328]["size_mb"] == 905
-    assert rows[1328]["shared_mb"] == 100
-    assert rows[1328]["non_local_mb"] == 0
-    assert rows[28384]["size_mb"] == 17384  # floored, per bytes_to_mb
-    assert rows[28384]["non_local_mb"] == 1024
-    assert rows[28384]["name"] == "python.exe"
+    monkeypatch.setattr(procinfo, "_run_powershell",
+                        lambda *args: (_ for _ in ()).throw(AssertionError()))
+    assert procinfo.win_gpu_procs([]) == []
 
 
 def test_win_gpu_procs_keeps_pipe_in_cmdline(monkeypatch):
@@ -172,7 +165,7 @@ def test_win_gpu_procs_keeps_pipe_in_cmdline(monkeypatch):
     out = "42|1048576|0|0|sh.exe|sh -c 'a | b | c'\n"
     monkeypatch.setattr(procinfo, "_run_powershell", lambda cmd, timeout: out)
     monkeypatch.setattr(procinfo.sys, "platform", "win32")
-    (row,) = procinfo.win_gpu_procs()
+    (row,) = procinfo.win_gpu_procs([42])
     assert row["cmdline"] == "sh -c 'a | b | c'"
 
 
@@ -180,15 +173,15 @@ def test_win_gpu_procs_skips_malformed_lines(monkeypatch):
     out = "not-a-pid|1|2|3|x|y\n7|1048576|0|0|a.exe|a\nshort|line\n"
     monkeypatch.setattr(procinfo, "_run_powershell", lambda cmd, timeout: out)
     monkeypatch.setattr(procinfo.sys, "platform", "win32")
-    assert [r["pid"] for r in procinfo.win_gpu_procs()] == [7]
+    assert [r["pid"] for r in procinfo.win_gpu_procs([7])] == [7]
 
 
 def test_win_gpu_procs_empty_off_windows(monkeypatch):
     monkeypatch.setattr(procinfo.sys, "platform", "linux")
-    assert procinfo.win_gpu_procs() == []
+    assert procinfo.win_gpu_procs([7]) == []
 
 
 def test_win_gpu_procs_empty_on_reader_failure(monkeypatch):
     monkeypatch.setattr(procinfo.sys, "platform", "win32")
     monkeypatch.setattr(procinfo, "_run_powershell", lambda cmd, timeout: None)
-    assert procinfo.win_gpu_procs() == []
+    assert procinfo.win_gpu_procs([7]) == []

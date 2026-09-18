@@ -115,11 +115,13 @@ remain useful.
 
 ### Audit cost and coverage
 
-On Windows/WDDM, NVML often cannot report per-process memory sizes. A
-`vram_status()` call adds a performance-counter sample and process lookup,
-costing roughly one second on the measured setup. Those adapter-aggregated
-counters supply names and command lines, but their memory totals are not used
-for selected-device capacity or spill decisions.
+On Windows/WDDM, NVML often cannot report per-process memory sizes. The
+process observation keeps the selected-GPU NVML PID set authoritative and uses
+one bounded `Win32_Process` identity lookup for those PIDs. It does not invoke
+`Get-Counter`: adapter-aggregated counter totals cannot be attributed to the
+selected device, so they are not used for capacity or spill decisions. Missing,
+inaccessible, or exited processes remain in the NVML inventory with
+`name: null` and `cmdline: null`.
 
 `VRAM_MCP_AUDIT=0` disables action logging, appearance/disappearance detection,
 and new trend samples. It does not disable current GPU, process, model, or

@@ -280,7 +280,8 @@ def combined_status(
         "scope": gpu_reading.scope,
     }
     source = procinfo_fn if procinfo_fn is not None else nvml_processes_fn
-    # The source is sampled EXACTLY ONCE (a ~1 s Windows perf-counter call) and
+    # The source is sampled EXACTLY ONCE; on Windows it performs one bounded
+    # identity lookup for the selected NVML PIDs and never samples counters.
     # the same rows feed both consumers, which need DIFFERENT views:
     #   * pressure  -> the FULL table plus the offload entitlements. The Ollama
     #     runner is normally the biggest VRAM holder and CAN genuinely be paged,
