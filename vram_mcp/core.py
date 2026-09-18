@@ -20,6 +20,16 @@ _MB_PER_GB = 1024
 SPILL_THRESHOLD_MB = 256   # floor only; pressure() also compares against free VRAM
 TIGHT_MB = 1024
 
+# Coverage a healthy verdict depends on, with what its absence means. Ordered:
+# the first unmet requirement is the one reported, so the reason names the
+# evidence nearest the reader rather than an arbitrary one. A new input that
+# `ok` relies on is a line here, not another branch.
+_OK_REQUIRES = (
+    ("models", "Ollama residency is unavailable."),
+    ("non_local_memory",
+     "Non-local memory is unavailable; driver spill cannot be ruled out."),
+)
+
 
 def observe_loaded(ollama) -> Observation[list[dict]]:
     """Use transport health when available; plain injected clients supply data."""
@@ -321,8 +331,19 @@ def combined_status(
     if not non_local_known:
         for key in ("non_local_mb", "explained_offload_mb", "unexplained_spill_mb", "spilling"):
             result["pressure"][key] = None
-    if result["pressure"]["state"] == "ok" and not model_reading.known:
-        result["pressure"].update(state="unknown", detail="Ollama residency is unavailable.")
+    # `ok` is the one verdict that asserts a NEGATIVE — that nothing is wrong —
+    # so it is earned only when every input it depends on was actually read.
+    # The other states rest on evidence they did observe (`tight` on capacity,
+    # `degraded` on residency, `thrashing` on the non-local figures it grades),
+    # so missing coverage never downgrades them; it would discard a fact.
+    # `capacity` is absent from the table on purpose: pressure() already returns
+    # "unknown" when free_mb is None, so a missing-capacity entry here could
+    # never fire.
+    coverage = result["pressure"]["coverage"]
+    if result["pressure"]["state"] == "ok":
+        unmet = next((why for key, why in _OK_REQUIRES if not coverage[key]), None)
+        if unmet is not None:
+            result["pressure"].update(state="unknown", detail=unmet)
     return result
 
 
