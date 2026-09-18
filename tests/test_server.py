@@ -128,6 +128,56 @@ def test_trend_empty_window_names_missing_gpu_readings_as_a_cause(monkeypatch):
     assert "VRAM_MCP_AUDIT=0" in text
 
 
+class _StubResidency:
+    """An Ollama stand-in that reports a known, empty residency."""
+
+    base_url = "http://ollama.test:11434"
+
+    def __init__(self, rows):
+        self._rows = list(rows)
+
+    def observe_loaded(self):
+        return Observation(self._rows, "ollama:/api/ps")
+
+    def ps(self):
+        return list(self._rows)
+
+
+def test_status_summary_says_why_pressure_is_unknown(monkeypatch):
+    """`summary` is the line an agent reads before the payload. "pressure:
+    unknown." alone gives it nothing to act on, and which evidence was missing
+    is the entire content of that verdict — so the detail belongs inline."""
+    monkeypatch.setattr(server, "_gpu_reading",
+                        lambda: [{"index": 0, "total_mb": 24576,
+                                  "used_mb": 4000, "free_mb": 20576}])
+    monkeypatch.setattr(server, "_procinfo_table",
+                        lambda: Observation([], "procs",
+                                            coverage={"non_local_memory": False}))
+    monkeypatch.setattr(server, "_ollama", _StubResidency([]))
+    monkeypatch.setattr(server, "_run_detection", lambda status: None)
+
+    status = server._vram_status_impl()
+    assert status["pressure"]["state"] == "unknown"
+    assert "pressure: unknown." in status["summary"]
+    assert "driver spill cannot be ruled out" in status["summary"]
+
+
+def test_status_summary_stays_terse_when_pressure_is_ok(monkeypatch):
+    """"No VRAM pressure detected." adds nothing to "pressure: ok"."""
+    monkeypatch.setattr(server, "_gpu_reading",
+                        lambda: [{"index": 0, "total_mb": 24576,
+                                  "used_mb": 4000, "free_mb": 20576}])
+    monkeypatch.setattr(server, "_procinfo_table",
+                        lambda: Observation([], "procs",
+                                            coverage={"non_local_memory": True}))
+    monkeypatch.setattr(server, "_ollama", _StubResidency([]))
+    monkeypatch.setattr(server, "_run_detection", lambda status: None)
+
+    status = server._vram_status_impl()
+    assert status["pressure"]["state"] == "ok"
+    assert status["summary"].endswith("pressure: ok.")
+
+
 # ---- warm() admission ------------------------------------------------------
 
 @pytest.fixture

@@ -128,10 +128,21 @@ and new trend samples. It does not disable current GPU, process, model, or
 activity observations. Claims and model operations remain enabled, and old
 audit events remain queryable.
 
-Pressure can report `ok`, `tight`, or `degraded` from the evidence it has.
-`thrashing` additionally requires scoped non-local-memory coverage. When that
-coverage is false, spill is unknown; missing process information is not evidence
-that nothing else is using the GPU.
+`tight` and `degraded` report from the evidence they have: each rests on a
+reading that was taken, so incomplete coverage elsewhere does not suppress them.
+`thrashing` requires scoped non-local-memory coverage, since that is the figure
+it grades.
+
+`ok` is the one verdict that asserts a negative — that nothing is wrong — so it
+requires every input it depends on, including that same non-local coverage.
+Without it, spill was never observable and the state is `unknown` with the
+missing evidence named in `detail`, rather than `ok`. Missing process
+information is not evidence that nothing else is using the GPU.
+
+On Windows/WDDM this is the normal case, not an edge one: NVML cannot report
+per-process memory and the GPU counters aggregate adapters, so non-local
+coverage is always false and `vram_status()` reports `unknown` there. Read
+`pressure.coverage` to see exactly which evidence was available.
 
 Keep the sample interval high enough that samples do not crowd action events
 out of the bounded log. Raising the spill floor can suppress noisy alerts;

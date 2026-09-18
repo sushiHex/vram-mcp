@@ -248,7 +248,12 @@ def _vram_status_impl() -> dict:
     status["summary"] = (
         f"{n_gpu} GPU(s), {n_loaded} model(s) loaded, "
         f"free: {_fmt_free(status['free_mb'])}, pressure: {state}."
-        + (f" {detail}" if detail and state not in ("ok", "unknown") else "")
+        # Only `ok` suppresses the detail: "No VRAM pressure detected." adds
+        # nothing to "pressure: ok". Every other state, `unknown` included,
+        # carries the reason for the verdict — and `unknown` is precisely where
+        # a reader cannot infer it, since which evidence was missing is the
+        # whole content of that answer.
+        + (f" {detail}" if detail and state != "ok" else "")
     )
     return status
 

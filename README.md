@@ -148,7 +148,7 @@ bypass an unreadable coordination ledger or another pending mutation.
 
 | `pressure.state` | Meaning |
 | --- | --- |
-| `ok` | No pressure detected in the available readings. |
+| `ok` | Nothing is wrong, and every input that claim rests on was actually read. Missing evidence yields `unknown`, never `ok`. |
 | `tight` | Less than 1 GiB is free on the selected GPU. |
 | `degraded` | Ollama placed part of a model on the CPU; expect slower inference. |
 | `thrashing` | Unexplained non-local memory meets the spill threshold and, when free VRAM is known, exceeds it. Driver paging is suspected. |

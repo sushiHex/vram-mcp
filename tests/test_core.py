@@ -417,6 +417,81 @@ def test_combined_status_includes_pressure():
     assert status["pressure"]["state"] == "ok"
 
 
+# ---- `ok` is earned, not defaulted to ---------------------------------------
+#
+# Windows/WDDM is the live case: NVML cannot report per-process memory and the
+# GPU counters aggregate adapters, so non-local coverage is always false there
+# and driver spill can never be observed. A healthy verdict on that evidence
+# would be an assertion about something never measured.
+
+def _blind_to_non_local(rows=()):
+    """A process reading from a platform that cannot see non-local memory."""
+    return lambda: Observation(list(rows), "procs",
+                               coverage={"non_local_memory": False})
+
+
+def test_ok_is_withheld_when_spill_could_not_be_ruled_out():
+    status = core.combined_status(
+        lambda: GPUS_OK, FakeOllama([]), procinfo_fn=_blind_to_non_local(),
+    )
+    pressure = status["pressure"]
+    assert pressure["state"] == "unknown"
+    assert pressure["detail"] == (
+        "Non-local memory is unavailable; driver spill cannot be ruled out.")
+    assert pressure["coverage"]["non_local_memory"] is False
+    # The figures stay null rather than reading as a measured zero.
+    assert pressure["unexplained_spill_mb"] is None
+    assert pressure["spilling"] is None
+
+
+def test_missing_residency_is_reported_before_missing_spill_coverage():
+    """Both requirements unmet: the reason names the nearer one rather than
+    whichever branch happens to run first."""
+    class _Blind:
+        def observe_loaded(self):
+            return Observation(None, "ollama:/api/ps", error="transport down")
+
+    status = core.combined_status(
+        lambda: GPUS_OK, _Blind(), procinfo_fn=_blind_to_non_local(),
+    )
+    assert status["pressure"]["state"] == "unknown"
+    assert status["pressure"]["detail"] == "Ollama residency is unavailable."
+
+
+def test_missing_spill_coverage_does_not_suppress_tight():
+    """`tight` rests on a capacity reading it did observe. Downgrading it would
+    discard a fact, not withhold a guess."""
+    status = core.combined_status(
+        lambda: GPUS_TIGHT, FakeOllama([]), procinfo_fn=_blind_to_non_local(),
+    )
+    assert status["pressure"]["state"] == "tight"
+
+
+def test_missing_spill_coverage_does_not_suppress_degraded():
+    models = [{"name": "m1", "size": gb_bytes(20), "size_vram": gb_bytes(16),
+               "expires_at": None}]
+    status = core.combined_status(
+        lambda: GPUS_OK, FakeOllama(models),
+        snapshot_fn=lambda: _snap(pid_map={"m1": 555}),
+        procinfo_fn=_blind_to_non_local([{"pid": 555, "size_mb": 16384}]),
+    )
+    assert status["pressure"]["state"] == "degraded"
+    assert status["pressure"]["offloaded_models"] == ["m1"]
+
+
+def test_ok_survives_when_every_requirement_is_covered():
+    """The downgrade must not fire on a platform that CAN see non-local
+    memory and reports none — that is a measurement, not an absence."""
+    status = core.combined_status(
+        lambda: GPUS_OK, FakeOllama([]),
+        procinfo_fn=lambda: Observation(
+            [{"pid": 999, "size_mb": 100, "non_local_mb": 0}], "procs",
+            coverage={"non_local_memory": True}),
+    )
+    assert status["pressure"]["state"] == "ok"
+    assert status["pressure"]["coverage"]["non_local_memory"] is True
+
+
 # ---- combined_status full wiring -------------------------------------------------
 
 def test_combined_status_full_wiring():
