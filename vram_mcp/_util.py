@@ -57,6 +57,46 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+class LockDisplacedError(OSError):
+    """The lock was acquired, but no longer governs the path it was taken on.
+
+    Raised when the lock file is deleted or replaced while this process holds
+    its advisory lock — something no vram-mcp client of this generation does.
+    It therefore means a foreign writer is present, most likely a pre-0.3
+    client, whose lock protocol treats the FILE'S EXISTENCE as ownership and
+    unlinks any lock file it judges stale.
+
+    An ``OSError`` on purpose: the ledger's callers already degrade on those, so
+    an affected tool reports a structured failure rather than a traceback, and
+    the specific type stays available to anyone who wants to say more.
+    """
+
+
+_DISPLACED = (
+    "lock {lock} was removed or replaced {when}. Another client is breaking "
+    "locks — a pre-0.3 vram-mcp treats the lock file's existence as ownership "
+    "and unlinks any it judges stale. Stop it before continuing; sharing one "
+    "ledger across generations is unsupported."
+)
+
+
+def _governs(fd: int, lock_path: Path) -> bool:
+    """Is the descriptor's file still the file that ``lock_path`` names?
+
+    Holding an advisory lock on an unlinked file is not an error and not
+    detectable from the descriptor: the lock stays valid on an inode nobody can
+    reach any more, while a second process creates a fresh file at the same
+    name and locks that instead. Comparing identities is what turns that
+    silence into a fact.
+    """
+    held = os.fstat(fd)
+    try:
+        named = os.stat(lock_path)
+    except OSError:
+        return False
+    return (held.st_ino, held.st_dev) == (named.st_ino, named.st_dev)
+
+
 @contextmanager
 def locked(path: Path, timeout: float = 5.0, poll: float = 0.05):
     """Serialize access through an OS-backed sibling lock file.
@@ -65,6 +105,23 @@ def locked(path: Path, timeout: float = 5.0, poll: float = 0.05):
     its age or existence, represents ownership; the OS releases it when a
     crashed holder exits.  This avoids both stale-file split brain on POSIX and
     sharing violations from deleting an open lock on Windows.
+
+    Identity is checked on both sides of the critical section, and neither check
+    is prevention. Mutual exclusion against a client that ignores advisory locks
+    cannot be reconstructed from this side; mixing generations on one ledger is
+    unsupported (see docs/coordination.md). What the checks buy is that such a
+    client cannot pass unnoticed:
+
+    * before the body — the path was already displaced, so this section never
+      had exclusion to begin with and must not run;
+    * after it — displacement happened *while we worked*, which is the ordinary
+      shape of the failure. The work may have raced a concurrent writer, so the
+      caller is told its result is unconfirmed rather than being handed a
+      success it cannot rely on.
+
+    The second check is why this is worth having. Nothing in this generation
+    removes a lock file, so in a single-generation deployment neither check can
+    fire; when one does, a foreign writer is a fact rather than an inference.
     """
     lock_path = path.with_suffix(path.suffix + ".lock")
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -84,7 +141,16 @@ def locked(path: Path, timeout: float = 5.0, poll: float = 0.05):
                 if time.monotonic() >= deadline:
                     raise TimeoutError(f"could not acquire lock {lock_path}")
                 time.sleep(poll)
+        if not _governs(fd, lock_path):
+            raise LockDisplacedError(_DISPLACED.format(
+                lock=lock_path, when="before this operation began"))
         yield
+        # Deliberately not in `finally`: a body that raised has its own story to
+        # tell, and masking it with this one would lose the more specific fault.
+        if not _governs(fd, lock_path):
+            raise LockDisplacedError(_DISPLACED.format(
+                lock=lock_path, when="while this operation was running, so it "
+                                     "may have raced a concurrent writer"))
     finally:
         if acquired:
             try:

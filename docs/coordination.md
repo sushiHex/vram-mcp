@@ -22,6 +22,34 @@ removes it permanently. Owners are descriptive labels, not authenticated
 identities. Separate home directories have separate ledgers, even when their
 processes use the same physical GPU.
 
+### One generation per ledger
+
+All clients sharing a ledger must be the same vram-mcp generation. Ownership is
+an advisory lock on a persistent lock file; a pre-0.3 client instead treats the
+lock file's *existence* as ownership, takes no advisory lock at all, and unlinks
+any lock file older than 30 seconds. Two consequences follow, and neither can be
+repaired from this side:
+
+- A pre-0.3 client can enter while a current client holds the lock, because it
+  never asks whether the lock is held. On POSIX it can also unlink the file we
+  hold, then create its own under the same name.
+- Even with perfect file serialization the generations are not semantically
+  compatible: a pre-0.3 client has no concept of pending operations, so it will
+  claim a model with an eviction in flight and reserve capacity during a pending
+  warm. Preserving records it does not read cannot make it honour them.
+
+So **stop every client before upgrading**, rather than mixing versions and
+hoping. What the current client does provide is that such a peer cannot go
+unnoticed: it verifies on both sides of every ledger operation that its lock
+still governs the lock file's path, and reports `LockDisplacedError` when it does
+not — before the operation if exclusion was already lost, and after it if the
+work may have raced a concurrent writer. Affected tools return a structured
+refusal naming the cause. Nothing in this generation removes a lock file, so in
+a single-generation deployment the check never fires.
+
+This is detection, not exclusion. A displaced lock means the ledger may already
+have diverged; treat it as an incident and restart from a single generation.
+
 ## Model claims
 
 Use `claim(model, owner, purpose)` before relying on a model. Claims default to
