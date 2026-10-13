@@ -25,6 +25,7 @@ from typing import Any, Optional, get_args, get_origin, get_type_hints
 import anyio.to_thread
 from mcp.server.fastmcp import FastMCP
 
+from . import __version__
 from . import claims as _claims
 from . import core
 from . import nvml as _nvml
@@ -41,6 +42,9 @@ from .schemas import (
 )
 
 mcp = FastMCP("vram-mcp")
+# FastMCP accepts no version, and the server beneath it otherwise announces the
+# MCP SDK's own version to every client as if it were this server's.
+mcp._mcp_server.version = __version__
 
 _OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 _ollama = OllamaClient(base_url=_OLLAMA_BASE_URL)
