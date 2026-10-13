@@ -5,7 +5,8 @@
 ## Shared state
 
 Every connected client starts its own stdio server. Processes running under the
-same OS user coordinate through `~/.cache/vram-mcp/`:
+same OS user coordinate through `~/.cache/vram-mcp/`, or through
+`VRAM_MCP_STATE_DIR` when it is set:
 
 | File | Contents |
 | --- | --- |
