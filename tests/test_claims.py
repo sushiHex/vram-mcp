@@ -781,6 +781,41 @@ def test_each_abandonment_continues_the_run_and_restarts_its_window(tmp_path):
     assert _next_retry_count(path, clock) == 2
 
 
+def test_an_attempt_that_outlives_its_run_starts_a_new_one(tmp_path):
+    """The attempt inherited count 1, but its run was forgotten while it was
+    still live. Counting from its copy would revive that run as 2."""
+    path = tmp_path / "claims.json"
+    clock = _clock(_T0)
+    _abandon(path, clock)
+    started = claims.begin_operation("model", "unload", force=True, path=path, now_fn=clock)
+    assert started["retry_count"] == 1
+    clock.tick(_WINDOW + 1)
+    claims.list_coordination(path=path, now_fn=clock)
+    assert _retry_memory_on_disk(path) == {}
+    claims._release_operation_lock(claims._OPERATION_LOCKS.pop(started["operation_id"]))
+    claims.list_coordination(path=path, now_fn=clock)
+    assert _retry_memory_on_disk(path)["model:latest"]["count"] == 1
+
+
+@pytest.mark.parametrize("kind, refused_call", [
+    ("unload", lambda path: claims.claim("model", "a", "p", path=path, now_fn=lambda: _T0)),
+    ("warm", lambda path: claims.reserve(4, "a", "p", path=path, now_fn=lambda: _T0)),
+])
+def test_a_refusal_still_reports_a_displaced_lock(tmp_path, monkeypatch, kind, refused_call):
+    """Pruning can write before the refusal, so the lock's exit check must
+    still run; an ordinary refusal must not stand in for displacement."""
+    path = tmp_path / "claims.json"
+    started = claims.begin_operation("model", kind, force=True, path=path, now_fn=lambda: _T0)
+    answers = iter([True, False])           # governs on entry, displaced by exit
+    monkeypatch.setattr(_util, "_governs", lambda fd, lock_path: next(answers))
+    try:
+        with pytest.raises(_util.LockDisplacedError):
+            refused_call(path)
+    finally:
+        monkeypatch.undo()
+        claims.finish_operation(started["operation_id"], path=path, now_fn=lambda: _T0)
+
+
 def test_a_refusal_records_the_abandonment_it_noticed(tmp_path):
     """Otherwise every refusal re-notices it and slides its window forward,
     and a model that is only ever refused remembers it indefinitely."""

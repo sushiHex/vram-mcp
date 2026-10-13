@@ -280,10 +280,11 @@ def _prune_expired(data: dict, now: datetime, path: Path) -> bool:
     # Each abandonment continues the run and restarts its window from now, when
     # it is noticed — not from the lease, which a live owner may outlast by any
     # margin, so dating from it could forget an abandonment as it happened.
+    # The run is counted here, never from the record's copy: a record can
+    # outlive the run it inherited, and its copy would revive a forgotten run.
     for record in expired:
         model = canonical_model(record["model"])
-        previous = memory.get(model, {}).get("count", 0)
-        memory[model] = {"count": max(previous, _count(record.get("retry_count")) + 1),
+        memory[model] = {"count": memory.get(model, {}).get("count", 0) + 1,
                          "expires_at": _iso(_retry_expiry(now))}
     data["operation_retry_counts"] = memory
     return bool(expired) or len(data["claims"]) != claims_before or memory != raw_memory
@@ -406,10 +407,14 @@ def claim(
     }
     with _locked(path):
         data = _load_pruned(path, now)
-        if _pending_for(data, model, now):
-            raise ValueError(f"operation pending for {model}")
-        data["claims"].append(record)
-        _save(path, data)
+        refused = bool(_pending_for(data, model, now))
+        if not refused:
+            data["claims"].append(record)
+            _save(path, data)
+    # Refused only after the lock's exit check: pruning may already have
+    # written, and a displaced lock must not hide behind an ordinary refusal.
+    if refused:
+        raise ValueError(f"operation pending for {model}")
     return {"claim_id": record["claim_id"], "expires_at": record["expires_at"],
             "model": model}
 
@@ -435,10 +440,12 @@ def reserve(
     }
     with _locked(path):
         data = _load_pruned(path, now)
-        if _has_pending_warm(data):
-            raise ValueError("warm admission pending; retry reservation after it completes")
-        data["claims"].append(record)
-        _save(path, data)
+        refused = _has_pending_warm(data)
+        if not refused:
+            data["claims"].append(record)
+            _save(path, data)
+    if refused:     # after the lock's exit check, as in claim()
+        raise ValueError("warm admission pending; retry reservation after it completes")
     return {"claim_id": record["claim_id"], "expires_at": record["expires_at"]}
 
 
