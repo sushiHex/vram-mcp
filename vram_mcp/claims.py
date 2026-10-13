@@ -25,6 +25,10 @@ from .models import canonical_model
 from .validation import nonblank_text, positive_gb, positive_ttl_seconds
 
 _DEFAULT_PATH = Path.home() / ".cache" / "vram-mcp" / "claims.json"
+# Bumped only by a change older clients could not honour safely; they then
+# refuse the ledger outright. Additive vocabulary stays within a protocol and
+# is tolerated record by record (see _identifiable_operation).
+_PROTOCOL = 1
 _OPERATION_LEASE_SECONDS = 120
 _EVICTION_KINDS = {"unload", "ensure_free"}
 _DEFAULT_SCOPE = "gpu:index=0"
@@ -120,6 +124,16 @@ def _load(path: Path) -> dict:
         raise ValueError(f"claim ledger is corrupt: {path}") from exc
     if not isinstance(data, dict) or not isinstance(data.get("claims"), list):
         raise ValueError(f"claim ledger has invalid shape: {path}")
+    # Unmarked ledgers predate the marker, so they are protocol 1 for good —
+    # never "whatever this version speaks", which would reinterpret old data.
+    protocol = data.get("protocol", 1)
+    if isinstance(protocol, bool) or not isinstance(protocol, int) or protocol < 1:
+        raise ValueError(f"claim ledger has invalid protocol: {path}")
+    if protocol > _PROTOCOL:
+        raise ValueError(
+            f"claim ledger {path} uses coordination protocol {protocol}, but this "
+            f"vram-mcp speaks protocol {_PROTOCOL}. Upgrade this client, or reset "
+            "the ledger as described in docs/coordination.md.")
     operations = data.get("operations", [])
     if not isinstance(operations, list):
         raise ValueError(f"claim ledger has invalid operations: {path}")
@@ -128,7 +142,7 @@ def _load(path: Path) -> dict:
 
 
 def _save(path: Path, data: dict) -> None:
-    save_json_atomic(path, data)
+    save_json_atomic(path, {**data, "protocol": _PROTOCOL})
 
 
 def _is_active(record: dict, now: datetime) -> bool:

@@ -50,6 +50,50 @@ a single-generation deployment the check never fires.
 This is detection, not exclusion. A displaced lock means the ledger may already
 have diverged; treat it as an incident and restart from a single generation.
 
+### Protocol marker
+
+Every write stamps the ledger with the coordination `protocol` it was made
+under. A client refuses a ledger whose protocol is newer than its own, for reads
+as well as writes, because the records may carry obligations it cannot see. The
+refusal names both protocols, and the file is left untouched.
+
+Changes that only add vocabulary stay within one protocol: a record carrying an
+unfamiliar lifecycle is still honoured and reported as `unrecognized`. Only a
+change that older clients could not honour safely raises the protocol number.
+
+The marker protects only between clients that check it, which begins with
+this one. Earlier clients ignore it, so its absence does not show who wrote a
+ledger, and its presence does not rule out a pre-0.3 writer. A ledger without a
+marker is read as protocol 1. The marker exists so that the next generation
+boundary is detected, unlike this one.
+
+### Recovering a shared ledger
+
+After a `LockDisplacedError` or a protocol refusal:
+
+1. Stop every vram-mcp process. Each MCP client session runs its own server, so
+   closing one session is not enough.
+2. Install one vram-mcp version everywhere that shares the home directory. A
+   protocol refusal persists until the ledger is reset or every client speaks
+   the protocol recorded in it.
+3. Decide whether to keep `claims.json`. It is plain JSON. If it parses, its
+   protocol is one your clients speak, and its claims match the work you know
+   to be running, keep it. Otherwise rename it aside (for example to
+   `claims.json.diverged`) rather than deleting it; the next client starts an
+   empty ledger.
+4. Restart one client and check `list_loaded()`. An operation that was pending
+   or `unknown` may still have changed Ollama residency after its client
+   stopped.
+5. Have agents re-claim the models and re-reserve the capacity they rely on
+   before resuming warm, unload, or `ensure_free`.
+
+Resetting the ledger discards its coordination promises: model claims,
+capacity reservations, pending-operation records, and retry history. Loaded
+models and audit history are unaffected. While every client is stopped, the
+`claims.json.lock`, `claims.json.operation-*.lock`, and `claims.json.tmp` files
+are safe to delete, and current clients recreate them as needed. Never delete
+them while any client is running.
+
 ## Model claims
 
 Use `claim(model, owner, purpose)` before relying on a model. Claims default to

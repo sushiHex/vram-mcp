@@ -1,6 +1,8 @@
 """Tests for vram_mcp.claims — real temp-dir file I/O (atomicity is the point)."""
 
 import json
+import subprocess
+import sys
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -500,8 +502,9 @@ def test_malformed_existing_operation_is_discarded_without_losing_claims(tmp_pat
     assert [r["claim_id"] for r in on_disk["claims"]] == ["claim"]
 
 
-# A record written by a LATER protocol version: identity and lease are readable,
-# but its lifecycle, outcome and retry vocabulary are ones this version lacks.
+# A record written by a later version under the same protocol: identity and lease
+# are readable, but its lifecycle, outcome and retry vocabulary are ones this
+# version lacks.
 _FOREIGN_OPERATION = {
     "operation_id": "future-op", "model": "model:latest", "kind": "unload",
     "scope": "gpu:index=0", "started_at": "2026-07-13T17:59:00Z",
@@ -700,3 +703,83 @@ def test_retry_count_survives_expiry_and_list_pruning(tmp_path):
         assert on_disk["operations"][0]["retry_count"] == 1
     finally:
         claims.finish_operation(second["operation_id"], path=path, now_fn=clock)
+
+
+# ── protocol marker ──────────────────────────────────────────────────────────
+
+def test_every_write_records_the_protocol_it_was_made_under(tmp_path):
+    path = tmp_path / "claims.json"
+    claims.claim("model", "a", "p", path=path, now_fn=lambda: _T0)
+    assert json.loads(path.read_text(encoding="utf-8"))["protocol"] == claims._PROTOCOL
+
+
+def test_an_unmarked_ledger_is_read_as_the_first_protocol_and_then_marked(tmp_path):
+    """Ledgers written before the marker existed carry none."""
+    path = tmp_path / "claims.json"
+    path.write_text(json.dumps({"claims": [], "operations": []}), encoding="utf-8")
+    claims.claim("model", "a", "p", path=path, now_fn=lambda: _T0)
+    assert json.loads(path.read_text(encoding="utf-8"))["protocol"] == 1
+
+
+def test_a_newer_protocol_is_refused_by_every_reader_and_writer(tmp_path):
+    """Its records may carry obligations this version cannot see, so neither
+    reporting nor changing them is safe — and the file is left exactly as found."""
+    path = tmp_path / "claims.json"
+    newer = claims._PROTOCOL + 1
+    path.write_text(json.dumps({"protocol": newer, "claims": [], "operations": []}),
+                    encoding="utf-8")
+    before = path.read_bytes()
+    for call in (
+        lambda: claims.claim("model", "a", "p", path=path, now_fn=lambda: _T0),
+        lambda: claims.begin_operation("model", "unload", path=path, now_fn=lambda: _T0),
+        lambda: claims.list_coordination(path=path, now_fn=lambda: _T0),
+        lambda: claims.list_claims(path=path, now_fn=lambda: _T0),
+    ):
+        with pytest.raises(ValueError, match=f"protocol {newer}"):
+            call()
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("marker", [0, -1, True, 1.0, "1", None])
+def test_an_unreadable_protocol_marker_is_refused(tmp_path, marker):
+    path = tmp_path / "claims.json"
+    path.write_text(json.dumps({"protocol": marker, "claims": []}), encoding="utf-8")
+    with pytest.raises(ValueError, match="invalid protocol"):
+        claims.list_claims(path=path, now_fn=lambda: _T0)
+
+
+# ── concurrent writers ───────────────────────────────────────────────────────
+
+_WRITER = (
+    "import sys\nfrom pathlib import Path\nfrom vram_mcp import claims\n"
+    "path, owner, count = Path(sys.argv[1]), sys.argv[2], int(sys.argv[3])\n"
+    "print('ready', flush=True)\n"
+    "sys.stdin.readline()\n"
+    "for i in range(count):\n"
+    "    claims.claim(f'model-{i}', owner, 'concurrency', path=path)\n"
+)
+
+
+def test_concurrent_writers_lose_no_update(tmp_path):
+    """Each claim is a read-modify-write of the whole file; without exclusion
+    two writers that read the same version silently drop one another's record."""
+    path = tmp_path / "claims.json"
+    writers, per_writer = 4, 25
+    procs = [subprocess.Popen([sys.executable, "-c", _WRITER, str(path), f"w{n}",
+                               str(per_writer)], stdin=subprocess.PIPE,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+             for n in range(writers)]
+    # Release every writer at once: interpreter start-up would otherwise
+    # stagger them enough that they barely overlap.
+    for proc in procs:
+        assert proc.stdout.readline().strip() == "ready"
+    for proc in procs:
+        proc.stdin.write("go\n")
+        proc.stdin.flush()
+    for proc in procs:
+        _, stderr = proc.communicate(timeout=60)
+        assert proc.returncode == 0, stderr
+    recorded = json.loads(path.read_text(encoding="utf-8"))["claims"]
+    assert len({r["claim_id"] for r in recorded}) == len(recorded) == writers * per_writer
+    assert {(r["owner"], r["model"]) for r in recorded} == {
+        (f"w{n}", f"model-{i}:latest") for n in range(writers) for i in range(per_writer)}
