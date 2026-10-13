@@ -106,11 +106,9 @@ as `null`; GPU failures retain `gpus=[]` with unavailable metadata and
 `free_mb=null`. This distinction lets callers separate “no models/processes”
 from “the source could not be queried.”
 
-Process metadata also reports whether non-local memory is covered. Current
-NVML process readings do not provide selected-device non-local memory. Windows
-GPU Process Memory counters aggregate adapters, so vram-mcp uses them only to
-name processes and reports `non_local_memory=false` rather than assigning their
-totals to the selected GPU. Compute and graphics process-query coverage are
+Process metadata also reports whether non-local memory is covered. No collector
+provides it yet: NVML process readings do not include it, so `non_local_memory`
+is `false` on every platform. Compute and graphics process-query coverage are
 reported separately; either query may be unavailable while the other's rows
 remain useful.
 
@@ -140,10 +138,11 @@ Without it, spill was never observable and the state is `unknown` with the
 missing evidence named in `detail`, rather than `ok`. Missing process
 information is not evidence that nothing else is using the GPU.
 
-On Windows/WDDM this is the normal case, not an edge one: NVML cannot report
-per-process memory and the GPU counters aggregate adapters, so non-local
-coverage is always false and `vram_status()` reports `unknown` there. Read
-`pressure.coverage` to see exactly which evidence was available.
+Today this is the normal case on every platform, not an edge one: no collector
+observes non-local memory, so `vram_status()` reports `unknown` where it would
+otherwise report `ok`. A measured route back on Windows is tracked in
+[#22](https://github.com/sushiHex/vram-mcp/issues/22). Read `pressure.coverage`
+to see exactly which evidence was available.
 
 Keep the sample interval high enough that samples do not crowd action events
 out of the bounded log. Raising the spill floor can suppress noisy alerts;

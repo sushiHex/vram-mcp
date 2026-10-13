@@ -101,13 +101,14 @@ real locks.
 **Linux is untested on hardware.** CI exercises the Linux code paths with mocks
 only.
 
-## Known limitation: Windows pressure
+## Known limitation: pressure cannot read `ok`
 
-On Windows, `pressure.coverage.non_local_memory` is `false`, so `pressure` reads
-`unknown`. NVML reports no per-process memory under WDDM. The GPU performance
-counters do report it, but the earlier collector summed them across every adapter
-on the host and was slow, so it was removed. An investigation on the validated
-machine found that both problems can be fixed:
+`pressure.coverage.non_local_memory` is `false` on every platform, because no
+collector observes non-local memory yet, so `pressure` reads `unknown` where it
+would otherwise read `ok`. NVML does not report non-local memory. On Windows the
+GPU performance counters do, but the earlier collector summed them across every
+adapter on the host and was slow, so it was removed. An investigation on the
+validated machine found that both of those problems can be fixed:
 
 - `D3DKMTQueryAdapterInfo` returns each WDDM adapter's PCI address. That maps
   its LUID to the NVML device exactly; on the validated machine, LUID
@@ -119,6 +120,8 @@ machine found that both problems can be fixed:
 - Per-process *Dedicated* Usage is not usable: Chrome's GPU process and `dwm`
   reported 488 GB and 209 GB on a 24 GB card, with valid counter status.
 
-Restoring Windows spill detection on this basis is tracked in
-[#22](https://github.com/sushiHex/vram-mcp/issues/22); until then, Windows
-`pressure` reads `unknown`.
+Restoring spill detection on this basis is tracked in
+[#22](https://github.com/sushiHex/vram-mcp/issues/22). Linux needs its own
+answer, because WDDM's demotion of VRAM to system memory is a Windows mechanism.
+Whether spill can be ruled out there structurally, rather than measured, is not
+yet established.
