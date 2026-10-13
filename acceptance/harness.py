@@ -221,11 +221,13 @@ async def reserving_all_but(b: Tools, headroom_mb: int):
         await b("release", claim_id=held["claim_id"])
 
 
-async def refresh_is_admitted_under_reservation(run: Run, a: Tools, b: Tools, model: str,
-                                                headroom_mb: int) -> None:
-    async with reserving_all_but(b, headroom_mb) as reserved:
+async def refresh_is_admitted_under_reservation(run: Run, a: Tools, b: Tools,
+                                                model: str) -> None:
+    # Everything free is reserved: a refresh needs no new residency, so even
+    # a full reservation must admit it.
+    async with reserving_all_but(b, 0) as reserved:
         refreshed = await a("warm", model=model, keep_alive=KEEP_ALIVE, by="acceptance-a")
-        run.check("A resident refresh is admitted under a reservation",
+        run.check("A resident refresh is admitted under a full reservation",
                   refreshed["ok"] and refreshed["reason"] == "already_resident",
                   f"{reserved}; warm -> {refreshed['outcome']} ({refreshed['reason']})")
 
@@ -373,7 +375,7 @@ async def acceptance(run: Run, args: argparse.Namespace, tmp: Path) -> dict:
             try:
                 await claims_protect_across_sessions(run, a, b, args.model)
                 await pending_warm_protects(run, a, b, args.model)
-                await refresh_is_admitted_under_reservation(run, a, b, args.model, headroom_mb)
+                await refresh_is_admitted_under_reservation(run, a, b, args.model)
                 await claims_outlive_their_client(run, state, args.ollama, args.gpu, b,
                                                   args.model)
                 await reload_is_refused_under_reservation(run, a, b, args.model, headroom_mb)

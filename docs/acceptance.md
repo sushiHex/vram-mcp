@@ -75,7 +75,7 @@ scenario fails.
 | Another session cannot evict a claimed model | Two server processes share one ledger. |
 | A pending warm blocks other sessions | A second session sees the in-flight operation and is refused. |
 | A confirmed warm agrees with Ollama residency | `succeeded` means the model is resident afterwards. |
-| A resident refresh is admitted under a reservation | Keep-alive refresh costs no new residency. |
+| A resident refresh is admitted under a full reservation | Keep-alive refresh costs no new residency, so it is admitted even with every free MB reserved. |
 | A departed client's claim protects until its TTL | A claim outlives its client's process, then expires. |
 | A confirmed unload agrees with Ollama residency | `succeeded` means the model is gone afterwards. |
 | A reload that would breach a reservation is refused | Admission honours another session's reservation: half the model's size is left free. |
