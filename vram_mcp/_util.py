@@ -50,6 +50,10 @@ def iso(dt: datetime) -> str:
 
 
 def parse_iso(text: str) -> datetime:
+    # A hand-edited file can hold any JSON here; a non-string is as unparsable
+    # as a malformed string, and callers already handle that as ValueError.
+    if not isinstance(text, str):
+        raise ValueError(f"not an ISO timestamp: {text!r}")
     return datetime.fromisoformat(text.replace("Z", "+00:00"))
 
 

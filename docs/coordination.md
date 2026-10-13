@@ -163,7 +163,7 @@ entry has this stable shape:
 | `owner_live` | Whether the operation's OS owner lock is currently held. |
 | `lease_expired` | Whether the wall-clock lease has elapsed; this never overrides `owner_live`. |
 | `outcome`, `reason` | `null` while in flight; `unknown` and the retained reason for an uncertain operation. |
-| `retry_count`, `retry_after` | Number of retries already made and the next safe retry time, or `null` while in flight. |
+| `retry_count`, `retry_after` | `retry_count` is the length of the current run of attempts on this model that were abandoned without an outcome. A definite finish ends the run, as do 24 hours without a further abandonment. `retry_after` is the next safe retry time, or `null` while in flight. |
 
 An operation with `owner_live=true` continues to block the same-model mutation
 even when `lease_expired=true`. A lease is safe to discard only when its owner
