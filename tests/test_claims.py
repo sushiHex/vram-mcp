@@ -713,12 +713,25 @@ def test_every_write_records_the_protocol_it_was_made_under(tmp_path):
     assert json.loads(path.read_text(encoding="utf-8"))["protocol"] == claims._PROTOCOL
 
 
-def test_an_unmarked_ledger_is_read_as_the_first_protocol_and_then_marked(tmp_path):
-    """Ledgers written before the marker existed carry none."""
+def test_upgrading_marks_an_unmarked_ledger_without_losing_protection(tmp_path):
+    """Ledgers written before the marker existed carry none; the first write
+    by a marking client must keep every promise already in them."""
     path = tmp_path / "claims.json"
-    path.write_text(json.dumps({"claims": [], "operations": []}), encoding="utf-8")
-    claims.claim("model", "a", "p", path=path, now_fn=lambda: _T0)
-    assert json.loads(path.read_text(encoding="utf-8"))["protocol"] == 1
+    held = claims.claim("held", "a", "p", path=path, now_fn=lambda: _T0)
+    pending = claims.begin_operation("busy", "unload", force=True,
+                                     path=path, now_fn=lambda: _T0)
+    claims.finish_operation(pending["operation_id"], uncertain=True,
+                            path=path, now_fn=lambda: _T0)
+    unmarked = json.loads(path.read_text(encoding="utf-8"))
+    del unmarked["protocol"]
+    path.write_text(json.dumps(unmarked), encoding="utf-8")
+
+    claims.claim("other", "b", "p", path=path, now_fn=lambda: _T0)
+
+    on_disk = json.loads(path.read_text(encoding="utf-8"))
+    assert on_disk["protocol"] == 1
+    assert held["claim_id"] in {r["claim_id"] for r in on_disk["claims"]}
+    assert [r["operation_id"] for r in on_disk["operations"]] == [pending["operation_id"]]
 
 
 def test_a_newer_protocol_is_refused_by_every_reader_and_writer(tmp_path):
