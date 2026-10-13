@@ -1,6 +1,9 @@
 """Tests for vram_mcp.claims — real temp-dir file I/O (atomicity is the point)."""
 
 import json
+import subprocess
+import sys
+import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -500,8 +503,9 @@ def test_malformed_existing_operation_is_discarded_without_losing_claims(tmp_pat
     assert [r["claim_id"] for r in on_disk["claims"]] == ["claim"]
 
 
-# A record written by a LATER protocol version: identity and lease are readable,
-# but its lifecycle, outcome and retry vocabulary are ones this version lacks.
+# A record written by a later version under the same protocol: identity and lease
+# are readable, but its lifecycle, outcome and retry vocabulary are ones this
+# version lacks.
 _FOREIGN_OPERATION = {
     "operation_id": "future-op", "model": "model:latest", "kind": "unload",
     "scope": "gpu:index=0", "started_at": "2026-07-13T17:59:00Z",
@@ -874,3 +878,141 @@ def test_a_non_string_expiry_reads_as_lapsed_instead_of_breaking_the_ledger(tmp_
 
 def _iso_at(moment):
     return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# ── protocol marker ──────────────────────────────────────────────────────────
+
+def test_every_write_records_the_protocol_it_was_made_under(tmp_path):
+    path = tmp_path / "claims.json"
+    claims.claim("model", "a", "p", path=path, now_fn=lambda: _T0)
+    assert json.loads(path.read_text(encoding="utf-8"))["protocol"] == claims._PROTOCOL
+
+
+def test_upgrading_marks_an_unmarked_ledger_without_losing_protection(tmp_path):
+    """Ledgers written before the marker existed carry none; the first write
+    by a marking client must keep every promise already in them."""
+    path = tmp_path / "claims.json"
+    claims.claim("held", "a", "p", path=path, now_fn=lambda: _T0)
+    claims.reserve(4, "a", "p", path=path, now_fn=lambda: _T0)
+    pending = claims.begin_operation("busy", "unload", force=True,
+                                     path=path, now_fn=lambda: _T0)
+    claims.finish_operation(pending["operation_id"], uncertain=True,
+                            path=path, now_fn=lambda: _T0)
+    unmarked = json.loads(path.read_text(encoding="utf-8"))
+    del unmarked["protocol"]
+    unmarked["operation_retry_counts"] = {
+        "elsewhere:latest": {"count": 2, "expires_at": "2026-07-14T18:00:00Z"}}
+    unmarked["field_from_a_later_build"] = {"kept": True}
+    path.write_text(json.dumps(unmarked), encoding="utf-8")
+
+    added = claims.claim("other", "b", "p", path=path, now_fn=lambda: _T0)
+
+    on_disk = json.loads(path.read_text(encoding="utf-8"))
+    assert on_disk.pop("protocol") == 1
+    on_disk["claims"] = [r for r in on_disk["claims"] if r["claim_id"] != added["claim_id"]]
+    assert on_disk == unmarked
+
+
+_NEWER = claims._PROTOCOL + 1
+
+
+@pytest.mark.parametrize("ledger", [
+    {"protocol": _NEWER, "claims": [], "operations": []},
+    # A newer protocol may reshape the ledger; it is still diagnosed as newer.
+    {"protocol": _NEWER, "records": {}},
+])
+def test_a_newer_protocol_is_refused_by_every_reader_and_writer(tmp_path, ledger):
+    """Its records may carry obligations this version cannot see, so neither
+    reporting nor changing them is safe — and the file is left exactly as found."""
+    path = tmp_path / "claims.json"
+    path.write_text(json.dumps(ledger), encoding="utf-8")
+    before = path.read_bytes()
+    for call in (
+        lambda: claims.claim("model", "a", "p", path=path, now_fn=lambda: _T0),
+        lambda: claims.reserve(4, "a", "p", path=path, now_fn=lambda: _T0),
+        lambda: claims.renew("claim", path=path, now_fn=lambda: _T0),
+        lambda: claims.release("claim", path=path, now_fn=lambda: _T0),
+        lambda: claims.begin_operation("model", "unload", path=path, now_fn=lambda: _T0),
+        lambda: claims.finish_operation("operation", path=path, now_fn=lambda: _T0),
+        lambda: claims.list_coordination(path=path, now_fn=lambda: _T0),
+        lambda: claims.list_claims(path=path, now_fn=lambda: _T0),
+    ):
+        with pytest.raises(ValueError, match=f"protocol {_NEWER}"):
+            call()
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("marker", [0, -1, True, 1.0, "1", None])
+def test_an_unreadable_protocol_marker_is_refused(tmp_path, marker):
+    path = tmp_path / "claims.json"
+    path.write_text(json.dumps({"protocol": marker, "claims": []}), encoding="utf-8")
+    with pytest.raises(ValueError, match="invalid protocol"):
+        claims.list_claims(path=path, now_fn=lambda: _T0)
+
+
+def test_a_displaced_ledger_lock_does_not_strand_the_operation_owner(tmp_path, monkeypatch):
+    """Displacement is only discovered on the ledger lock's exit, after the
+    owner lock is taken. The caller never learns an operation_id to finish
+    with, so the owner must be released then, not left blocking the model."""
+    path = tmp_path / "claims.json"
+    answers = iter([True, False])           # governs on entry, displaced by exit
+    monkeypatch.setattr(_util, "_governs", lambda fd, lock_path: next(answers))
+    owners_before = dict(claims._OPERATION_LOCKS)
+    with pytest.raises(_util.LockDisplacedError):
+        claims.begin_operation("model", "unload", force=True, path=path, now_fn=lambda: _T0)
+    assert claims._OPERATION_LOCKS == owners_before
+    fd = claims._try_operation_lock(path, "model:latest")
+    assert fd is not None
+    claims._release_operation_lock(fd)
+
+
+# ── concurrent writers ───────────────────────────────────────────────────────
+
+_WRITER = (
+    "import sys, time\nfrom pathlib import Path\nfrom vram_mcp import claims\n"
+    "path, owner, count = Path(sys.argv[1]), sys.argv[2], int(sys.argv[3])\n"
+    "(path.parent / f'{owner}.ready').touch()\n"
+    "deadline = time.monotonic() + 30\n"
+    "while not (path.parent / 'go').exists():\n"
+    "    if time.monotonic() > deadline:\n"
+    "        sys.exit('never released')\n"
+    "    time.sleep(0.001)\n"
+    "for i in range(count):\n"
+    "    claims.claim(f'model-{i}', owner, 'concurrency', path=path)\n"
+)
+
+
+def _await(condition, seconds=30):
+    deadline = time.monotonic() + seconds
+    while not condition():
+        assert time.monotonic() < deadline, "writers never became ready"
+        time.sleep(0.01)
+
+
+def test_concurrent_writers_lose_no_update(tmp_path):
+    """Each claim is a read-modify-write of the whole file; without exclusion
+    two writers that read the same version silently drop one another's record."""
+    path = tmp_path / "claims.json"
+    owners, per_writer = [f"w{n}" for n in range(4)], 25
+    procs = []
+    try:
+        for owner in owners:
+            with open(tmp_path / f"{owner}.err", "w") as err:
+                procs.append(subprocess.Popen(
+                    [sys.executable, "-c", _WRITER, str(path), owner, str(per_writer)],
+                    stderr=err))
+        # Release every writer at once: interpreter start-up would otherwise
+        # stagger them enough that they barely overlap.
+        _await(lambda: all((tmp_path / f"{o}.ready").exists() for o in owners))
+        (tmp_path / "go").touch()
+        for owner, proc in zip(owners, procs):
+            assert proc.wait(timeout=60) == 0, (tmp_path / f"{owner}.err").read_text()
+    finally:
+        for proc in procs:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+    recorded = json.loads(path.read_text(encoding="utf-8"))["claims"]
+    assert len({r["claim_id"] for r in recorded}) == len(recorded) == len(owners) * per_writer
+    assert {(r["owner"], r["model"]) for r in recorded} == {
+        (owner, f"model-{i}:latest") for owner in owners for i in range(per_writer)}

@@ -133,9 +133,6 @@ def locked(path: Path, timeout: float = 5.0, poll: float = 0.05):
     fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR)
     acquired = False
     try:
-        # Windows locks byte ranges and cannot lock an empty file.
-        if os.fstat(fd).st_size == 0:
-            os.write(fd, b"\0")
         while True:
             try:
                 _try_lock(fd)

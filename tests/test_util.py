@@ -97,6 +97,18 @@ def test_locked_is_released_when_holder_crashes(tmp_path):
         pass
 
 
+def test_a_contender_waits_for_the_lock_and_never_writes_to_it(tmp_path):
+    """Windows enforces a held byte-range lock against writes from any other
+    handle, so a contender that pads the file fails with PermissionError
+    instead of waiting. An empty file locks perfectly well; leave it empty."""
+    p = tmp_path / "d.json"
+    with _util.locked(p):
+        assert p.with_suffix(p.suffix + ".lock").stat().st_size == 0
+        with pytest.raises(TimeoutError):
+            with _util.locked(p, timeout=0.1, poll=0.01):
+                pass
+
+
 # ---- a lock must still govern the path it was taken on ----------------------
 #
 # A pre-0.3 client treats the lock file's EXISTENCE as ownership and unlinks any
