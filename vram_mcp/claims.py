@@ -147,8 +147,6 @@ def _try_operation_lock(path: Path, model: str) -> int | None:
     lock_path = _operation_lock_path(path, model)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR)
-    if os.fstat(fd).st_size == 0:
-        os.write(fd, b"\0")
     try:
         _try_lock(fd)
     except BlockingIOError:
