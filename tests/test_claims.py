@@ -700,3 +700,100 @@ def test_retry_count_survives_expiry_and_list_pruning(tmp_path):
         assert on_disk["operations"][0]["retry_count"] == 1
     finally:
         claims.finish_operation(second["operation_id"], path=path, now_fn=clock)
+
+
+# ── retry memory ─────────────────────────────────────────────────────────────
+
+_WINDOW = claims._RETRY_MEMORY_SECONDS
+
+
+def _abandon(path, clock, model="model"):
+    """Leave an operation whose outcome is unknown, then let its lease lapse."""
+    started = claims.begin_operation(model, "unload", force=True, path=path, now_fn=clock)
+    claims.finish_operation(started["operation_id"], uncertain=True, path=path, now_fn=clock)
+    clock.tick(claims._OPERATION_LEASE_SECONDS + 1)
+
+
+def _retry_memory_on_disk(path):
+    return json.loads(path.read_text(encoding="utf-8"))["operation_retry_counts"]
+
+
+def _next_retry_count(path, clock, model="model"):
+    started = claims.begin_operation(model, "unload", force=True, path=path, now_fn=clock)
+    claims.finish_operation(started["operation_id"], path=path, now_fn=clock)
+    return started["retry_count"]
+
+
+def test_a_reading_list_persists_the_abandonment_it_notices(tmp_path):
+    """Pruning only retry memory is still a change; a poll must not redo it
+    in memory forever without writing it down."""
+    path = tmp_path / "claims.json"
+    clock = _clock(_T0)
+    _abandon(path, clock)
+    claims.list_coordination(path=path, now_fn=clock)
+    assert _retry_memory_on_disk(path) == {"model:latest": {
+        "count": 1, "expires_at": _iso_at(clock.now + timedelta(seconds=_WINDOW))}}
+
+
+def test_an_abandonment_is_forgotten_once_its_window_passes(tmp_path):
+    path = tmp_path / "claims.json"
+    clock = _clock(_T0)
+    _abandon(path, clock)
+    claims.list_coordination(path=path, now_fn=clock)
+    clock.tick(_WINDOW)
+    claims.list_coordination(path=path, now_fn=clock)
+    assert _retry_memory_on_disk(path) == {}
+    assert _next_retry_count(path, clock) == 0
+
+
+def test_an_abandonment_is_remembered_until_its_window_passes(tmp_path):
+    path = tmp_path / "claims.json"
+    clock = _clock(_T0)
+    _abandon(path, clock)
+    claims.list_coordination(path=path, now_fn=clock)
+    clock.tick(_WINDOW - 1)
+    assert _next_retry_count(path, clock) == 1
+
+
+def test_the_window_dates_from_when_abandonment_is_noticed(tmp_path):
+    """An owner may stay live long past its nominal lease. Dating the memory
+    from that lease would forget an abandonment the moment it happened."""
+    path = tmp_path / "claims.json"
+    clock = _clock(_T0)
+    started = claims.begin_operation("model", "unload", force=True, path=path, now_fn=clock)
+    clock.tick(2 * _WINDOW)
+    # The owner dies without finishing: its OS lock goes, its record stays.
+    claims._release_operation_lock(claims._OPERATION_LOCKS.pop(started["operation_id"]))
+    assert _next_retry_count(path, clock) == 1
+
+
+def test_bare_counts_from_earlier_builds_are_honoured_and_given_a_lifetime(tmp_path):
+    path = tmp_path / "claims.json"
+    path.write_text(json.dumps({"claims": [], "operations": [],
+                                "operation_retry_counts": {"model:latest": 2}}),
+                    encoding="utf-8")
+    clock = _clock(_T0)
+    claims.list_coordination(path=path, now_fn=clock)
+    assert _retry_memory_on_disk(path) == {"model:latest": {
+        "count": 2, "expires_at": _iso_at(_T0 + timedelta(seconds=_WINDOW))}}
+    assert _next_retry_count(path, clock) == 2
+
+
+@pytest.mark.parametrize("entry", [
+    "two", True, -1, None,
+    {"count": -1, "expires_at": "2026-07-14T18:00:00Z"},
+    {"count": True, "expires_at": "2026-07-14T18:00:00Z"},
+    {"count": 2, "expires_at": "not a time"},
+    {"count": 2},
+])
+def test_an_unreadable_retry_entry_is_dropped_rather_than_guessed(tmp_path, entry):
+    path = tmp_path / "claims.json"
+    path.write_text(json.dumps({"claims": [], "operations": [],
+                                "operation_retry_counts": {"model:latest": entry}}),
+                    encoding="utf-8")
+    assert _next_retry_count(path, _clock(_T0)) == 0
+    assert _retry_memory_on_disk(path) == {}
+
+
+def _iso_at(moment):
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
