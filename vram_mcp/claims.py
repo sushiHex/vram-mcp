@@ -122,8 +122,10 @@ def _load(path: Path) -> dict:
         data = json.loads(text)
     except ValueError as exc:
         raise ValueError(f"claim ledger is corrupt: {path}") from exc
-    if not isinstance(data, dict) or not isinstance(data.get("claims"), list):
+    if not isinstance(data, dict):
         raise ValueError(f"claim ledger has invalid shape: {path}")
+    # The marker is read before any protocol-specific field: a newer protocol
+    # may reshape them, and must be diagnosed as newer, not as malformed.
     # Unmarked ledgers predate the marker, so they are protocol 1 for good —
     # never "whatever this version speaks", which would reinterpret old data.
     protocol = data.get("protocol", 1)
@@ -134,6 +136,8 @@ def _load(path: Path) -> dict:
             f"claim ledger {path} uses coordination protocol {protocol}, but this "
             f"vram-mcp speaks protocol {_PROTOCOL}. Upgrade this client, or reset "
             "the ledger as described in docs/coordination.md.")
+    if not isinstance(data.get("claims"), list):
+        raise ValueError(f"claim ledger has invalid shape: {path}")
     operations = data.get("operations", [])
     if not isinstance(operations, list):
         raise ValueError(f"claim ledger has invalid operations: {path}")

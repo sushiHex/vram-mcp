@@ -67,6 +67,10 @@ ledger, and its presence does not rule out a pre-0.3 writer. A ledger without a
 marker is read as protocol 1. The marker exists so that the next generation
 boundary is detected, unlike this one.
 
+Detection is not a rolling upgrade. A client mid-operation when a newer one
+stamps the ledger cannot record that operation's outcome, so stop every client
+before upgrading across a protocol change.
+
 ### Recovering a shared ledger
 
 After a `LockDisplacedError` or a protocol refusal:
@@ -76,15 +80,17 @@ After a `LockDisplacedError` or a protocol refusal:
 2. Install one vram-mcp version everywhere that shares the home directory. A
    protocol refusal persists until the ledger is reset or every client speaks
    the protocol recorded in it.
-3. Decide whether to keep `claims.json`. It is plain JSON. If it parses, its
-   protocol is one your clients speak, and its claims match the work you know
-   to be running, keep it. Otherwise rename it aside (for example to
-   `claims.json.diverged`) rather than deleting it; the next client starts an
-   empty ledger.
-4. Restart one client and check `list_loaded()`. An operation that was pending
-   or `unknown` may still have changed Ollama residency after its client
-   stopped.
-5. Have agents re-claim the models and re-reserve the capacity they rely on
+3. Decide whether to keep `claims.json`. It is plain JSON; keep it only if its
+   claims match the work you know to be running. Otherwise rename it aside
+   (for example to `claims.json.diverged`) rather than deleting it; the next
+   client starts an empty ledger. Note any operation's `pending_until` first.
+4. Restart one client and call `list_claims()`. It must succeed: that, not
+   inspection by eye, is what establishes the ledger is usable. If it is
+   refused, return to step 3.
+5. Stopping clients does not stop a request already sent to Ollama. Wait until
+   every noted `pending_until` has passed, or restart Ollama, before trusting
+   what `list_loaded()` reports.
+6. Have agents re-claim the models and re-reserve the capacity they rely on
    before resuming warm, unload, or `ensure_free`.
 
 Resetting the ledger discards its coordination promises: model claims,

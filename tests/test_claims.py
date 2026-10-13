@@ -3,6 +3,7 @@
 import json
 import subprocess
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -717,38 +718,52 @@ def test_upgrading_marks_an_unmarked_ledger_without_losing_protection(tmp_path):
     """Ledgers written before the marker existed carry none; the first write
     by a marking client must keep every promise already in them."""
     path = tmp_path / "claims.json"
-    held = claims.claim("held", "a", "p", path=path, now_fn=lambda: _T0)
+    claims.claim("held", "a", "p", path=path, now_fn=lambda: _T0)
+    claims.reserve(4, "a", "p", path=path, now_fn=lambda: _T0)
     pending = claims.begin_operation("busy", "unload", force=True,
                                      path=path, now_fn=lambda: _T0)
     claims.finish_operation(pending["operation_id"], uncertain=True,
                             path=path, now_fn=lambda: _T0)
     unmarked = json.loads(path.read_text(encoding="utf-8"))
     del unmarked["protocol"]
+    unmarked["operation_retry_counts"] = {
+        "elsewhere:latest": {"count": 2, "expires_at": "2026-07-14T18:00:00Z"}}
+    unmarked["field_from_a_later_build"] = {"kept": True}
     path.write_text(json.dumps(unmarked), encoding="utf-8")
 
-    claims.claim("other", "b", "p", path=path, now_fn=lambda: _T0)
+    added = claims.claim("other", "b", "p", path=path, now_fn=lambda: _T0)
 
     on_disk = json.loads(path.read_text(encoding="utf-8"))
-    assert on_disk["protocol"] == 1
-    assert held["claim_id"] in {r["claim_id"] for r in on_disk["claims"]}
-    assert [r["operation_id"] for r in on_disk["operations"]] == [pending["operation_id"]]
+    assert on_disk.pop("protocol") == 1
+    on_disk["claims"] = [r for r in on_disk["claims"] if r["claim_id"] != added["claim_id"]]
+    assert on_disk == unmarked
 
 
-def test_a_newer_protocol_is_refused_by_every_reader_and_writer(tmp_path):
+_NEWER = claims._PROTOCOL + 1
+
+
+@pytest.mark.parametrize("ledger", [
+    {"protocol": _NEWER, "claims": [], "operations": []},
+    # A newer protocol may reshape the ledger; it is still diagnosed as newer.
+    {"protocol": _NEWER, "records": {}},
+])
+def test_a_newer_protocol_is_refused_by_every_reader_and_writer(tmp_path, ledger):
     """Its records may carry obligations this version cannot see, so neither
     reporting nor changing them is safe — and the file is left exactly as found."""
     path = tmp_path / "claims.json"
-    newer = claims._PROTOCOL + 1
-    path.write_text(json.dumps({"protocol": newer, "claims": [], "operations": []}),
-                    encoding="utf-8")
+    path.write_text(json.dumps(ledger), encoding="utf-8")
     before = path.read_bytes()
     for call in (
         lambda: claims.claim("model", "a", "p", path=path, now_fn=lambda: _T0),
+        lambda: claims.reserve(4, "a", "p", path=path, now_fn=lambda: _T0),
+        lambda: claims.renew("claim", path=path, now_fn=lambda: _T0),
+        lambda: claims.release("claim", path=path, now_fn=lambda: _T0),
         lambda: claims.begin_operation("model", "unload", path=path, now_fn=lambda: _T0),
+        lambda: claims.finish_operation("operation", path=path, now_fn=lambda: _T0),
         lambda: claims.list_coordination(path=path, now_fn=lambda: _T0),
         lambda: claims.list_claims(path=path, now_fn=lambda: _T0),
     ):
-        with pytest.raises(ValueError, match=f"protocol {newer}"):
+        with pytest.raises(ValueError, match=f"protocol {_NEWER}"):
             call()
     assert path.read_bytes() == before
 
@@ -764,35 +779,50 @@ def test_an_unreadable_protocol_marker_is_refused(tmp_path, marker):
 # ── concurrent writers ───────────────────────────────────────────────────────
 
 _WRITER = (
-    "import sys\nfrom pathlib import Path\nfrom vram_mcp import claims\n"
+    "import sys, time\nfrom pathlib import Path\nfrom vram_mcp import claims\n"
     "path, owner, count = Path(sys.argv[1]), sys.argv[2], int(sys.argv[3])\n"
-    "print('ready', flush=True)\n"
-    "sys.stdin.readline()\n"
+    "(path.parent / f'{owner}.ready').touch()\n"
+    "deadline = time.monotonic() + 30\n"
+    "while not (path.parent / 'go').exists():\n"
+    "    if time.monotonic() > deadline:\n"
+    "        sys.exit('never released')\n"
+    "    time.sleep(0.001)\n"
     "for i in range(count):\n"
     "    claims.claim(f'model-{i}', owner, 'concurrency', path=path)\n"
 )
+
+
+def _await(condition, seconds=30):
+    deadline = time.monotonic() + seconds
+    while not condition():
+        assert time.monotonic() < deadline, "writers never became ready"
+        time.sleep(0.01)
 
 
 def test_concurrent_writers_lose_no_update(tmp_path):
     """Each claim is a read-modify-write of the whole file; without exclusion
     two writers that read the same version silently drop one another's record."""
     path = tmp_path / "claims.json"
-    writers, per_writer = 4, 25
-    procs = [subprocess.Popen([sys.executable, "-c", _WRITER, str(path), f"w{n}",
-                               str(per_writer)], stdin=subprocess.PIPE,
-                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-             for n in range(writers)]
-    # Release every writer at once: interpreter start-up would otherwise
-    # stagger them enough that they barely overlap.
-    for proc in procs:
-        assert proc.stdout.readline().strip() == "ready"
-    for proc in procs:
-        proc.stdin.write("go\n")
-        proc.stdin.flush()
-    for proc in procs:
-        _, stderr = proc.communicate(timeout=60)
-        assert proc.returncode == 0, stderr
+    owners, per_writer = [f"w{n}" for n in range(4)], 25
+    procs = []
+    try:
+        for owner in owners:
+            with open(tmp_path / f"{owner}.err", "w") as err:
+                procs.append(subprocess.Popen(
+                    [sys.executable, "-c", _WRITER, str(path), owner, str(per_writer)],
+                    stderr=err))
+        # Release every writer at once: interpreter start-up would otherwise
+        # stagger them enough that they barely overlap.
+        _await(lambda: all((tmp_path / f"{o}.ready").exists() for o in owners))
+        (tmp_path / "go").touch()
+        for owner, proc in zip(owners, procs):
+            assert proc.wait(timeout=60) == 0, (tmp_path / f"{owner}.err").read_text()
+    finally:
+        for proc in procs:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
     recorded = json.loads(path.read_text(encoding="utf-8"))["claims"]
-    assert len({r["claim_id"] for r in recorded}) == len(recorded) == writers * per_writer
+    assert len({r["claim_id"] for r in recorded}) == len(recorded) == len(owners) * per_writer
     assert {(r["owner"], r["model"]) for r in recorded} == {
-        (f"w{n}", f"model-{i}:latest") for n in range(writers) for i in range(per_writer)}
+        (owner, f"model-{i}:latest") for owner in owners for i in range(per_writer)}
