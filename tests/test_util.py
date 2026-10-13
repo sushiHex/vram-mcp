@@ -16,6 +16,14 @@ def test_iso_roundtrip():
     assert _util.parse_iso("2026-07-16T18:00:00Z") == dt
 
 
+@pytest.mark.parametrize("value", [None, 1789000000, ["2026-07-16"], {}])
+def test_parse_iso_rejects_a_non_string_as_unparsable(value):
+    """A hand-edited ledger can hold any JSON value. Callers handle ValueError;
+    an AttributeError from str.replace once escaped all of them."""
+    with pytest.raises(ValueError):
+        _util.parse_iso(value)
+
+
 def test_save_and_load_json(tmp_path):
     p = tmp_path / "d.json"
     _util.save_json_atomic(p, {"k": [1, 2]})
