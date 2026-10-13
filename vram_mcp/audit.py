@@ -12,12 +12,12 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-from ._util import append_jsonl_capped, iso, load_json, locked, parse_iso, read_jsonl, save_json_atomic
+from ._util import STATE_DIR, append_jsonl_capped, iso, load_json, locked, parse_iso, read_jsonl, save_json_atomic
 from .models import canonical_model
 
-DEFAULT_EVENTS_PATH = Path.home() / ".cache" / "vram-mcp" / "events.jsonl"
-DEFAULT_LAST_SEEN_PATH = Path.home() / ".cache" / "vram-mcp" / "last_seen.json"
-DEFAULT_SAMPLE_PATH = Path.home() / ".cache" / "vram-mcp" / "last_sample.json"
+DEFAULT_EVENTS_PATH = STATE_DIR / "events.jsonl"
+DEFAULT_LAST_SEEN_PATH = STATE_DIR / "last_seen.json"
+DEFAULT_SAMPLE_PATH = STATE_DIR / "last_sample.json"
 SAMPLE_INTERVAL_SECONDS = 60.0
 
 _RECENT_ACTION_SECONDS = 10.0

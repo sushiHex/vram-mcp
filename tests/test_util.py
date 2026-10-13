@@ -16,6 +16,22 @@ def test_iso_roundtrip():
     assert _util.parse_iso("2026-07-16T18:00:00Z") == dt
 
 
+def test_state_dir_defaults_to_the_shared_user_cache():
+    assert _util.resolve_state_dir({}) == _util.Path.home() / ".cache" / "vram-mcp"
+    assert _util.resolve_state_dir({"VRAM_MCP_STATE_DIR": ""}) == (
+        _util.Path.home() / ".cache" / "vram-mcp")
+
+
+def test_state_dir_can_be_redirected_to_isolate_a_coordination_domain(tmp_path):
+    assert _util.resolve_state_dir({"VRAM_MCP_STATE_DIR": str(tmp_path)}) == tmp_path.resolve()
+
+
+def test_a_relative_state_dir_is_fixed_at_startup(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    resolved = _util.resolve_state_dir({"VRAM_MCP_STATE_DIR": "state"})
+    assert resolved.is_absolute() and resolved == (tmp_path / "state").resolve()
+
+
 @pytest.mark.parametrize("value", [None, 1789000000, ["2026-07-16"], {}])
 def test_parse_iso_rejects_a_non_string_as_unparsable(value):
     """A hand-edited ledger can hold any JSON value. Callers handle ValueError;

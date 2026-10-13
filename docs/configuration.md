@@ -45,6 +45,7 @@ clients sharing one GPU and ledger.
 | `OLLAMA_BASE_URL` | `http://127.0.0.1:11434` | Ollama HTTP endpoint. |
 | `OLLAMA_MODELS` | `~/.ollama/models` | Local model directory used to correlate manifests with runner processes. Match the directory used by Ollama. |
 | `VRAM_MCP_GPU_INDEX` | `0` | Zero-based NVIDIA GPU index used for capacity, process, activity, pressure, trend, and eviction decisions. Use the same value across coordinating clients. |
+| `VRAM_MCP_STATE_DIR` | `~/.cache/vram-mcp` | Directory holding the claims ledger and audit state. Clients coordinate only with clients that use the same directory; a different one is a separate coordination domain. Use an absolute path: a relative one resolves against each server's working directory at startup. |
 | `VRAM_MCP_AUDIT` | `1` | Enable passive appearance/disappearance detection and trend sampling. Set exactly `0` to disable. |
 | `VRAM_MCP_MEANINGFUL_MB` | `512` | Minimum dedicated VRAM in MB for tracking a non-Ollama process in appearance/disappearance events. |
 | `VRAM_MCP_EVENT_CAP` | `5000` | Maximum retained events, including samples; oldest entries are pruned. |

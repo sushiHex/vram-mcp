@@ -14,6 +14,23 @@ from typing import Optional
 BYTES_PER_MB = 1024 * 1024
 
 
+def resolve_state_dir(environ) -> Path:
+    """Where coordinating clients share their ledger and audit state.
+
+    Every client that should coordinate must resolve the same directory; a
+    separate one is a separate coordination domain, which is exactly what an
+    isolated test run wants.
+    """
+    configured = environ.get("VRAM_MCP_STATE_DIR")
+    # Resolved once, at startup: a relative path must not drift with a later
+    # change of working directory and quietly split one domain into two.
+    return (Path(configured).expanduser().resolve() if configured
+            else Path.home() / ".cache" / "vram-mcp")
+
+
+STATE_DIR = resolve_state_dir(os.environ)
+
+
 def bytes_to_mb(value, default=None) -> Optional[int]:
     """Best-effort bytes → whole MB; ``default`` on missing/garbage input.
 

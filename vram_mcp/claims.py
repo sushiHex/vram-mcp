@@ -18,13 +18,13 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from ._util import (
-    locked as _locked, iso as _iso, parse_iso as _parse_iso,
+    STATE_DIR, locked as _locked, iso as _iso, parse_iso as _parse_iso,
     save_json_atomic, _try_lock, _unlock,
 )
 from .models import canonical_model
 from .validation import nonblank_text, positive_gb, positive_ttl_seconds
 
-_DEFAULT_PATH = Path.home() / ".cache" / "vram-mcp" / "claims.json"
+_DEFAULT_PATH = STATE_DIR / "claims.json"
 # Bumped only by a change older clients could not honour safely; they then
 # refuse the ledger outright. Additive vocabulary stays within a protocol and
 # is tolerated record by record (see _identifiable_operation).

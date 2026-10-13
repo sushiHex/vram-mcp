@@ -188,6 +188,7 @@ The client's MCP schema provides full arguments and defaults.
 | --- | --- |
 | [Configuration](docs/configuration.md) | Source installation, environment variables, and connection troubleshooting. |
 | [Coordination and diagnostics](docs/coordination.md) | Claims, reservations, protection limits, pressure, and audit history. |
+| [Hardware acceptance](docs/acceptance.md) | The opt-in run against a real GPU and Ollama, and the environments it has validated. |
 
 ## Development
 
@@ -206,6 +207,8 @@ python -m pytest -q
 ```
 
 Tests use mocked GPU, process, and HTTP calls; no GPU or Ollama daemon is needed.
+Validation on real hardware is a separate, opt-in run; see
+[hardware acceptance](docs/acceptance.md).
 CI covers Python 3.10–3.14 on Windows and Linux. Current model management targets
 Ollama and NVIDIA; AMD/Intel telemetry and vLLM/llama.cpp management are future
 work.
