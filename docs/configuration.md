@@ -7,7 +7,7 @@
 Use Python 3.10+:
 
 ```sh
-git clone https://github.com/sushiHex/vram-mcp.git
+git clone --branch v0.3.0 https://github.com/sushiHex/vram-mcp.git
 cd vram-mcp
 python -m venv .venv
 ```
@@ -59,7 +59,7 @@ For clients using `mcpServers` JSON, add an `env` object to the server entry:
   "mcpServers": {
     "vram": {
       "command": "uvx",
-      "args": ["--from", "git+https://github.com/sushiHex/vram-mcp", "vram-mcp"],
+      "args": ["--from", "git+https://github.com/sushiHex/vram-mcp@v0.3.0", "vram-mcp"],
       "env": {
         "OLLAMA_BASE_URL": "http://127.0.0.1:11434",
         "VRAM_MCP_GPU_INDEX": "0",
