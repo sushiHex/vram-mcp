@@ -18,13 +18,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
 import os
 import platform
-import socket
 import subprocess
 import sys
 import tempfile
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from importlib.metadata import version
 from pathlib import Path
@@ -37,8 +37,9 @@ from mcp.client.stdio import stdio_client
 from vram_mcp import claims
 from vram_mcp.models import canonical_model
 
-KEEP_ALIVE = "2m"           # an interrupted run's model still leaves VRAM on its own
+KEEP_ALIVE = "2m"       # an interrupted run's model still leaves VRAM on its own
 CLAIM_TTL_SECONDS = 5
+MIN_MODEL_MB = 64       # reservation rounding must never leave room for the model
 EXPECTED_TOOLS = {"advise", "claim", "ensure_free", "history", "list_claims", "list_loaded",
                   "release", "renew", "reserve", "trend", "unload", "vram_status", "warm"}
 LOOPBACK = {"127.0.0.1", "localhost", "::1"}
@@ -89,12 +90,8 @@ async def session(state_dir: Path, ollama: str, gpu: int):
             yield Tools(client)
 
 
-@contextmanager
-def refusing_endpoint():
-    """A loopback URL nothing can answer: its port stays bound and never listens."""
-    with socket.socket() as held:
-        held.bind(("127.0.0.1", 0))
-        yield f"http://127.0.0.1:{held.getsockname()[1]}"
+# RFC 6761 reserves .invalid: it never resolves, so no server can ever answer.
+UNREACHABLE = "http://ollama.invalid:11434"
 
 
 # ── results ──────────────────────────────────────────────────────────────────
@@ -212,7 +209,8 @@ async def pending_warm_protects(run: Run, a: Tools, b: Tools, model: str) -> Non
 async def reserving_all_but(b: Tools, headroom_mb: int):
     """Reserve every free MB but ``headroom_mb``, measured now, for the block."""
     free_mb = (await b("vram_status"))["free_mb"]
-    gb = round(max(free_mb - headroom_mb, 1) / 1024, 2)
+    # Rounded down, so the headroom left is never smaller than asked for.
+    gb = math.floor((free_mb - headroom_mb) / 1024 * 100) / 100
     held = await b("reserve", gb=gb, owner="acceptance-b", purpose="acceptance",
                    ttl_seconds=300)
     if not held["ok"]:
@@ -262,18 +260,16 @@ async def reload_is_refused_under_reservation(run: Run, a: Tools, b: Tools, mode
 
 
 async def unreachable_ollama_stays_unknown(run: Run, state: Path, gpu: int, model: str) -> None:
-    with refusing_endpoint() as nowhere:
-        async with session(state, nowhere, gpu) as c:
-            status = await c("vram_status")
-            run.check("Unreachable Ollama reads as unknown, never as empty",
-                      status["loaded"] is None
-                      and status["observations"]["ollama"]["status"] == "unavailable",
-                      f"loaded={status['loaded']}; summary: {status['summary']}")
-            warmed = await c("warm", model=model, keep_alive=KEEP_ALIVE, by="acceptance-c")
-            run.check("No mutation is attempted without residency",
-                      warmed["outcome"] == "refused"
-                      and warmed["reason"] == "observation_unavailable",
-                      f"warm -> {warmed['outcome']} ({warmed['reason']})")
+    async with session(state, UNREACHABLE, gpu) as c:
+        status = await c("vram_status")
+        run.check("Unreachable Ollama reads as unknown, never as empty",
+                  status["loaded"] is None
+                  and status["observations"]["ollama"]["status"] == "unavailable",
+                  f"loaded={status['loaded']}; summary: {status['summary']}")
+        warmed = await c("warm", model=model, keep_alive=KEEP_ALIVE, by="acceptance-c")
+        run.check("No mutation is attempted without residency",
+                  warmed["outcome"] == "refused" and warmed["reason"] == "observation_unavailable",
+                  f"warm -> {warmed['outcome']} ({warmed['reason']})")
 
 
 async def unload_test_model(run: Run, b: Tools, model: str) -> None:
@@ -296,31 +292,36 @@ def refuse_to_touch(args: argparse.Namespace, run: Run, status: dict) -> str | N
     if status["loaded"]:
         return (f"Ollama is not idle ({len(status['loaded'])} model(s) resident); loading "
                 "the test model could make Ollama evict one")
-    tags = requests.get(f"{args.ollama}/api/tags", timeout=10).json()["models"]
-    if canonical_model(args.model) not in {canonical_model(m["name"]) for m in tags}:
-        return f"{canonical_model(args.model)} is not installed"
+    target = canonical_model(args.model)
+    size_mb = installed_size_mb(args.ollama, target)
+    if size_mb is None:
+        return f"{target} is not installed"
+    if not MIN_MODEL_MB <= size_mb < status["free_mb"]:
+        return (f"{target} is {size_mb} MB; the reservation scenarios need a model of at "
+                f"least {MIN_MODEL_MB} MB that fits in the {status['free_mb']} MB free")
     live_claims, live_operations = live_coordination()
     if live_claims or live_operations:
         return (f"the live ledger holds {len(live_claims)} claim(s) or reservation(s) and "
-                f"{len(live_operations)} operation(s); run when no session is coordinating")
+                f"{len(live_operations)} operation record(s); run when no session is "
+                "coordinating")
     return None
 
 
 def live_coordination() -> tuple[list, list]:
-    """Active claims and operations in the live ledger, without writing it.
+    """Active claims and every operation record in the live ledger, read only.
 
-    ``list_coordination`` would prune and save, so operations are read directly.
+    An expired operation can still have a live owner, and telling which would
+    mean taking its lock, so every record counts. ``list_coordination`` would
+    prune and save, so the records are read directly.
     """
-    now = claims._default_now()
-    operations = claims._load(claims._DEFAULT_PATH)["operations"]
-    return claims.list_claims(), [op for op in operations if claims._is_active(op, now)]
+    return claims.list_claims(), claims._load(claims._DEFAULT_PATH)["operations"]
 
 
-def model_size_mb(ollama: str, model: str) -> int:
+def installed_size_mb(ollama: str, model: str) -> int | None:
     for row in requests.get(f"{ollama}/api/tags", timeout=10).json()["models"]:
         if canonical_model(row["name"]) == canonical_model(model):
             return int(row["size"]) // 2**20
-    raise ToolError(f"{model} is not installed")
+    return None
 
 
 def environment(ollama: str, gpu: int, status: dict) -> dict:
@@ -366,7 +367,8 @@ async def acceptance(run: Run, args: argparse.Namespace, tmp: Path) -> dict:
         if refusal:
             run.skip("Mutation scenarios", refusal)
             return env
-        headroom_mb = model_size_mb(args.ollama, args.model) // 2
+        # Half the model's size: a reload must be refused, whatever the model.
+        headroom_mb = installed_size_mb(args.ollama, args.model) // 2
         async with session(state, args.ollama, args.gpu) as b:
             try:
                 await claims_protect_across_sessions(run, a, b, args.model)

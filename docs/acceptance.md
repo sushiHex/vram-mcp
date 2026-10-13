@@ -14,9 +14,11 @@ drives them. Run it against every release candidate.
 - For the mutation scenarios:
   - Ollama runs on this machine, on the GPU passed as `--gpu`;
   - Ollama is idle, with no model resident;
-  - no live vram-mcp session holds a claim, reservation or pending operation;
-  - an installed model to test with. A small one is quickest, since it is loaded
-    and unloaded several times.
+  - the live ledger holds no claim, reservation or operation record. An expired
+    record may still have a live owner, so any record blocks the run; a live
+    session's `list_claims()` prunes the stale ones;
+  - an installed model of at least 64 MB that fits in free VRAM. A small one is
+    quickest, since it is loaded and unloaded several times.
 
   The harness checks all of these except Ollama's GPU placement, and skips the
   mutation scenarios, saying why, when any check fails.
@@ -53,8 +55,8 @@ scenario fails.
   is the run's own. Every load uses a two-minute keep-alive, so an interrupted
   run's model still leaves VRAM on its own. On the way out the harness unloads
   the test model, and only that model, and reports whether it succeeded.
-- **Unreachable Ollama:** one scenario holds a local port bound without
-  listening, so nothing can answer on it, and points a server at it.
+- **Unreachable Ollama:** one scenario points a server at `ollama.invalid`.
+  RFC 6761 reserves that domain so it never resolves, so no server can answer.
 - **Residual race:** a client that loads a model between the idle check and the
   end of the run can still be affected by Ollama's scheduling. Run the harness
   when nothing else is using Ollama.
