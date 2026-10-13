@@ -25,6 +25,10 @@ from .models import canonical_model
 from .validation import nonblank_text, positive_gb, positive_ttl_seconds
 
 _DEFAULT_PATH = Path.home() / ".cache" / "vram-mcp" / "claims.json"
+# Bumped only by a change older clients could not honour safely; they then
+# refuse the ledger outright. Additive vocabulary stays within a protocol and
+# is tolerated record by record (see _identifiable_operation).
+_PROTOCOL = 1
 _OPERATION_LEASE_SECONDS = 120
 _EVICTION_KINDS = {"unload", "ensure_free"}
 _DEFAULT_SCOPE = "gpu:index=0"
@@ -118,7 +122,21 @@ def _load(path: Path) -> dict:
         data = json.loads(text)
     except ValueError as exc:
         raise ValueError(f"claim ledger is corrupt: {path}") from exc
-    if not isinstance(data, dict) or not isinstance(data.get("claims"), list):
+    if not isinstance(data, dict):
+        raise ValueError(f"claim ledger has invalid shape: {path}")
+    # The marker is read before any protocol-specific field: a newer protocol
+    # may reshape them, and must be diagnosed as newer, not as malformed.
+    # Unmarked ledgers predate the marker, so they are protocol 1 for good —
+    # never "whatever this version speaks", which would reinterpret old data.
+    protocol = data.get("protocol", 1)
+    if isinstance(protocol, bool) or not isinstance(protocol, int) or protocol < 1:
+        raise ValueError(f"claim ledger has invalid protocol: {path}")
+    if protocol > _PROTOCOL:
+        raise ValueError(
+            f"claim ledger {path} uses coordination protocol {protocol}, but this "
+            f"vram-mcp speaks protocol {_PROTOCOL}. Upgrade this client, or reset "
+            "the ledger as described in docs/coordination.md.")
+    if not isinstance(data.get("claims"), list):
         raise ValueError(f"claim ledger has invalid shape: {path}")
     operations = data.get("operations", [])
     if not isinstance(operations, list):
@@ -128,7 +146,7 @@ def _load(path: Path) -> dict:
 
 
 def _save(path: Path, data: dict) -> None:
-    save_json_atomic(path, data)
+    save_json_atomic(path, {**data, "protocol": _PROTOCOL})
 
 
 def _is_active(record: dict, now: datetime) -> bool:
@@ -147,8 +165,6 @@ def _try_operation_lock(path: Path, model: str) -> int | None:
     lock_path = _operation_lock_path(path, model)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR)
-    if os.fstat(fd).st_size == 0:
-        os.write(fd, b"\0")
     try:
         _try_lock(fd)
     except BlockingIOError:
@@ -527,35 +543,36 @@ def begin_operation(
     kind = nonblank_text(kind, "kind")
     scope = nonblank_text(scope, "scope")
     now = now_fn()
-    with _locked(path):
-        data = _load(path)
-        _prune_expired(data, now, path)
-        retry_counts = data.get("operation_retry_counts", {})
-        if not isinstance(retry_counts, dict):
-            retry_counts = {}
-        retry_count = retry_counts.get(model, 0)
-        if isinstance(retry_count, bool) or not isinstance(retry_count, int) or retry_count < 0:
-            retry_count = 0
-        pending = _pending_for(data, model, now)
-        if pending:
-            return {"ok": False, "outcome": "refused", "reason": "operation_pending",
-                    "model": model, "operations": [_operation_view(path, r, now) for r in pending]}
-        if kind == "warm":
-            capacity_pending = _pending_warm_for_scope(data, scope)
-            if capacity_pending:
-                return {"ok": False, "outcome": "refused", "reason": "capacity_pending",
-                        "model": model, "scope": scope,
-                        "operations": [_operation_view(path, r, now) for r in capacity_pending]}
-        active_claims = _active_model_claims(data, model, now)
-        if kind in _EVICTION_KINDS and not force and active_claims:
-            return {"ok": False, "outcome": "refused", "reason": "model_claimed",
-                    "model": model,
-                    "claims": [_claim_view(record) for record in active_claims]}
-        fd = _try_operation_lock(path, model)
-        if fd is None:
-            return {"ok": False, "outcome": "refused", "reason": "operation_pending",
-                    "model": model, "operations": []}
-        try:
+    fd = None
+    try:
+        with _locked(path):
+            data = _load(path)
+            _prune_expired(data, now, path)
+            retry_counts = data.get("operation_retry_counts", {})
+            if not isinstance(retry_counts, dict):
+                retry_counts = {}
+            retry_count = retry_counts.get(model, 0)
+            if isinstance(retry_count, bool) or not isinstance(retry_count, int) or retry_count < 0:
+                retry_count = 0
+            pending = _pending_for(data, model, now)
+            if pending:
+                return {"ok": False, "outcome": "refused", "reason": "operation_pending",
+                        "model": model, "operations": [_operation_view(path, r, now) for r in pending]}
+            if kind == "warm":
+                capacity_pending = _pending_warm_for_scope(data, scope)
+                if capacity_pending:
+                    return {"ok": False, "outcome": "refused", "reason": "capacity_pending",
+                            "model": model, "scope": scope,
+                            "operations": [_operation_view(path, r, now) for r in capacity_pending]}
+            active_claims = _active_model_claims(data, model, now)
+            if kind in _EVICTION_KINDS and not force and active_claims:
+                return {"ok": False, "outcome": "refused", "reason": "model_claimed",
+                        "model": model,
+                        "claims": [_claim_view(record) for record in active_claims]}
+            fd = _try_operation_lock(path, model)
+            if fd is None:
+                return {"ok": False, "outcome": "refused", "reason": "operation_pending",
+                        "model": model, "operations": []}
             operation_id = uuid.uuid4().hex
             expires_at = _expires_at(now, _OPERATION_LEASE_SECONDS)
             record = {"operation_id": operation_id, "model": model, "kind": kind,
@@ -566,10 +583,13 @@ def begin_operation(
                       "retry_after": None}
             data["operations"].append(record)
             _save(path, data)
-            _OPERATION_LOCKS[operation_id] = fd
-        except Exception:
+    except BaseException:
+        # Covers the ledger lock's exit as well as the write: an operation whose
+        # lock was displaced must not leave behind an owner nobody can finish.
+        if fd is not None:
             _release_operation_lock(fd)
-            raise
+        raise
+    _OPERATION_LOCKS[operation_id] = fd
     # retry_count comes from the record just written, not recomputed: the lease
     # a caller is told about and the one on disk must not be able to disagree.
     return {"ok": True, "outcome": "begun", "operation_id": operation_id,
