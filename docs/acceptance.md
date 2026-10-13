@@ -14,9 +14,9 @@ drives them. Run it against every release candidate.
 - For the mutation scenarios:
   - Ollama runs on this machine, on the GPU passed as `--gpu`;
   - Ollama is idle, with no model resident;
-  - the live ledger holds no claim, reservation or operation record. An expired
-    record may still have a live owner, so any record blocks the run; a live
-    session's `list_claims()` prunes the stale ones;
+  - the live ledger holds no active claim or reservation, and no operation record
+    at all: an expired operation may still have a live owner, so any one blocks
+    the run, and a live session's `list_claims()` prunes the stale ones;
   - an installed model of at least 64 MB that fits in free VRAM. A small one is
     quickest, since it is loaded and unloaded several times.
 
@@ -75,10 +75,10 @@ scenario fails.
 | Another session cannot evict a claimed model | Two server processes share one ledger. |
 | A pending warm blocks other sessions | A second session sees the in-flight operation and is refused. |
 | A confirmed warm agrees with Ollama residency | `succeeded` means the model is resident afterwards. |
-| A resident refresh is admitted under a full reservation | Keep-alive refresh costs no new residency, so it is admitted even with every free MB reserved. |
+| A resident refresh is admitted under a full reservation | Keep-alive refresh costs no new residency, so it is admitted with all free memory reserved, rounded down to 0.01 GB. |
 | A departed client's claim protects until its TTL | A claim outlives its client's process, then expires. |
 | A confirmed unload agrees with Ollama residency | `succeeded` means the model is gone afterwards. |
-| A reload that would breach a reservation is refused | Admission honours another session's reservation: half the model's size is left free. |
+| A reload that would breach a reservation is refused | Admission honours another session's reservation: about half the model's size is left free. |
 | Unreachable Ollama reads as unknown, never as empty | `loaded` is `null`, not `[]`. |
 | No mutation is attempted without residency | `warm` is refused with `observation_unavailable`. |
 | The test model is unloaded afterwards | Cleanup is checked, not assumed. |
