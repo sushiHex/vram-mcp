@@ -11,8 +11,15 @@ drives them. Run it against every release candidate.
 
 - An NVIDIA GPU with `nvidia-smi` on `PATH`, and a running Ollama.
 - The development install: `python -m pip install -e ".[dev]"`.
-- For the mutation scenarios, an installed model that nothing else is using.
-  The smallest one you have is best; it is loaded and unloaded several times.
+- For the mutation scenarios:
+  - Ollama runs on this machine, on the GPU passed as `--gpu`;
+  - Ollama is idle, with no model resident;
+  - no live vram-mcp session holds a claim, reservation or pending operation;
+  - an installed model to test with. A small one is quickest, since it is loaded
+    and unloaded several times.
+
+  The harness checks all of these except Ollama's GPU placement, and skips the
+  mutation scenarios, saying why, when any check fails.
 
 ## Running it
 
@@ -37,24 +44,29 @@ scenario fails.
 ## What it touches
 
 - **Coordination state:** every server it starts uses one fresh temporary
-  `VRAM_MCP_STATE_DIR`, removed afterwards. The servers coordinate with each
-  other and with nothing else. The live ledger is read once, never written, to
-  refuse a model that a live session has claimed.
-- **Ollama:** it mutates only the `--model` it was given, and only when that
-  model was installed, not resident, and unclaimed at the start. Every load uses
-  a two-minute keep-alive, so an interrupted run's model still leaves VRAM on
-  its own. On the way out it unloads that model, and only that model.
-- **Unreachable Ollama:** one scenario starts a server pointed at a closed local
-  port. It never contacts anything else.
+  `VRAM_MCP_STATE_DIR`, deleted when the run ends. The servers coordinate with
+  each other and with nothing else. The live ledger is read, never written, to
+  confirm that no session is coordinating.
+- **Ollama:** mutation requires an idle Ollama, because loading even one model
+  can make Ollama's scheduler evict another to make room. With nothing resident
+  there is nothing to evict, and any residency of the test model during the run
+  is the run's own. Every load uses a two-minute keep-alive, so an interrupted
+  run's model still leaves VRAM on its own. On the way out the harness unloads
+  the test model, and only that model, and reports whether it succeeded.
+- **Unreachable Ollama:** one scenario holds a local port bound without
+  listening, so nothing can answer on it, and points a server at it.
+- **Residual race:** a client that loads a model between the idle check and the
+  end of the run can still be affected by Ollama's scheduling. Run the harness
+  when nothing else is using Ollama.
 
 ## Scenarios
 
 | Scenario | Demonstrates |
 | --- | --- |
-| Every tool is discoverable | The installed server exposes all 13 tools over MCP. |
+| Every tool is discoverable | The server exposes exactly the 13 expected tools over MCP. |
 | The selected GPU is identified with provenance | Source, timestamp and `gpu:index=N` scope on the capacity reading. |
 | Ollama residency is observed | Loaded models come from a healthy observation. |
-| The isolated ledger is read even with nothing to annotate | `observations.coordination` is present with no model loaded. |
+| The ledger is read and reported, loaded models or not | `observations.coordination` is present, from `claims` alone when nothing is loaded. |
 | Process observations report their coverage | Compute, graphics and non-local coverage are explicit. |
 | Pressure states the evidence it rests on | The verdict names which evidence it had. |
 | A claim made under an alias names the canonical model | `registry.ollama.ai/library/PHI4-MINI` claims `phi4-mini:latest`. |
@@ -62,11 +74,15 @@ scenario fails.
 | A pending warm blocks other sessions | A second session sees the in-flight operation and is refused. |
 | A confirmed warm agrees with Ollama residency | `succeeded` means the model is resident afterwards. |
 | A resident refresh is admitted under a reservation | Keep-alive refresh costs no new residency. |
+| A departed client's claim protects until its TTL | A claim outlives its client's process, then expires. |
 | A confirmed unload agrees with Ollama residency | `succeeded` means the model is gone afterwards. |
-| A reload that would breach the reservation is refused | Admission honours another session's reservation. |
+| A reload that would breach a reservation is refused | Admission honours another session's reservation: half the model's size is left free. |
 | Unreachable Ollama reads as unknown, never as empty | `loaded` is `null`, not `[]`. |
-| No mutation is attempted without residency | `warm` is refused before any request. |
-| A departed client's claim protects until its TTL, then frees the model | Recovery after a client exits. |
+| No mutation is attempted without residency | `warm` is refused with `observation_unavailable`. |
+| The test model is unloaded afterwards | Cleanup is checked, not assumed. |
+
+Residency checks fail rather than pass when residency cannot be read: an
+unknown reading must never confirm that a model is gone.
 
 Recovery after an operation *owner* crashes mid-mutation is not repeated here.
 It depends only on the operating system releasing a dead process's file lock,
@@ -77,7 +93,7 @@ real locks.
 
 | Date | OS | GPU and driver | Ollama | vram-mcp | Result |
 | --- | --- | --- | --- | --- | --- |
-| 2026-10-13 | Windows 11 (26200), Python 3.14.3 | RTX 3090, 596.49 | 0.34.4 | 0.2.0 at `a66573d` + this harness | 16 of 16 passed with `phi4-mini` |
+| 2026-10-13 | Windows 11 (26200), Python 3.14.3 | RTX 3090, 596.49 | 0.34.4 | 0.2.0 at `a66573d` + this harness | 17 of 17 passed with `phi4-mini` |
 
 **Linux is untested on hardware.** CI exercises the Linux code paths with mocks
 only.
@@ -100,5 +116,6 @@ machine found that both problems can be fixed:
 - Per-process *Dedicated* Usage is not usable: Chrome's GPU process and `dwm`
   reported 488 GB and 209 GB on a 24 GB card, with valid counter status.
 
-Restoring Windows spill detection on this basis is tracked separately; until
-then, read Windows `pressure` as diagnostic only.
+Restoring Windows spill detection on this basis is tracked in
+[#22](https://github.com/sushiHex/vram-mcp/issues/22); until then, Windows
+`pressure` reads `unknown`.

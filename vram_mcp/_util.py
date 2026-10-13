@@ -22,7 +22,10 @@ def resolve_state_dir(environ) -> Path:
     isolated test run wants.
     """
     configured = environ.get("VRAM_MCP_STATE_DIR")
-    return Path(configured).expanduser() if configured else Path.home() / ".cache" / "vram-mcp"
+    # Resolved once, at startup: a relative path must not drift with a later
+    # change of working directory and quietly split one domain into two.
+    return (Path(configured).expanduser().resolve() if configured
+            else Path.home() / ".cache" / "vram-mcp")
 
 
 STATE_DIR = resolve_state_dir(os.environ)
