@@ -776,6 +776,22 @@ def test_an_unreadable_protocol_marker_is_refused(tmp_path, marker):
         claims.list_claims(path=path, now_fn=lambda: _T0)
 
 
+def test_a_displaced_ledger_lock_does_not_strand_the_operation_owner(tmp_path, monkeypatch):
+    """Displacement is only discovered on the ledger lock's exit, after the
+    owner lock is taken. The caller never learns an operation_id to finish
+    with, so the owner must be released then, not left blocking the model."""
+    path = tmp_path / "claims.json"
+    answers = iter([True, False])           # governs on entry, displaced by exit
+    monkeypatch.setattr(_util, "_governs", lambda fd, lock_path: next(answers))
+    owners_before = dict(claims._OPERATION_LOCKS)
+    with pytest.raises(_util.LockDisplacedError):
+        claims.begin_operation("model", "unload", force=True, path=path, now_fn=lambda: _T0)
+    assert claims._OPERATION_LOCKS == owners_before
+    fd = claims._try_operation_lock(path, "model:latest")
+    assert fd is not None
+    claims._release_operation_lock(fd)
+
+
 # ── concurrent writers ───────────────────────────────────────────────────────
 
 _WRITER = (

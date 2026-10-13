@@ -543,35 +543,36 @@ def begin_operation(
     kind = nonblank_text(kind, "kind")
     scope = nonblank_text(scope, "scope")
     now = now_fn()
-    with _locked(path):
-        data = _load(path)
-        _prune_expired(data, now, path)
-        retry_counts = data.get("operation_retry_counts", {})
-        if not isinstance(retry_counts, dict):
-            retry_counts = {}
-        retry_count = retry_counts.get(model, 0)
-        if isinstance(retry_count, bool) or not isinstance(retry_count, int) or retry_count < 0:
-            retry_count = 0
-        pending = _pending_for(data, model, now)
-        if pending:
-            return {"ok": False, "outcome": "refused", "reason": "operation_pending",
-                    "model": model, "operations": [_operation_view(path, r, now) for r in pending]}
-        if kind == "warm":
-            capacity_pending = _pending_warm_for_scope(data, scope)
-            if capacity_pending:
-                return {"ok": False, "outcome": "refused", "reason": "capacity_pending",
-                        "model": model, "scope": scope,
-                        "operations": [_operation_view(path, r, now) for r in capacity_pending]}
-        active_claims = _active_model_claims(data, model, now)
-        if kind in _EVICTION_KINDS and not force and active_claims:
-            return {"ok": False, "outcome": "refused", "reason": "model_claimed",
-                    "model": model,
-                    "claims": [_claim_view(record) for record in active_claims]}
-        fd = _try_operation_lock(path, model)
-        if fd is None:
-            return {"ok": False, "outcome": "refused", "reason": "operation_pending",
-                    "model": model, "operations": []}
-        try:
+    fd = None
+    try:
+        with _locked(path):
+            data = _load(path)
+            _prune_expired(data, now, path)
+            retry_counts = data.get("operation_retry_counts", {})
+            if not isinstance(retry_counts, dict):
+                retry_counts = {}
+            retry_count = retry_counts.get(model, 0)
+            if isinstance(retry_count, bool) or not isinstance(retry_count, int) or retry_count < 0:
+                retry_count = 0
+            pending = _pending_for(data, model, now)
+            if pending:
+                return {"ok": False, "outcome": "refused", "reason": "operation_pending",
+                        "model": model, "operations": [_operation_view(path, r, now) for r in pending]}
+            if kind == "warm":
+                capacity_pending = _pending_warm_for_scope(data, scope)
+                if capacity_pending:
+                    return {"ok": False, "outcome": "refused", "reason": "capacity_pending",
+                            "model": model, "scope": scope,
+                            "operations": [_operation_view(path, r, now) for r in capacity_pending]}
+            active_claims = _active_model_claims(data, model, now)
+            if kind in _EVICTION_KINDS and not force and active_claims:
+                return {"ok": False, "outcome": "refused", "reason": "model_claimed",
+                        "model": model,
+                        "claims": [_claim_view(record) for record in active_claims]}
+            fd = _try_operation_lock(path, model)
+            if fd is None:
+                return {"ok": False, "outcome": "refused", "reason": "operation_pending",
+                        "model": model, "operations": []}
             operation_id = uuid.uuid4().hex
             expires_at = _expires_at(now, _OPERATION_LEASE_SECONDS)
             record = {"operation_id": operation_id, "model": model, "kind": kind,
@@ -582,10 +583,13 @@ def begin_operation(
                       "retry_after": None}
             data["operations"].append(record)
             _save(path, data)
-            _OPERATION_LOCKS[operation_id] = fd
-        except Exception:
+    except BaseException:
+        # Covers the ledger lock's exit as well as the write: an operation whose
+        # lock was displaced must not leave behind an owner nobody can finish.
+        if fd is not None:
             _release_operation_lock(fd)
-            raise
+        raise
+    _OPERATION_LOCKS[operation_id] = fd
     # retry_count comes from the record just written, not recomputed: the lease
     # a caller is told about and the one on disk must not be able to disagree.
     return {"ok": True, "outcome": "begun", "operation_id": operation_id,

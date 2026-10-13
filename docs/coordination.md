@@ -83,13 +83,13 @@ After a `LockDisplacedError` or a protocol refusal:
 3. Decide whether to keep `claims.json`. It is plain JSON; keep it only if its
    claims match the work you know to be running. Otherwise rename it aside
    (for example to `claims.json.diverged`) rather than deleting it; the next
-   client starts an empty ledger. Note any operation's `pending_until` first.
+   client starts an empty ledger.
 4. Restart one client and call `list_claims()`. It must succeed: that, not
    inspection by eye, is what establishes the ledger is usable. If it is
    refused, return to step 3.
-5. Stopping clients does not stop a request already sent to Ollama. Wait until
-   every noted `pending_until` has passed, or restart Ollama, before trusting
-   what `list_loaded()` reports.
+5. If the old ledger held any operation, restart Ollama before trusting what
+   `list_loaded()` reports. Stopping a client does not stop a request it already
+   sent, and `pending_until` is a local lease, not a deadline Ollama observes.
 6. Have agents re-claim the models and re-reserve the capacity they rely on
    before resuming warm, unload, or `ensure_free`.
 
