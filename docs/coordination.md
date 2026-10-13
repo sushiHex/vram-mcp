@@ -16,7 +16,10 @@ same OS user coordinate through `~/.cache/vram-mcp/`:
 
 Ledger writes use file locks and atomic replacement. An unreadable or
 wrong-shaped ledger is treated as unavailable, because silently replacing it
-could discard another session's protection. An individual malformed operation
+could discard another session's protection. `vram_status()` and `list_loaded()`
+read the ledger on every call, loaded models or not, and report it under
+`observations.coordination`. When it cannot be read, their `summary` names the
+cause. An individual malformed operation
 record is discarded while valid claims are retained, and the next ledger write
 removes it permanently. Owners are descriptive labels, not authenticated
 identities. Separate home directories have separate ledgers, even when their
