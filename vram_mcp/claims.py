@@ -26,9 +26,9 @@ from .validation import nonblank_text, positive_gb, positive_ttl_seconds
 
 _DEFAULT_PATH = Path.home() / ".cache" / "vram-mcp" / "claims.json"
 _OPERATION_LEASE_SECONDS = 120
-# How long an abandoned attempt still counts toward the next one's retry_count.
-# A retention policy, not a safety bound: the count is informational, and an
-# attempt after the window simply starts afresh.
+# retry_count counts a run of abandoned attempts on one model; the run is
+# forgotten this long after its latest abandonment. A retention policy, not a
+# safety bound: the count is informational, and a later attempt starts afresh.
 _RETRY_MEMORY_SECONDS = 24 * 60 * 60
 _EVICTION_KINDS = {"unload", "ensure_free"}
 _DEFAULT_SCOPE = "gpu:index=0"
@@ -260,8 +260,7 @@ def _retry_expiry(now: datetime) -> datetime:
 def _prune_expired(data: dict, now: datetime, path: Path) -> bool:
     """Drop lapsed claims, abandoned operations, and retry memory past its window.
 
-    Returns whether anything changed, so a caller with nothing else to write
-    still persists what it pruned.
+    Returns whether anything changed, so that it can be persisted.
     """
     claims_before = len(data["claims"])
     data["claims"] = [r for r in data["claims"] if _is_active(r, now)]
@@ -276,18 +275,30 @@ def _prune_expired(data: dict, now: datetime, path: Path) -> bool:
         else:
             expired.append(record)
     data["operations"] = retained
-    raw_memory = data.get("operation_retry_counts")
+    raw_memory = data.get("operation_retry_counts", {})
     memory = _retry_memory(raw_memory, now)
-    # The window dates from now, when abandonment is noticed, not from the lease:
-    # an owner may stay live long past its lease, and dating from that would
-    # forget the abandonment the moment it happened.
+    # Each abandonment continues the run and restarts its window from now, when
+    # it is noticed — not from the lease, which a live owner may outlast by any
+    # margin, so dating from it could forget an abandonment as it happened.
     for record in expired:
         model = canonical_model(record["model"])
         previous = memory.get(model, {}).get("count", 0)
         memory[model] = {"count": max(previous, _count(record.get("retry_count")) + 1),
                          "expires_at": _iso(_retry_expiry(now))}
     data["operation_retry_counts"] = memory
-    return bool(expired) or len(data["claims"]) != claims_before or memory != (raw_memory or {})
+    return bool(expired) or len(data["claims"]) != claims_before or memory != raw_memory
+
+
+def _load_pruned(path: Path, now: datetime) -> dict:
+    """Load under the caller's lock, persisting any pruning straight away.
+
+    Persisted even when the caller goes on to refuse: otherwise every refusal
+    re-notices the same abandonment and slides its retry window forward.
+    """
+    data = _load(path)
+    if _prune_expired(data, now, path):
+        _save(path, data)
+    return data
 
 
 def _canonical_record(record: dict) -> dict | None:
@@ -394,8 +405,7 @@ def claim(
         "expires_at": _iso(expires_at),
     }
     with _locked(path):
-        data = _load(path)
-        _prune_expired(data, now, path)
+        data = _load_pruned(path, now)
         if _pending_for(data, model, now):
             raise ValueError(f"operation pending for {model}")
         data["claims"].append(record)
@@ -424,8 +434,7 @@ def reserve(
         "ttl_seconds": ttl_seconds, "expires_at": _iso(expires_at),
     }
     with _locked(path):
-        data = _load(path)
-        _prune_expired(data, now, path)
+        data = _load_pruned(path, now)
         if _has_pending_warm(data):
             raise ValueError("warm admission pending; retry reservation after it completes")
         data["claims"].append(record)
@@ -518,9 +527,7 @@ def list_coordination(
     target = canonical_model(model) if model is not None else None
     now = now_fn()
     with _locked(path):
-        data = _load(path)
-        if _prune_expired(data, now, path):
-            _save(path, data)
+        data = _load_pruned(path, now)
         active_claims = []
         for record in data["claims"]:
             if not _is_active(record, now):
@@ -559,8 +566,7 @@ def begin_operation(
     scope = nonblank_text(scope, "scope")
     now = now_fn()
     with _locked(path):
-        data = _load(path)
-        _prune_expired(data, now, path)
+        data = _load_pruned(path, now)
         retry_count = data["operation_retry_counts"].get(model, {}).get("count", 0)
         pending = _pending_for(data, model, now)
         if pending:
@@ -621,8 +627,7 @@ def finish_operation(
     operation_model = None
     try:
         with _locked(path):
-            data = _load(path)
-            _prune_expired(data, now, path)
+            data = _load_pruned(path, now)
             found = any(isinstance(r, dict) and r.get("operation_id") == operation_id
                         for r in data["operations"])
             if found:
