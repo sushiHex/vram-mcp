@@ -25,7 +25,10 @@ def isolated_runtime(monkeypatch, tmp_path):
     monkeypatch.setattr(requests.Session, "request", forbidden)
     monkeypatch.setattr(server, "_gpu_reading", forbidden)
     monkeypatch.setattr(server, "_procinfo_table", forbidden)
-    monkeypatch.setattr(server, "_snapshot", forbidden)
+    # The ledger is isolated above, so only the real process and NVML
+    # collectors behind a correlating snapshot need forbidding.
+    monkeypatch.setattr(server, "runner_pid_map", forbidden)
+    monkeypatch.setattr(server._nvml, "nvml_busy_map", forbidden)
 
 
 
@@ -176,6 +179,32 @@ def test_status_summary_stays_terse_when_pressure_is_ok(monkeypatch):
     status = server._vram_status_impl()
     assert status["pressure"]["state"] == "ok"
     assert status["summary"].endswith("pressure: ok.")
+
+
+def _idle_status_sources(monkeypatch):
+    monkeypatch.setattr(server, "_gpu_reading",
+                        lambda: [{"index": 0, "total_mb": 24576,
+                                  "used_mb": 4000, "free_mb": 20576}])
+    monkeypatch.setattr(server, "_procinfo_table",
+                        lambda: Observation([], "procs",
+                                            coverage={"non_local_memory": True}))
+    monkeypatch.setattr(server, "_ollama", _StubResidency([]))
+    monkeypatch.setattr(server, "_run_detection", lambda status: None)
+
+
+@pytest.mark.parametrize("impl", ["_vram_status_impl", "_list_loaded_impl"])
+def test_summary_names_an_unreadable_ledger_with_nothing_loaded(monkeypatch, impl):
+    """Without this, an agent cannot tell "no claims" from "claims unreadable"
+    until it calls something that refuses."""
+    _idle_status_sources(monkeypatch)
+    server._claims._DEFAULT_PATH.write_text(
+        json.dumps({"protocol": server._claims._PROTOCOL + 1, "claims": []}),
+        encoding="utf-8")
+    status = getattr(server, impl)()
+    assert status["observations"]["coordination"]["status"] == "unavailable"
+    assert "Coordination unavailable: claim ledger" in status["summary"]
+    assert f"protocol {server._claims._PROTOCOL + 1}" in status["summary"]
+    assert ".." not in status["summary"]
 
 
 # ---- warm() admission ------------------------------------------------------

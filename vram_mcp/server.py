@@ -200,12 +200,25 @@ def _coordination_result(schema: type, result: dict | None = None, **overrides) 
     return normalized
 
 
-def _snapshot() -> core.Snapshot:
-    """Capture protection for one status view or one eviction decision."""
+def _snapshot(correlate: bool = True) -> core.Snapshot:
+    """Capture protection for one status view or one eviction decision.
+
+    ``correlate=False`` reads the ledger alone, skipping the runner listing and
+    NVML session that only loaded models need.
+    """
     return core.Snapshot.capture(
-        _claims.list_claims, runner_pid_map,
-        lambda pids: _nvml.nvml_busy_map(pids, index=_GPU_INDEX),
+        _claims.list_claims,
+        runner_pid_map if correlate else None,
+        (lambda pids: _nvml.nvml_busy_map(pids, index=_GPU_INDEX)) if correlate else None,
     )
+
+
+def _coordination_note(status: dict) -> str:
+    """Name an unreadable ledger, so "no claims" never reads as "unreadable"."""
+    coordination = status["observations"].get("coordination") or {}
+    if coordination.get("status") != "unavailable":
+        return ""
+    return f" Coordination unavailable: {str(coordination.get('error')).rstrip('.')}."
 
 
 def _active_claims() -> tuple[list, bool]:
@@ -254,6 +267,7 @@ def _vram_status_impl() -> dict:
         # a reader cannot infer it, since which evidence was missing is the
         # whole content of that answer.
         + (f" {detail}" if detail and state != "ok" else "")
+        + _coordination_note(status)
     )
     return status
 
@@ -278,8 +292,9 @@ def _list_loaded_impl() -> dict:
     _run_detection(status)
     loaded = status["loaded"]
     return {"loaded": loaded, "observations": status["observations"],
-            "summary": f"{len(loaded)} model(s) loaded." if loaded is not None
-            else "Ollama residency is unavailable; loaded models are unknown."}
+            "summary": (f"{len(loaded)} model(s) loaded." if loaded is not None
+                        else "Ollama residency is unavailable; loaded models are unknown.")
+                       + _coordination_note(status)}
 
 
 @mcp.tool()

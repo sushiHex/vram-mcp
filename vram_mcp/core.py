@@ -269,14 +269,18 @@ def combined_status(
     resolved_pids: set = set()
     offloads: dict = {}
     snap = None
-    # Nothing loaded -> nothing to enrich; skip the snapshot's subprocess/IO.
-    if snapshot_fn is not None and loaded:
+    # The ledger is read on every call: reservations exist without any loaded
+    # model, and an unreadable ledger must never look like an empty one. Its
+    # correlation with runners — a process listing and an NVML session — is
+    # paid only when there are models to correlate.
+    if snapshot_fn is not None:
+        coordination_source = "claims+nvml" if loaded else "claims"
         try:
-            snap = snapshot_fn()
-            observations["coordination"] = Observation(True, "claims+nvml").metadata()
+            snap = snapshot_fn(correlate=bool(loaded))
+            observations["coordination"] = Observation(True, coordination_source).metadata()
         except (OSError, ValueError, TimeoutError) as exc:
-            snap = None
-            observations["coordination"] = Observation(None, "claims+nvml", error=str(exc)).metadata()
+            observations["coordination"] = Observation(
+                None, coordination_source, error=str(exc)).metadata()
         if snap is not None:
             loaded, resolved_pids = attach_coordination(loaded, snap)
         # The SAME snapshot answers both questions, so the pid map is walked

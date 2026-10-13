@@ -381,7 +381,7 @@ def test_combined_status_live_offload_shape_is_degraded_not_thrashing():
     status = core.combined_status(
         lambda: [{"index": 0, "total_mb": 24576, "used_mb": 24017, "free_mb": 559}],
         FakeOllama(models),
-        snapshot_fn=lambda: _snap(pid_map={"qwen3:32b": RUNNER_PID}),
+        snapshot_fn=lambda correlate: _snap(pid_map={"qwen3:32b": RUNNER_PID}),
         procinfo_fn=lambda: [
             {"pid": RUNNER_PID, "size_mb": 22371, "non_local_mb": 3906},
             {"pid": 9968, "size_mb": 671, "non_local_mb": 3},
@@ -472,7 +472,7 @@ def test_missing_spill_coverage_does_not_suppress_degraded():
                "expires_at": None}]
     status = core.combined_status(
         lambda: GPUS_OK, FakeOllama(models),
-        snapshot_fn=lambda: _snap(pid_map={"m1": 555}),
+        snapshot_fn=lambda correlate: _snap(pid_map={"m1": 555}),
         procinfo_fn=_blind_to_non_local([{"pid": 555, "size_mb": 16384}]),
     )
     assert status["pressure"]["state"] == "degraded"
@@ -501,7 +501,7 @@ def test_combined_status_full_wiring():
                  pid_map={"m1": 555}, busy_map={555: True})
     status = core.combined_status(
         gpu_fn_const(8000), FakeOllama(models),
-        snapshot_fn=lambda: snap,
+        snapshot_fn=lambda correlate: snap,
         nvml_processes_fn=lambda: [
             {"pid": 555, "size_mb": 4096, "kind": "compute"},
             {"pid": 999, "size_mb": 100, "kind": "graphics"},
@@ -519,7 +519,7 @@ def test_combined_status_other_processes_from_procinfo():
     snap = _snap(pid_map={"m1": 555})
     status = core.combined_status(
         gpu_fn_const(8000), FakeOllama(models),
-        snapshot_fn=lambda: snap,
+        snapshot_fn=lambda correlate: snap,
         procinfo_fn=lambda: [
             {"pid": 555, "size_mb": 4096, "name": "llama-server.exe", "cmdline": "...", "kind": "compute"},
             {"pid": 999, "size_mb": 14492, "name": "python.exe", "cmdline": "python train.py", "kind": "compute"},
@@ -551,7 +551,7 @@ def test_pressure_sees_ollama_runner_spill():
     status = core.combined_status(
         lambda: [{"index": 0, "total_mb": 24576, "used_mb": 24000, "free_mb": 576}],
         FakeOllama([{"name": "m", "size": gb_bytes(20), "size_vram": gb_bytes(16)}]),
-        snapshot_fn=lambda: _snap(pid_map={"m": 999}),
+        snapshot_fn=lambda correlate: _snap(pid_map={"m": 999}),
         procinfo_fn=source,
     )
     p = status["pressure"]
@@ -585,15 +585,45 @@ def test_combined_status_forwards_spill_threshold():
     assert quiet["pressure"]["state"] == "thrashing"
 
 
-def test_combined_status_skips_snapshot_when_nothing_loaded():
-    """An idle-status call must not pay the snapshot's subprocess/IO cost."""
-    def exploding_snapshot():
-        raise AssertionError("snapshot must not be captured for zero models")
+def test_combined_status_reads_only_the_ledger_when_nothing_is_loaded():
+    """Reservations exist without any loaded model, so the ledger is read on
+    every call; the runner listing and NVML session it would correlate are not."""
+    calls = []
+
+    def snapshot(correlate):
+        calls.append(correlate)
+        return _snap()
+
+    status = core.combined_status(gpu_fn_const(8000), FakeOllama([]), snapshot_fn=snapshot)
+    assert calls == [False]
+    assert status["loaded"] == []
+    coordination = status["observations"]["coordination"]
+    assert (coordination["status"], coordination["source"]) == ("available", "claims")
+
+
+def test_combined_status_reports_an_unreadable_ledger_with_nothing_loaded():
+    """An unreadable ledger must never look like an empty one."""
+    def unreadable(correlate):
+        raise ValueError("claim ledger uses coordination protocol 2")
+
+    status = core.combined_status(gpu_fn_const(8000), FakeOllama([]), snapshot_fn=unreadable)
+    coordination = status["observations"]["coordination"]
+    assert coordination["status"] == "unavailable"
+    assert coordination["error"] == "claim ledger uses coordination protocol 2"
+
+
+def test_combined_status_correlates_when_models_are_loaded():
+    calls = []
+
+    def snapshot(correlate):
+        calls.append(correlate)
+        return _snap(pid_map={"m": 999})
 
     status = core.combined_status(
-        gpu_fn_const(8000), FakeOllama([]), snapshot_fn=exploding_snapshot,
-    )
-    assert status["loaded"] == []
+        gpu_fn_const(8000), FakeOllama([{"name": "m", "size_vram": gb_bytes(4)}]),
+        snapshot_fn=snapshot)
+    assert calls == [True]
+    assert status["observations"]["coordination"]["source"] == "claims+nvml"
 
 
 # ---- ensure_free ------------------------------------------------------------
