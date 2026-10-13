@@ -341,8 +341,9 @@ def environment(ollama: str, gpu: int, status: dict) -> dict:
     return {
         "OS": platform.platform(),
         "Python": platform.python_version(),
-        "vram-mcp": f"{version('vram-mcp')} at "
-                    f"{run_quietly('git', 'rev-parse', '--short', 'HEAD')}",
+        "vram-mcp": version("vram-mcp") + (
+            "" if (revision := run_quietly("git", "rev-parse", "--short", "HEAD")) == "unavailable"
+            else f" at {revision}"),
         "mcp": version("mcp"),
         "GPU": run_quietly("nvidia-smi", f"--id={gpu}", "--format=csv,noheader",
                            "--query-gpu=name,driver_version,memory.total"),
