@@ -60,6 +60,13 @@ def _status(gpus, loaded=(), procs=()):
     }
 
 
+def test_the_server_announces_its_own_version():
+    """Left alone, the server reports the MCP SDK's version as its own."""
+    import vram_mcp
+    options = server.mcp._mcp_server.create_initialization_options()
+    assert (options.server_name, options.server_version) == ("vram-mcp", vram_mcp.__version__)
+
+
 def test_run_detection_skips_sample_when_gpu_data_absent(audit_spy):
     """list_loaded() deliberately skips the nvidia-smi spawn, so its status has
     no GPU rows. Recording {free_mb: None, used_mb: 0, total_mb: 0} would write

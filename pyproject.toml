@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "vram-mcp"
-version = "0.2.0"
+dynamic = ["version"]
 description = "MCP server to inspect and free NVIDIA GPU VRAM via Ollama + nvidia-smi."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -33,6 +33,15 @@ vram-mcp = "vram_mcp.server:main"
 Homepage = "https://github.com/sushiHex/vram-mcp"
 Repository = "https://github.com/sushiHex/vram-mcp"
 Issues = "https://github.com/sushiHex/vram-mcp/issues"
+
+[tool.hatch.version]
+path = "vram_mcp/__init__.py"
+
+[tool.hatch.build.targets.sdist]
+# Exactly the tracked project: hatch reads only this .gitignore, so anything a
+# global or nested ignore hides would otherwise be published.
+include = ["vram_mcp", "tests", "acceptance", "docs", "README.md", "LICENSE",
+           "AGENTS.md", "pyproject.toml"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["vram_mcp"]

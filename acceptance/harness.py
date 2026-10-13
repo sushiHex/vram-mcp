@@ -34,7 +34,7 @@ import requests
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-from vram_mcp import claims
+from vram_mcp import __version__, claims
 from vram_mcp.models import canonical_model
 
 KEEP_ALIVE = "2m"       # an interrupted run's model still leaves VRAM on its own
@@ -341,8 +341,9 @@ def environment(ollama: str, gpu: int, status: dict) -> dict:
     return {
         "OS": platform.platform(),
         "Python": platform.python_version(),
-        "vram-mcp": f"{version('vram-mcp')} at "
-                    f"{run_quietly('git', 'rev-parse', '--short', 'HEAD')}",
+        "vram-mcp": __version__ + (
+            "" if (revision := run_quietly("git", "rev-parse", "--short", "HEAD")) == "unavailable"
+            else f" at {revision}"),
         "mcp": version("mcp"),
         "GPU": run_quietly("nvidia-smi", f"--id={gpu}", "--format=csv,noheader",
                            "--query-gpu=name,driver_version,memory.total"),
