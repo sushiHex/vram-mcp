@@ -33,4 +33,9 @@ jobs:
           python-version: "3.10"
       - run: pip install uv
       - run: uv pip install --system --resolution lowest-direct -e ".[dev]"
+      # lowest-direct also lowers our typing-extensions, which holds pydantic
+      # back; the newest pydantic against the oldest mcp is exactly the pair
+      # that broke 0.3.0, so it is upgraded on purpose.
+      - run: uv pip install --system --upgrade pydantic
+      - run: python -c "import importlib.metadata as m; print({p: m.version(p) for p in ('mcp', 'pydantic', 'requests', 'nvidia-ml-py', 'pytest')})"
       - run: python -m pytest -q
