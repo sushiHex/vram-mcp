@@ -17,7 +17,9 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
-    "mcp>=1.10.0,<2",  # v1.10 adds FastMCP structured output schemas.
+    # 1.21.1 is the first that stops importing a private pydantic function that
+    # current pydantic no longer has; earlier releases install and then crash.
+    "mcp>=1.21.1,<2",
     "requests>=2.31",
     "nvidia-ml-py>=12.560",
     "typing-extensions>=4.6",

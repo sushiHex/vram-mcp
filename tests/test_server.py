@@ -9,9 +9,7 @@ import json
 
 import pytest
 
-pytest.importorskip("mcp")
-
-from vram_mcp import core, server  # noqa: E402
+from vram_mcp import core, server
 from vram_mcp.observations import Observation
 
 

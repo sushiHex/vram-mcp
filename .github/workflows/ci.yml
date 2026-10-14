@@ -19,3 +19,17 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - run: pip install -e ".[dev]"
       - run: python -m pytest -q
+
+  minimum-dependencies:
+    # Every floor in pyproject.toml is a promise that resolvers may hold us to:
+    # test the direct dependencies at their lowest declared versions, against
+    # today's transitive releases, on the oldest supported Python.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - run: pip install uv
+      - run: uv pip install --system --resolution lowest-direct -e ".[dev]"
+      - run: python -m pytest -q

@@ -17,11 +17,9 @@ from pathlib import Path
 import pytest
 import requests
 
-pytest.importorskip("mcp")
-
-from vram_mcp import audit, claims, core, server  # noqa: E402
-from vram_mcp.observations import Observation  # noqa: E402
-from vram_mcp.ollama import OllamaClient  # noqa: E402
+from vram_mcp import audit, claims, core, server
+from vram_mcp.observations import Observation
+from vram_mcp.ollama import OllamaClient
 
 
 _T0 = datetime(2026, 9, 12, 12, 0, 0, tzinfo=timezone.utc)
