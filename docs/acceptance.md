@@ -97,6 +97,7 @@ real locks.
 | --- | --- | --- | --- | --- | --- |
 | 2026-10-13 | Windows 11 (26200), Python 3.14.3 | RTX 3090, 596.49 | 0.34.4 | 0.2.0 at `a66573d` + this harness | 17 of 17 passed with `phi4-mini` |
 | 2026-10-13 | Windows 11 (26200), Python 3.14.3 | RTX 3090, 596.49 | 0.34.4 | 0.3.0 wheel, release candidate `b64bcf4`, installed in a clean environment (mcp 1.30.0) | 17 of 17 passed with `phi4-mini` |
+| 2026-10-13 | Windows 11 (26200), Python 3.14.3 | RTX 3090, 596.49 | 0.34.4 | 0.3.1 wheel, release candidate `6aa7c54`, installed in a clean environment (mcp 1.30.0) | 17 of 17 passed with `phi4-mini` |
 
 **Linux is untested on hardware.** CI exercises the Linux code paths with mocks
 only.
