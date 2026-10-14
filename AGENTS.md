@@ -26,7 +26,7 @@ Keep core logic injectable and testable. MCP tools are asynchronous; dispatch bl
 
 Use pytest with descriptive `test_<behavior>` names. Mock hardware, subprocesses, and HTTP; tests should not require a GPU or Ollama daemon. Use `tmp_path`, `monkeypatch`, and injected clocks for ledger/audit isolation; never touch live `~/.cache/vram-mcp/` files.
 
-Add regression tests for changed behavior, including unavailable telemetry and claim/reservation protection. No coverage threshold is configured. CI tests Python 3.10-3.14 on Windows and Linux, plus one job at the lowest declared dependency versions. Server tests require `mcp`, as the package does: a missing or broken SDK fails them rather than skipping them.
+Add regression tests for changed behavior, including unavailable telemetry and claim/reservation protection. No coverage threshold is configured. CI tests Python 3.10-3.14 on Windows and Linux, plus one job with direct dependencies at the lowest versions they resolve to. Server tests require `mcp`, as the package does: a missing or broken SDK fails them rather than skipping them.
 
 ## Commit & Pull Request Guidelines
 

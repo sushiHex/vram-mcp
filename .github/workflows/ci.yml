@@ -21,9 +21,10 @@ jobs:
       - run: python -m pytest -q
 
   minimum-dependencies:
-    # Every floor in pyproject.toml is a promise that resolvers may hold us to:
-    # test the direct dependencies at their lowest declared versions, against
-    # today's transitive releases, on the oldest supported Python.
+    # A floor in pyproject.toml is a promise resolvers may hold us to: test the
+    # direct dependencies at the lowest versions they can resolve to (a floor
+    # below what another dependency needs resolves higher), against today's
+    # transitive releases, on the oldest supported Python.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
