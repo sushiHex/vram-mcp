@@ -15,10 +15,8 @@ from typing import get_type_hints
 
 import pytest
 
-pytest.importorskip("mcp")
-
-from vram_mcp import schemas, server  # noqa: E402
-from vram_mcp.observations import Observation  # noqa: E402
+from vram_mcp import schemas, server
+from vram_mcp.observations import Observation
 
 
 @pytest.fixture(autouse=True)

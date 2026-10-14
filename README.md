@@ -31,13 +31,13 @@ isolated environment; no source checkout is needed.
 **[Claude Code](https://code.claude.com/docs/en/mcp):**
 
 ```sh
-claude mcp add vram --scope user -- uvx --from git+https://github.com/sushiHex/vram-mcp@v0.3.0 vram-mcp
+claude mcp add vram --scope user -- uvx --from git+https://github.com/sushiHex/vram-mcp@v0.3.1 vram-mcp
 ```
 
 **[Codex](https://learn.chatgpt.com/docs/extend/mcp?surface=cli):**
 
 ```sh
-codex mcp add vram -- uvx --from git+https://github.com/sushiHex/vram-mcp@v0.3.0 vram-mcp
+codex mcp add vram -- uvx --from git+https://github.com/sushiHex/vram-mcp@v0.3.1 vram-mcp
 ```
 
 **[Hermes](https://hermes-agent.nousresearch.com/docs/user-guide/features/mcp)** — merge into `~/.hermes/config.yaml`:
@@ -46,7 +46,7 @@ codex mcp add vram -- uvx --from git+https://github.com/sushiHex/vram-mcp@v0.3.0
 mcp_servers:
   vram:
     command: uvx
-    args: ["--from", "git+https://github.com/sushiHex/vram-mcp@v0.3.0", "vram-mcp"]
+    args: ["--from", "git+https://github.com/sushiHex/vram-mcp@v0.3.1", "vram-mcp"]
 ```
 
 <details>
@@ -59,7 +59,7 @@ Merge this entry into your client's MCP configuration:
   "mcpServers": {
     "vram": {
       "command": "uvx",
-      "args": ["--from", "git+https://github.com/sushiHex/vram-mcp@v0.3.0", "vram-mcp"]
+      "args": ["--from", "git+https://github.com/sushiHex/vram-mcp@v0.3.1", "vram-mcp"]
     }
   }
 }
@@ -70,12 +70,17 @@ Windows paths need escaped backslashes, such as `C:\\tools\\uvx.exe`.
 
 </details>
 
+On Windows, the MCP SDK needs `pywin32`, which has no free-threaded build. If
+`uv` picks a free-threaded Python (`3.14t`) and the install fails, add
+`--python 3.13` right after `uvx`.
+
 Reconnect your client after registration. It launches the server over stdio;
 running `vram-mcp` by hand waits for MCP input. Prefer a local installation?
 See [installing from source](docs/configuration.md#installing-from-source).
 
 **Upgrading from 0.2?** Stop every client using vram-mcp first; old and new
-servers must never share one ledger. See the [0.3.0 notes](docs/releases/v0.3.0.md).
+servers must never share one ledger. See the [0.3.0 notes](docs/releases/v0.3.0.md)
+and the [0.3.1 fix](docs/releases/v0.3.1.md).
 
 ### Make your first check
 
