@@ -2,7 +2,9 @@
 
 Never part of ``python -m pytest``. Read-only checks run by default. Scenarios
 that load and unload a model run only when ``--model``, ``--ollama`` and
-``--gpu`` are all given, so nothing is mutated by accident.
+``--gpu`` are all given, so nothing is mutated by accident. Scenarios that
+overcommit VRAM, paging every process on the GPU, run only with
+``--overcommit``.
 
 Every server it starts is a real ``vram-mcp`` stdio process with a fresh
 temporary ``VRAM_MCP_STATE_DIR``, so the harness coordinates only with itself
@@ -21,9 +23,11 @@ import json
 import math
 import os
 import platform
+import statistics
 import subprocess
 import sys
 import tempfile
+import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from importlib.metadata import version
@@ -291,6 +295,127 @@ async def unload_test_model(run: Run, b: Tools, model: str) -> None:
               f"unload -> {result['outcome']}")
 
 
+# ── overcommit: VRAM pages, and pressure must say so ─────────────────────────
+
+class Holder:
+    """One ``overcommit.py`` process holding and touching GPU memory, and the
+    lines it printed, each with the monotonic time it arrived."""
+
+    def __init__(self, process: asyncio.subprocess.Process) -> None:
+        self.process = process
+        self.lines: list[tuple[float, dict]] = []
+        self._first = asyncio.Event()
+        self._reader = asyncio.ensure_future(self._read())
+
+    @classmethod
+    async def start(cls, bus_id: str, mb: int, seconds: float) -> "Holder":
+        return cls(await asyncio.create_subprocess_exec(
+            sys.executable, str(OVERCOMMIT), bus_id, str(mb), str(seconds),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL))
+
+    async def _read(self) -> None:
+        async for line in self.process.stdout:
+            self.lines.append((time.monotonic(), json.loads(line)))
+            self._first.set()
+        self._first.set()
+
+    async def allocated(self) -> str | None:
+        """None once its memory is allocated; otherwise why it is not."""
+        await self._first.wait()
+        first = self.lines[0][1] if self.lines else {"error": "it exited silently"}
+        return first.get("error") if "allocated_mb" not in first else None
+
+    def rates(self, since: float = 0.0) -> list[float]:
+        return [line["gbps"] for at, line in self.lines if "gbps" in line and at >= since]
+
+    async def stop(self) -> None:
+        if self.process.returncode is None:
+            self.process.kill()
+        await self.process.wait()
+        await self._reader
+
+
+OVERCOMMIT = Path(__file__).with_name("overcommit.py")
+FULL_HEADROOM_MB = 256    # the first holder fills VRAM but fits: full, not paging
+OVERCOMMIT_MB = 3072      # how far the second holder goes past free VRAM
+HOLD_SECONDS = 30
+PAGING_RATIO = 0.1        # a pass at a tenth of solo bandwidth went over PCIe
+
+
+def refuse_to_overcommit(status: dict) -> str | None:
+    """Why the overcommit scenarios must not run, or None when they may."""
+    if sys.platform != "win32":
+        return ("only WDDM pages ordinary CUDA allocations to system memory; "
+                "see #27 for Linux")
+    if status["pressure"]["state"] != "ok":
+        return f"pressure already reads {status['pressure']['state']}"
+    if status["loaded"]:
+        return (f"Ollama has {len(status['loaded'])} model(s) resident, which "
+                "overcommitting would page too")
+    if status["observations"]["processes"].get("device") is None:
+        return "the GPU's PCI address is unknown"
+    if status["free_mb"] < 4 * FULL_HEADROOM_MB:
+        return f"only {status['free_mb']} MB is free"
+    return None
+
+
+def _non_local(status: dict, holders: list[Holder]) -> str:
+    by_pid = {row["pid"]: row["non_local_mb"] for row in status.get("other_processes") or []}
+    return ", ".join(f"{by_pid.get(holder.process.pid)} MB" for holder in holders)
+
+
+async def overcommit_reads_as_thrashing(run: Run, tools: Tools) -> None:
+    status = await tools("vram_status")
+    refusal = refuse_to_overcommit(status)
+    if refusal:
+        run.skip("Overcommit scenarios", refusal)
+        return
+    bus_id = status["observations"]["processes"]["device"]
+    holders = [await Holder.start(bus_id, status["free_mb"] - FULL_HEADROOM_MB,
+                                  HOLD_SECONDS + 15)]
+    try:
+        if why := await holders[0].allocated():
+            run.skip("Overcommit scenarios", f"the first holder could not allocate: {why}")
+            return
+        await asyncio.sleep(5)
+        full = (await tools("vram_status"))["pressure"]
+        run.check("Full VRAM that is not overcommitted is not thrashing",
+                  full["state"] != "thrashing",
+                  f"{full['state']}: {full['free_mb']} MB free, {full['non_local_mb']} MB "
+                  "non-local")
+        solo = statistics.median(holders[0].rates()[1:] or [0.0])  # the first pass faults pages in
+        overcommitted_at = time.monotonic()
+        holders.append(await Holder.start(bus_id, OVERCOMMIT_MB, HOLD_SECONDS))
+        if why := await holders[1].allocated():
+            run.skip("Overcommit scenarios", f"the driver refused to overcommit: {why}")
+            return
+        await asyncio.sleep(HOLD_SECONDS / 2)
+        during = await tools("vram_status")
+    finally:
+        for holder in holders:
+            await holder.stop()
+
+    paging = holders[0].rates(overcommitted_at) + holders[1].rates()
+    slowest = min(paging, default=solo)
+    run.check("Overcommitted VRAM pages",
+              slowest < solo * PAGING_RATIO,
+              f"{solo:.0f} GB/s while VRAM fit; slowest pass {slowest:.1f} GB/s once "
+              f"about {OVERCOMMIT_MB} MB past it")
+    pressure = during["pressure"]
+    run.check("Pressure reads thrashing while VRAM pages",
+              pressure["state"] == "thrashing",
+              f"{pressure['state']}: {pressure['free_mb']} MB free, {pressure['non_local_mb']} "
+              f"MB non-local, the holders' share {_non_local(during, holders)}")
+    for _ in range(10):     # WDDM takes a moment to give the memory back
+        after = (await tools("vram_status"))["pressure"]
+        if after["state"] == "ok":
+            break
+        await asyncio.sleep(2)
+    run.check("Pressure reads ok once paging stops", after["state"] == "ok",
+              f"{after['state']}: {after['free_mb']} MB free, {after['non_local_mb']} MB "
+              "non-local")
+
+
 # ── preconditions, environment, report ───────────────────────────────────────
 
 def refuse_to_touch(args: argparse.Namespace, run: Run, status: dict) -> str | None:
@@ -379,22 +504,33 @@ async def acceptance(run: Run, args: argparse.Namespace, tmp: Path) -> dict:
         refusal = refuse_to_touch(args, run, status) if args.model else "no --model given"
         if refusal:
             run.skip("Mutation scenarios", refusal)
-            return env
-        # Half the model's size: a reload must be refused, whatever the model.
-        headroom_mb = installed_size_mb(args.ollama, args.model) // 2
-        async with session(state, args.ollama, args.gpu) as b:
-            try:
-                await claims_protect_across_sessions(run, a, b, args.model)
-                await pending_warm_protects(run, a, b, args.model)
-                await refresh_is_admitted_under_reservation(run, a, b, args.model)
-                await claims_outlive_their_client(run, state, args.ollama, args.gpu, b,
-                                                  args.model)
-                await reload_is_refused_under_reservation(run, a, b, args.model, headroom_mb)
-                await unreachable_ollama_stays_unknown(run, tmp / "unreachable", args.gpu,
-                                                       args.model)
-            finally:
-                await unload_test_model(run, b, args.model)
+        else:
+            await mutation(run, args, state, tmp, a)
+        if not args.overcommit:
+            run.skip("Overcommit scenarios", "no --overcommit given")
+        elif run.failed:
+            run.skip("Overcommit scenarios", "an earlier check failed")
+        else:
+            await overcommit_reads_as_thrashing(run, a)
     return env
+
+
+async def mutation(run: Run, args: argparse.Namespace, state: Path, tmp: Path,
+                   a: Tools) -> None:
+    # Half the model's size: a reload must be refused, whatever the model.
+    headroom_mb = installed_size_mb(args.ollama, args.model) // 2
+    async with session(state, args.ollama, args.gpu) as b:
+        try:
+            await claims_protect_across_sessions(run, a, b, args.model)
+            await pending_warm_protects(run, a, b, args.model)
+            await refresh_is_admitted_under_reservation(run, a, b, args.model)
+            await claims_outlive_their_client(run, state, args.ollama, args.gpu, b,
+                                              args.model)
+            await reload_is_refused_under_reservation(run, a, b, args.model, headroom_mb)
+            await unreachable_ollama_stays_unknown(run, tmp / "unreachable", args.gpu,
+                                                   args.model)
+        finally:
+            await unload_test_model(run, b, args.model)
 
 
 async def main(args: argparse.Namespace) -> int:
@@ -418,6 +554,10 @@ def parse(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--gpu", type=int, help="NVIDIA GPU index; required with --model")
     parser.add_argument("--model", help="an installed model to load and unload; Ollama "
                                         "must be idle")
+    parser.add_argument("--overcommit", action="store_true",
+                        help="also overcommit VRAM for about a minute, to check that "
+                             "paging reads as thrashing; it pages every GPU user, so "
+                             "run it on an otherwise idle GPU")
     parser.add_argument("--report", help="also write the Markdown report here")
     args = parser.parse_args(argv)
     if args.model and (args.ollama is None or args.gpu is None):
