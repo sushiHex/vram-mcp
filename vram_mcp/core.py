@@ -24,11 +24,11 @@ TIGHT_MB = 1024
 # the first unmet requirement is the one reported, so the reason names the
 # evidence nearest the reader rather than an arbitrary one. A new input that
 # `ok` relies on is a line here, not another branch.
-_OK_REQUIRES = (
-    ("models", "Ollama residency is unavailable."),
-    ("non_local_memory",
-     "Non-local memory is unavailable; driver spill cannot be ruled out."),
-)
+_OK_REQUIRES = {
+    "models": "Ollama residency is unavailable",
+    "non_local_memory":
+        "Non-local memory is unavailable; driver spill cannot be ruled out",
+}
 
 
 def observe_loaded(ollama) -> Observation[list[dict]]:
@@ -305,6 +305,7 @@ def combined_status(
     #   * other_processes -> the runner-filtered view, since those PIDs are
     #     already reported as model entries.
     full_table: list[dict] = []
+    gaps: dict = {}
     if source is not None:
         process_reading = source()
         if not isinstance(process_reading, Observation):
@@ -314,6 +315,7 @@ def combined_status(
                                           scope=process_reading.scope)
         observations["processes"] = process_reading.metadata()
         full_table = process_reading.data if process_reading.known else []
+        gaps = process_reading.gaps or {}
         result["other_processes"] = (other_processes(full_table, resolved_pids)
                                      if process_reading.known else None)
     pressure_models = loaded
@@ -345,9 +347,11 @@ def combined_status(
     # never fire.
     coverage = result["pressure"]["coverage"]
     if result["pressure"]["state"] == "ok":
-        unmet = next((why for key, why in _OK_REQUIRES if not coverage[key]), None)
+        unmet = next((key for key in _OK_REQUIRES if not coverage[key]), None)
         if unmet is not None:
-            result["pressure"].update(state="unknown", detail=unmet)
+            why = _OK_REQUIRES[unmet]
+            detail = f"{why} ({gaps[unmet]})." if unmet in gaps else f"{why}."
+            result["pressure"].update(state="unknown", detail=detail)
     return result
 
 

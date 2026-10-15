@@ -2,10 +2,10 @@
 
 NVML gives per-process VRAM directly on Linux/TCC but returns ``None`` on
 Windows/WDDM. There, NVML's selected-GPU PID set is enriched with one bounded
-``Get-CimInstance Win32_Process`` identity query. Windows GPU Process Memory
-counters aggregate adapters and are deliberately not sampled or attributed to a
-selected device. Pure module: every external reader is injected; each degrades
-to ``[]``/``{}`` on any failure and never raises.
+``Get-CimInstance Win32_Process`` identity query, and with each process's
+non-local memory on the selected adapter (:mod:`.wddm`). Pure module: every
+external reader is injected; each degrades to ``[]``/``{}`` on any failure and
+never raises.
 """
 from __future__ import annotations
 
@@ -39,9 +39,8 @@ def _filter_pids(pids) -> list[int]:
     return sorted(real)[:_MAX_FILTER_PIDS]
 
 
-# The query is deliberately identity-only: Windows GPU Process Memory counters
-# aggregate adapters and cannot prove attribution to the selected GPU. NVML owns
-# the selected-GPU PID set; this one bounded CIM query only enriches those PIDs.
+# The query is deliberately identity-only: memory comes from NVML and, for
+# non-local memory, from the selected adapter's own counters (:mod:`.wddm`).
 def _win_gpu_identity_ps(pids: list[int]) -> str:
     pid_filter = " OR ".join(f"ProcessId={pid}" for pid in pids)
     return (
@@ -57,11 +56,9 @@ def _run_powershell(command: str, timeout: int) -> Optional[str]:
 
 
 def win_gpu_procs(pids=(), timeout: int = 10) -> list[dict]:
-    """Return identity for the selected NVML PIDs on Windows.
+    """Return identity for the selected GPU's PIDs on Windows.
 
-    Windows GPU counters aggregate adapters, so they are not sampled here and
-    their values can never be attributed to the selected GPU. ``pids`` is the
-    authoritative NVML PID set. A nonempty set performs one bounded CIM query;
+    ``pids`` is the selected GPU's PID set. A nonempty set performs one bounded CIM query;
     an empty set performs no subprocess call. Missing or failed identity data
     returns ``[]`` so callers retain the known NVML inventory with null names.
     """
@@ -127,15 +124,23 @@ def _base_table(rows: list[dict]) -> dict[int, dict]:
 
 def _enrich_processes(
     rows: list[dict], *, platform: str, win_gpu_reader=None,
-    posix_reader=None,
+    posix_reader=None, non_local: Optional[dict] = None,
 ) -> list[dict]:
-    """Attach process identity without weakening selected-GPU attribution.
+    """Attach non-local memory and process identity to selected-GPU rows.
 
-    Windows GPU Process Memory counters aggregate a PID across adapters and
-    are not queried. Identity is useful, but no Windows fallback may fill
-    memory fields or add a PID that NVML did not report for the selected device.
+    ``non_local`` maps PID to non-local MB on the selected adapter. It may name
+    a process NVML did not report: WDDM accounts for every process with memory
+    on the adapter, and a process holding non-local memory there joins the
+    table as ``kind="wddm"``, because its memory counts toward driver spill.
     """
     table = _base_table(rows)
+    if non_local is not None:
+        for pid, entry in table.items():
+            entry["non_local_mb"] = non_local.get(pid)
+        for pid, mb in non_local.items():
+            if pid not in table and mb != 0:
+                table[pid] = {**_base_table([{"pid": pid, "kind": "wddm"}])[pid],
+                              "non_local_mb": mb}
     if platform == "win32" and win_gpu_reader is not None:
         for windows_row in win_gpu_reader(list(table.keys())):
             entry = table.get(windows_row["pid"])
@@ -160,8 +165,14 @@ def observe_processes(
     nvml_observer=None,
     win_gpu_reader=None,
     posix_reader=None,
+    non_local=None,
 ) -> Observation[list[dict]]:
-    """Observe process holders for one selected GPU with platform enrichment."""
+    """Observe process holders for one selected GPU with platform enrichment.
+
+    ``non_local`` is the selected GPU's non-local memory reader
+    (:class:`.wddm.NonLocalMemory` on Windows). Without one, non-local memory
+    is not covered, and ``gaps`` says why.
+    """
     platform = sys.platform if platform is None else platform
     nvml_observer = nvml_observer or _nvml.observe_processes
     win_gpu_reader = win_gpu_procs if win_gpu_reader is None else win_gpu_reader
@@ -176,14 +187,31 @@ def observe_processes(
             error=nvml_observation.error or "NVML process telemetry unavailable",
             scope=scope, coverage=coverage,
         )
+    usage = non_local.observe() if non_local is not None else None
     rows = _enrich_processes(
         nvml_observation.data or [], platform=platform,
         win_gpu_reader=win_gpu_reader, posix_reader=posix_reader,
+        non_local=usage.data if usage is not None and usage.known else None,
     )
+    if usage is None:
+        gap = _NO_NON_LOCAL_READER
+    elif not usage.known:
+        gap = usage.error or "non-local memory reading failed"
+    else:
+        unread = sorted(row["pid"] for row in rows if row["non_local_mb"] is None)
+        gap = (f"no non-local reading for PID(s) {', '.join(map(str, unread))}"
+               if unread else None)
+    coverage["non_local_memory"] = gap is None
     return Observation(
         rows, source, observed_at=nvml_observation.observed_at, scope=scope,
-        coverage=coverage,
+        coverage=coverage, gaps={"non_local_memory": gap} if gap else None,
     )
+
+
+# Native Linux keeps cudaMalloc memory on the GPU, but no Linux interface
+# reports a process's GPU memory in system RAM, and managed memory can
+# oversubscribe; see #27.
+_NO_NON_LOCAL_READER = "no collector reads non-local memory on this platform"
 
 
 def process_table(*, nvml_processes, win_gpu_reader=None,
@@ -193,8 +221,8 @@ def process_table(*, nvml_processes, win_gpu_reader=None,
 
     Starts from selected-device NVML rows. Platform dispatch is explicit:
     Windows uses one bounded identity lookup for those PIDs, while POSIX uses
-    ``ps``. Windows memory fields remain ``None`` because adapter-aggregated
-    counters cannot prove selected-device attribution.
+    ``ps``. Memory fields NVML did not report remain ``None``; the server's
+    :func:`observe_processes` adds non-local memory.
     """
     selected_platform = sys.platform if platform is None else platform
     return _enrich_processes(

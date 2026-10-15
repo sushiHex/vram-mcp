@@ -157,6 +157,16 @@ async def read_only(run: Run, tools: Tools, gpu: int) -> dict:
     run.check("Pressure states the evidence it rests on",
               set(coverage) == {"capacity", "models", "processes", "non_local_memory"},
               f"pressure {status['pressure']['state']}, coverage {coverage}")
+    gap = (processes.get("gaps") or {}).get("non_local_memory")
+    if sys.platform == "win32":
+        run.check("Windows reads the selected adapter's non-local memory, so "
+                  "pressure reaches a verdict",
+                  coverage["non_local_memory"] and status["pressure"]["state"] != "unknown",
+                  f"pressure {status['pressure']['state']}: {status['pressure']['detail']}")
+    else:
+        run.check("Uncovered non-local memory says why",
+                  coverage["non_local_memory"] or bool(gap),
+                  f"non-local covered: {coverage['non_local_memory']}; gap: {gap}")
     return status
 
 

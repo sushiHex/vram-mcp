@@ -71,6 +71,7 @@ scenario fails.
 | The ledger is read and reported, loaded models or not | `observations.coordination` is present, from `claims` alone when nothing is loaded. |
 | Process observations report their coverage | Compute, graphics and non-local coverage are explicit. |
 | Pressure states the evidence it rests on | The verdict names which evidence it had. |
+| Windows reads the selected adapter's non-local memory, so pressure reaches a verdict | On Windows, `non_local_memory` is covered and `pressure` is not `unknown`. Elsewhere, the scenario is "Uncovered non-local memory says why": `gaps` names the reason. |
 | A claim made under an alias names the canonical model | `registry.ollama.ai/library/PHI4-MINI` claims `phi4-mini:latest`. |
 | Another session cannot evict a claimed model | Two server processes share one ledger. |
 | A pending warm blocks other sessions | A second session sees the in-flight operation and is refused. |
@@ -102,27 +103,28 @@ real locks.
 **Linux is untested on hardware.** CI exercises the Linux code paths with mocks
 only.
 
-## Known limitation: pressure cannot read `ok`
+## Non-local memory, and why Linux cannot read `ok`
 
-`pressure.coverage.non_local_memory` is `false` on every platform, because no
-collector observes non-local memory yet, so `pressure` reads `unknown` where it
-would otherwise read `ok`. NVML does not report non-local memory. On Windows the
-GPU performance counters do, but the earlier collector summed them across every
-adapter on the host and was slow, so it was removed. An investigation on the
-validated machine found that both of those problems can be fixed:
+`pressure` reads `ok` only when non-local memory was observed, since driver
+spill cannot be ruled out otherwise. NVML does not report it. On Windows,
+vram-mcp reads it from WDDM ([#22](https://github.com/sushiHex/vram-mcp/issues/22)):
 
-- `D3DKMTQueryAdapterInfo` returns each WDDM adapter's PCI address. That maps
-  its LUID to the NVML device exactly; on the validated machine, LUID
-  `0x153af` is at PCI `2D:00.0`, which is `nvidia-smi`'s bus ID.
+- `D3DKMTQueryAdapterInfo` returns each WDDM adapter's PCI address, which maps
+  the adapter's LUID to the NVML device exactly. The LUID is not stable: on the
+  validated machine it moved from `0x153af` to `0x143af` across a driver
+  update, so it is resolved again on every read (about 0.03 ms).
 - PDH, read directly rather than through PowerShell, returns
-  `\GPU Process Memory(*)\Non Local Usage` for that LUID in about 1 ms after a
-  one-time ~0.6 s query setup. The per-process values summed exactly to the
-  adapter's shared usage.
-- Per-process *Dedicated* Usage is not usable: Chrome's GPU process and `dwm`
+  `\GPU Process Memory(*)\Non Local Usage` per process and adapter. One query
+  per server costs about 0.5 s to open; each read after that takes under a
+  millisecond, and still sees processes started after it opened. The
+  per-process values summed exactly to the adapter's shared usage.
+- Per-process *Dedicated* Usage is not used: Chrome's GPU process and `dwm`
   reported 488 GB and 209 GB on a 24 GB card, with valid counter status.
+- WDDM listed processes on the adapter that NVML did not, one holding 31 MB of
+  non-local memory. Such processes count toward spill, as `kind: "wddm"`.
 
-Restoring spill detection on this basis is tracked in
-[#22](https://github.com/sushiHex/vram-mcp/issues/22). Linux needs its own
-answer, because WDDM's demotion of VRAM to system memory is a Windows mechanism.
-Whether spill can be ruled out there structurally, rather than measured, is not
-yet established.
+On Linux, `non_local_memory` stays `false`, so `pressure` reads `unknown` where
+it would otherwise read `ok`. Ordinary CUDA allocations are not demoted to
+system memory there as WDDM does, but managed memory can be, and no interface
+reports which processes use it. The evidence, and what a structural answer
+would need, are in [#27](https://github.com/sushiHex/vram-mcp/issues/27).

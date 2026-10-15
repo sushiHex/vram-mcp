@@ -492,6 +492,62 @@ def test_ok_survives_when_every_requirement_is_covered():
     assert status["pressure"]["coverage"]["non_local_memory"] is True
 
 
+def test_ok_withheld_detail_carries_the_process_gap():
+    status = core.combined_status(
+        lambda: GPUS_OK, FakeOllama([]),
+        procinfo_fn=lambda: Observation(
+            [], "procs", coverage={"non_local_memory": False},
+            gaps={"non_local_memory": "no non-local reading for PID(s) 5, 9"}),
+    )
+    assert status["pressure"]["state"] == "unknown"
+    assert status["pressure"]["detail"] == (
+        "Non-local memory is unavailable; driver spill cannot be ruled out "
+        "(no non-local reading for PID(s) 5, 9).")
+
+
+def test_ok_withheld_detail_without_gap_has_no_parentheses():
+    status = core.combined_status(
+        lambda: GPUS_OK, FakeOllama([]), procinfo_fn=_blind_to_non_local(),
+    )
+    assert status["pressure"]["detail"] == (
+        "Non-local memory is unavailable; driver spill cannot be ruled out.")
+
+
+def test_ok_with_full_coverage_and_integer_non_local_readings():
+    status = core.combined_status(
+        lambda: GPUS_OK, FakeOllama([]),
+        procinfo_fn=lambda: Observation(
+            [{"pid": 100, "size_mb": None, "non_local_mb": 40, "kind": "compute"},
+             {"pid": 900, "size_mb": None, "non_local_mb": 0, "kind": "wddm"}],
+            "procs", coverage={"non_local_memory": True}),
+    )
+    assert status["pressure"]["state"] == "ok"
+
+
+def test_thrashing_from_unexplained_wddm_row_exceeding_free_vram():
+    status = core.combined_status(
+        lambda: GPUS_TIGHT, FakeOllama([]),
+        procinfo_fn=lambda: Observation(
+            [{"pid": 900, "size_mb": None, "non_local_mb": 2048, "kind": "wddm"}],
+            "procs", coverage={"non_local_memory": True}),
+    )
+    pressure = status["pressure"]
+    assert pressure["state"] == "thrashing"
+    assert pressure["unexplained_spill_mb"] == 2048
+    assert pressure["spilling"] is True
+
+
+def test_wddm_row_below_free_vram_is_not_thrashing():
+    status = core.combined_status(
+        lambda: GPUS_OK, FakeOllama([]),
+        procinfo_fn=lambda: Observation(
+            [{"pid": 900, "size_mb": None, "non_local_mb": 2048, "kind": "wddm"}],
+            "procs", coverage={"non_local_memory": True}),
+    )
+    assert status["pressure"]["state"] == "ok"
+    assert status["pressure"]["spilling"] is False
+
+
 # ---- combined_status full wiring -------------------------------------------------
 
 def test_combined_status_full_wiring():

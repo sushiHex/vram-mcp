@@ -290,12 +290,14 @@ CPU-offloaded layers. vram-mcp attributes that memory before judging spill:
 
 Spill is flagged when scoped unexplained memory reaches `VRAM_MCP_SPILL_MB`
 (default 256 MB) **and exceeds selected-device free VRAM**. Treat this as a
-diagnostic heuristic. Current NVML process telemetry does not expose non-local
-memory, and Windows performance counters aggregate adapters; their totals are
-therefore not assigned to the selected GPU. When
+diagnostic heuristic. On Windows, non-local memory comes from the selected
+GPU's own WDDM adapter, so other GPUs' memory never counts. Linux has no such
+reading, so spill stays unknown there
+([#27](https://github.com/sushiHex/vram-mcp/issues/27)). When
 `pressure.coverage.non_local_memory=false`, driver spill is unknown rather than
-zero. A partially CPU-offloaded model can still read `degraded` without evidence
-of driver paging.
+zero, and the process observation's `gaps.non_local_memory` says why. A
+partially CPU-offloaded model can still read `degraded` without evidence of
+driver paging.
 
 ### History
 

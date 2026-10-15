@@ -216,3 +216,157 @@ def test_win_gpu_procs_empty_on_reader_failure(monkeypatch):
     monkeypatch.setattr(procinfo.sys, "platform", "win32")
     monkeypatch.setattr(procinfo, "_run_powershell", lambda cmd, timeout: None)
     assert procinfo.win_gpu_procs([7]) == []
+
+
+# ---- non-local memory merged into observe_processes -------------------------
+
+class FakeNonLocal:
+    """Fake non-local reader: canned Observation, counts observe() calls."""
+
+    def __init__(self, observation):
+        self._observation = observation
+        self.calls = 0
+
+    def observe(self):
+        self.calls += 1
+        return self._observation
+
+
+def _usage(data):
+    return FakeNonLocal(Observation(data, "wddm"))
+
+
+def _nvml_rows(*rows):
+    return lambda index, *, nvml=None: Observation(
+        list(rows), "nvml", scope=f"gpu:index={index}")
+
+
+def test_observe_processes_merges_non_local_into_nvml_rows():
+    result = procinfo.observe_processes(
+        platform="linux",
+        nvml_observer=_nvml_rows({"pid": 100, "size_mb": 8000, "kind": "compute"},
+                                 {"pid": 200, "size_mb": 500, "kind": "graphics"}),
+        posix_reader=lambda pids: {},
+        non_local=_usage({100: 300, 200: 0}),
+    )
+    by_pid = {row["pid"]: row for row in result.data}
+    assert by_pid[100]["non_local_mb"] == 300
+    assert by_pid[100]["size_mb"] == 8000
+    assert by_pid[200]["non_local_mb"] == 0     # a measured zero, not unknown
+    assert result.coverage["non_local_memory"] is True
+    assert result.gaps is None
+    assert "gaps" not in result.metadata()
+
+
+def test_observe_processes_wddm_only_pid_joins_with_identity():
+    seen = []
+
+    def win(pids):
+        seen.append(sorted(pids))
+        return [{"pid": 900, "name": "chrome.exe", "cmdline": "chrome.exe --gpu"}]
+
+    result = procinfo.observe_processes(
+        platform="win32",
+        nvml_observer=_nvml_rows({"pid": 100, "size_mb": None, "kind": "compute"}),
+        win_gpu_reader=win,
+        non_local=_usage({100: 10, 900: 2048}),
+    )
+    by_pid = {row["pid"]: row for row in result.data}
+    assert by_pid[900]["kind"] == "wddm"
+    assert by_pid[900]["size_mb"] is None
+    assert by_pid[900]["non_local_mb"] == 2048
+    assert by_pid[900]["name"] == "chrome.exe"
+    assert by_pid[900]["cmdline"] == "chrome.exe --gpu"
+    assert seen == [[100, 900]]                 # identity lookup got the wddm PID
+    assert result.coverage["non_local_memory"] is True
+
+
+def test_observe_processes_zero_mb_unknown_pid_is_skipped():
+    result = procinfo.observe_processes(
+        platform="linux",
+        nvml_observer=_nvml_rows({"pid": 100, "size_mb": 1, "kind": "compute"}),
+        posix_reader=lambda pids: {},
+        non_local=_usage({100: 5, 777: 0}),
+    )
+    assert [row["pid"] for row in result.data] == [100]
+    assert result.coverage["non_local_memory"] is True
+
+
+def test_observe_processes_unreadable_unknown_pid_joins_and_uncovers():
+    result = procinfo.observe_processes(
+        platform="linux",
+        nvml_observer=_nvml_rows({"pid": 100, "size_mb": 1, "kind": "compute"}),
+        posix_reader=lambda pids: {},
+        non_local=_usage({100: 5, 777: None}),
+    )
+    by_pid = {row["pid"]: row for row in result.data}
+    assert by_pid[777]["kind"] == "wddm"
+    assert by_pid[777]["non_local_mb"] is None
+    assert result.coverage["non_local_memory"] is False
+    assert result.gaps == {
+        "non_local_memory": "no non-local reading for PID(s) 777"}
+
+
+def test_observe_processes_nvml_pid_missing_from_usage_names_it_in_gap():
+    result = procinfo.observe_processes(
+        platform="linux",
+        nvml_observer=_nvml_rows({"pid": 9, "size_mb": 1, "kind": "compute"},
+                                 {"pid": 5, "size_mb": 1, "kind": "compute"},
+                                 {"pid": 7, "size_mb": 1, "kind": "compute"}),
+        posix_reader=lambda pids: {},
+        non_local=_usage({7: 64}),
+    )
+    by_pid = {row["pid"]: row for row in result.data}
+    assert by_pid[5]["non_local_mb"] is None
+    assert by_pid[7]["non_local_mb"] == 64
+    assert result.coverage["non_local_memory"] is False
+    assert result.gaps == {
+        "non_local_memory": "no non-local reading for PID(s) 5, 9"}
+
+
+def test_observe_processes_unavailable_reader_gap_is_its_error():
+    reader = FakeNonLocal(Observation(None, "wddm", error="PDH query failed"))
+    result = procinfo.observe_processes(
+        platform="linux",
+        nvml_observer=_nvml_rows({"pid": 100, "size_mb": 1, "kind": "compute"}),
+        posix_reader=lambda pids: {},
+        non_local=reader,
+    )
+    assert result.known is True
+    assert result.data[0]["non_local_mb"] is None
+    assert result.coverage["non_local_memory"] is False
+    assert result.gaps == {"non_local_memory": "PDH query failed"}
+
+
+def test_observe_processes_without_reader_gap_names_missing_collector():
+    result = procinfo.observe_processes(
+        platform="linux",
+        nvml_observer=_nvml_rows({"pid": 100, "size_mb": 1, "kind": "compute"}),
+        posix_reader=lambda pids: {},
+    )
+    assert result.data[0]["non_local_mb"] is None
+    assert result.coverage["non_local_memory"] is False
+    assert result.gaps == {"non_local_memory": procinfo._NO_NON_LOCAL_READER}
+    assert result.metadata()["gaps"] == {
+        "non_local_memory": procinfo._NO_NON_LOCAL_READER}
+
+
+def test_observe_processes_does_not_call_reader_when_nvml_unavailable():
+    reader = _usage({100: 5})
+
+    def failed(index, *, nvml=None):
+        return Observation(None, "nvml", error="driver unavailable")
+
+    result = procinfo.observe_processes(
+        platform="linux", nvml_observer=failed,
+        posix_reader=lambda pids: {}, non_local=reader,
+    )
+    assert result.known is False
+    assert reader.calls == 0
+    assert result.coverage["non_local_memory"] is False
+
+
+def test_observation_metadata_includes_gaps_only_when_present():
+    assert "gaps" not in Observation([], "x").metadata()
+    assert "gaps" not in Observation([], "x", gaps={}).metadata()
+    assert Observation([], "x", gaps={"a": "why"}).metadata()["gaps"] == {"a": "why"}

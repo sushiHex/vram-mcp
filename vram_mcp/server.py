@@ -18,6 +18,7 @@ import functools
 import os
 import math
 import re
+import sys
 
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional, get_args, get_origin, get_type_hints
@@ -51,6 +52,7 @@ _ollama = OllamaClient(base_url=_OLLAMA_BASE_URL)
 
 from . import audit as _audit
 from . import procinfo as _procinfo
+from . import wddm as _wddm
 
 def _numeric_env(name: str, default, *, whole: bool = False, allow_zero: bool = False):
     try:
@@ -78,9 +80,13 @@ def _gpu_reading():
     return observe_gpu(_GPU_INDEX)
 
 
+# One per server: its counter query costs ~0.4 s to open and ~0.1 ms to read.
+_non_local = _wddm.NonLocalMemory(_GPU_INDEX) if sys.platform == "win32" else None
+
+
 def _procinfo_table():
     """Collect the configured device regardless of audit settings."""
-    return _procinfo.observe_processes(_GPU_INDEX)
+    return _procinfo.observe_processes(_GPU_INDEX, non_local=_non_local)
 
 
 def _run_detection(status: dict) -> None:

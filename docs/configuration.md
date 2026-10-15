@@ -106,21 +106,26 @@ as `null`; GPU failures retain `gpus=[]` with unavailable metadata and
 `free_mb=null`. This distinction lets callers separate “no models/processes”
 from “the source could not be queried.”
 
-Process metadata also reports whether non-local memory is covered. No collector
-provides it yet: NVML process readings do not include it, so `non_local_memory`
-is `false` on every platform. Compute and graphics process-query coverage are
-reported separately; either query may be unavailable while the other's rows
-remain useful.
+Process metadata also reports whether non-local memory is covered, and when it
+is not, `gaps.non_local_memory` says why. On Windows, `non_local_memory` is
+`true` when the selected GPU's WDDM adapter is found and every listed process
+has a reading. On Linux it is `false`: no interface reports a process's GPU
+memory in system RAM ([#27](https://github.com/sushiHex/vram-mcp/issues/27)).
+Compute and graphics process-query coverage are reported separately; either
+query may be unavailable while the other's rows remain useful.
 
 ### Audit cost and coverage
 
 On Windows/WDDM, NVML often cannot report per-process memory sizes. The
-process observation keeps the selected-GPU NVML PID set authoritative and uses
-one bounded `Win32_Process` identity lookup for those PIDs. It does not invoke
-`Get-Counter`: adapter-aggregated counter totals cannot be attributed to the
-selected device, so they are not used for capacity or spill decisions. Missing,
-inaccessible, or exited processes remain in the NVML inventory with
-`name: null` and `cmdline: null`.
+process observation starts from the selected GPU's NVML PID set and reads each
+process's non-local memory from the WDDM adapter at that GPU's PCI address,
+through the `GPU Process Memory` performance counters. Other adapters' readings
+are never counted. A process that NVML did not list but that holds non-local
+memory on the adapter joins the table with `kind: "wddm"`. The counter query
+opens once per server, which takes about half a second on the first status
+call; later reads take well under a millisecond. One bounded `Win32_Process`
+lookup then adds identity. Missing, inaccessible, or exited processes remain in
+the inventory with `name: null` and `cmdline: null`.
 
 `VRAM_MCP_AUDIT=0` disables action logging, appearance/disappearance detection,
 and new trend samples. It does not disable current GPU, process, model, or
@@ -138,11 +143,10 @@ Without it, spill was never observable and the state is `unknown` with the
 missing evidence named in `detail`, rather than `ok`. Missing process
 information is not evidence that nothing else is using the GPU.
 
-Today this is the normal case on every platform, not an edge one: no collector
-observes non-local memory, so `vram_status()` reports `unknown` where it would
-otherwise report `ok`. A measured route back on Windows is tracked in
-[#22](https://github.com/sushiHex/vram-mcp/issues/22). Read `pressure.coverage`
-to see exactly which evidence was available.
+On Linux this is the normal case, not an edge one: no collector observes
+non-local memory there, so `vram_status()` reports `unknown` where it would
+otherwise report `ok` ([#27](https://github.com/sushiHex/vram-mcp/issues/27)).
+Read `pressure.coverage` to see exactly which evidence was available.
 
 Keep the sample interval high enough that samples do not crowd action events
 out of the bounded log. Raising the spill floor can suppress noisy alerts;

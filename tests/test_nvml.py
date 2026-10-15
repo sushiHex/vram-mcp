@@ -71,6 +71,13 @@ class FakeNvml:
     def nvmlDeviceGetUUID(self, handle):
         return "GPU-fake-uuid"
 
+    def nvmlDeviceGetPciInfo(self, handle):
+        class _Pci:
+            busId = self.bus_id
+        return _Pci()
+
+    bus_id = "00000000:2D:00.0"
+
     def nvmlDeviceGetComputeRunningProcesses_v3(self, handle):
         if self.fail_compute:
             raise FakeNVMLError("not supported")
@@ -280,3 +287,15 @@ def test_b2mb_non_convertible_returns_none():
     assert nvml_mod._b2mb("garbage") is None
     assert nvml_mod._b2mb(None) is None
     assert nvml_mod._b2mb(300 * 1024**2) == 300
+
+
+def test_pci_bus_id_is_text_in_either_binding_form():
+    fake = FakeNvml()
+    assert nvml_mod.nvml_pci_bus_id(0, nvml=fake) == "00000000:2D:00.0"
+    assert fake.shutdown_called
+    fake.bus_id = b"00000000:41:00.0"   # older bindings return bytes
+    assert nvml_mod.nvml_pci_bus_id(0, nvml=fake) == "00000000:41:00.0"
+
+
+def test_pci_bus_id_is_none_without_a_device():
+    assert nvml_mod.nvml_pci_bus_id(0, nvml=FakeNvml(fail_handle=True)) is None
