@@ -146,6 +146,14 @@ with no subprocess: names from one Toolhelp snapshot, command lines from
 such as `dwm.exe`, keeps its name but has `cmdline: null`. Exited processes
 remain in the inventory with `name: null` and `cmdline: null`.
 
+A desktop's process table is mostly command lines: Chromium and Electron GPU
+processes carry over 1,000 characters of flags each. `vram_status()` therefore
+returns the first 160 characters of each, followed by `…` when cut. That
+usually names the program and, for Chromium, its process type; `name` is
+always whole. `vram_status(cmdline_chars=N)` changes the length, `0` leaves the
+field out, and `null` returns command lines whole. Detection and the audit log
+always see them whole. This saves tokens; it is not redaction.
+
 `VRAM_MCP_AUDIT=0` disables action logging, appearance/disappearance detection,
 and new trend samples. It does not disable current GPU, process, model, or
 activity observations. Claims and model operations remain enabled, and old
