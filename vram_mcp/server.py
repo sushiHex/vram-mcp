@@ -9,7 +9,7 @@ Every tool is ``async def`` and runs its blocking body (subprocess spawns,
 NVML sessions, HTTP calls, file locks) in a worker thread via
 ``anyio.to_thread.run_sync`` — the installed FastMCP invokes sync tools
 directly on the asyncio event loop, so a plain ``def`` tool would block the
-whole server (pings included) for the duration of every nvidia-smi/wmic call.
+whole server (pings included) for the duration of every nvidia-smi call.
 """
 
 from __future__ import annotations

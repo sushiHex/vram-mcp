@@ -136,9 +136,11 @@ reports on the adapter is in the table; one NVML did not list appears with
 `kind: "wddm"`. The counter query opens once per server, which
 takes about half a second on the first status call; later reads take well
 under a millisecond. The observation's `device` is the GPU's PCI address, from
-the same NVML session as its processes. One bounded `Win32_Process`
-lookup then adds identity. Missing, inaccessible, or exited processes remain in
-the inventory with `name: null` and `cmdline: null`.
+the same NVML session as its processes. Identity is then read through ctypes,
+with no subprocess: names from one Toolhelp snapshot, command lines from
+`NtQueryInformationProcess`. A process Windows denies to a non-elevated server,
+such as `dwm.exe`, keeps its name but has `cmdline: null`. Exited processes
+remain in the inventory with `name: null` and `cmdline: null`.
 
 `VRAM_MCP_AUDIT=0` disables action logging, appearance/disappearance detection,
 and new trend samples. It does not disable current GPU, process, model, or
