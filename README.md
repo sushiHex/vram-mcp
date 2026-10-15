@@ -159,7 +159,7 @@ bypass an unreadable coordination ledger or another pending mutation.
 | `ok` | Nothing is wrong, and every input that claim rests on was actually read. Missing evidence yields `unknown`, never `ok`. |
 | `tight` | Less than 1 GiB is free on the selected GPU. |
 | `degraded` | Ollama placed part of a model on the CPU; expect slower inference. |
-| `thrashing` | The driver is paging VRAM: in the last 10 seconds, WDDM's memory manager kept the GPU busy in at least half of them. |
+| `thrashing` | The driver is paging VRAM: in at least 5 of the last 10 seconds, WDDM's memory manager kept the GPU busy. |
 
 Missing required telemetry produces `pressure.state="unknown"`. Read
 `pressure.coverage` and top-level `observations` to see which evidence was

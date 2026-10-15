@@ -108,7 +108,7 @@ With `--overcommit` (Windows only):
 | Scenario | Demonstrates |
 | --- | --- |
 | Full VRAM that is not overcommitted is not thrashing | With VRAM filled to within 256 MB of capacity, `pressure` does not read `thrashing`. It reads `tight`. |
-| Overcommitted VRAM keeps paging | With a second holder asking 6144 MB more than is free, the holders spend at least half of the 10 s before the reading in passes under a tenth of the solo rate. One slow pass is not enough: WDDM can absorb a small overcommit by evicting idle desktop memory once, after which nothing pages. |
+| Overcommitted VRAM keeps paging | With a second holder asking 6144 MB more than is free, for at least half of the 10 s before the reading, a holder is in a pass under a tenth of its solo rate. One slow pass is not enough: WDDM can absorb a small overcommit by evicting idle desktop memory once, after which nothing pages. |
 | Pressure reads thrashing while VRAM pages | `pressure` reads `thrashing` while the holders keep paging. Skipped, saying why, when they did not. |
 | Pressure reads ok once paging stops | After the holders exit, `pressure` reads `ok` again. |
 
@@ -157,9 +157,9 @@ Loading a model or filling VRAM made a burst of 2-4 seconds. Ollama generation
 stayed under 4%.
 
 A sampler thread, started with the server, reads those ticks once a second and
-keeps the last 10 intervals. `thrashing` means at least half of them reach 5% of
-an engine. The first status call waits until 5 intervals exist, at most about
-7 seconds, once per server.
+keeps the last 10 intervals. `thrashing` means at least 5 of them reach 5% of
+an engine: longer than the bursts loading causes. A status call waits until 5
+intervals exist, at most about 7 seconds, after startup or a gap.
 
 This is a measured correlation, not a WDDM contract. The driver chooses which
 engine does the paging, and page-table updates and fills also run as the System

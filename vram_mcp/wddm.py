@@ -60,9 +60,13 @@ _VALID_DATA = (0, 1)  # PDH_CSTATUS_VALID_DATA, PDH_CSTATUS_NEW_DATA
 _SYSTEM_PID = 4
 _TICKS_PER_SECOND = 10_000_000
 
+_LINKED_ADAPTER = ("the GPU belongs to a linked adapter, whose physical GPUs "
+                   "these counters cannot tell apart")
+
 PAGING_PERCENT = 5.0      # of one engine, in one interval
 PAGING_WINDOW = 10        # intervals kept
-PAGING_MIN_SECONDS = 5    # intervals before a window is judged
+PAGING_SECONDS = 5        # active intervals that make paging sustained; also
+                          # the history a window needs before it is judged
 
 
 def parse_bus_id(bus_id: str) -> tuple[int, Address]:
@@ -114,8 +118,7 @@ def non_local(counters: dict[str, list[Sample]], luid: int) -> NonLocal:
     """Adapter ``luid``'s non-local memory; LookupError when it cannot be read."""
     adapter = list(_instances(_ADAPTER_INSTANCE, counters[_ADAPTERS], luid))
     if any(int(match["phys"]) != 0 for match, _, _ in adapter):
-        raise LookupError("the GPU belongs to a linked adapter, whose physical "
-                          "GPUs these counters cannot tell apart")
+        raise LookupError(_LINKED_ADAPTER)
     total = [value for _, status, value in adapter if status in _VALID_DATA]
     if not total:
         raise LookupError("WDDM reports no readable memory counters for the "
@@ -136,9 +139,10 @@ class Paging:
     at 5-54% of an engine in nearly every second, while loading a model or
     filling VRAM without overcommitting it made a burst of two to four
     seconds, and generation stayed under 4%. Paging is therefore *sustained*
-    when at least half the intervals reach :data:`PAGING_PERCENT`. This is a
-    measured correlation, not a WDDM contract: the paging engine is chosen by
-    the driver, and page-table updates and fills run there too.
+    when :data:`PAGING_SECONDS` intervals of the window reach
+    :data:`PAGING_PERCENT`, however many the window holds. This is a measured
+    correlation, not a WDDM contract: the paging engine is chosen by the
+    driver, and page-table updates and fills run there too.
     """
     percents: tuple[float, ...]
 
@@ -148,7 +152,7 @@ class Paging:
 
     @property
     def sustained(self) -> bool:
-        return bool(self.percents) and self.active * 2 >= len(self.percents)
+        return self.active >= PAGING_SECONDS
 
     def summary(self) -> dict:
         return {"sustained": self.sustained, "active_seconds": self.active,
@@ -162,8 +166,10 @@ class PagingMonitor:
 
     A status call cannot measure activity by itself: paging comes in bursts,
     and a window as long as the gap between calls averages it away. The
-    thread keeps the last :data:`PAGING_WINDOW` intervals; the first read
-    waits until :data:`PAGING_MIN_SECONDS` exist, at most once per server.
+    thread keeps the last :data:`PAGING_WINDOW` intervals; a read waits until
+    :data:`PAGING_SECONDS` exist, which happens after startup and after a gap.
+    A gap is any reading that failed, or one interval longer than three: a
+    sleeping machine, or a stalled collector, must not join two windows.
     """
 
     source = "wddm:pdh"
@@ -216,24 +222,24 @@ class PagingMonitor:
         with self._changed:
             self._sampled_at = now
             self._error = error
-            if ticks is None:
+            previous, self._previous = self._previous, (now, ticks) if ticks else None
+            if ticks is None or previous is None or now - previous[0] > 3 * self._interval:
                 self._percents.clear()      # a gap must not join two windows
-            elif self._previous is not None:
-                then, before = self._previous
+            else:
+                then, before = previous
                 # Engines that appear, vanish, or restart count from now on.
                 busy = sum(value - before[key] for key, value in ticks.items()
                            if before.get(key, value + 1) <= value)
                 self._percents.append(100 * busy / _TICKS_PER_SECOND / (now - then))
-            self._previous = (now, ticks) if ticks is not None else None
             self._changed.notify_all()
 
     def observe(self) -> Observation[Paging]:
         """The recent window. A sampler just started is waited for, briefly."""
         scope = f"gpu:index={self.index}"
-        deadline = time.monotonic() + (PAGING_MIN_SECONDS + 2) * self._interval
+        deadline = time.monotonic() + (PAGING_SECONDS + 2) * self._interval
         with self._changed:
             while (self._thread is not None and self._error is None
-                   and len(self._percents) < PAGING_MIN_SECONDS
+                   and len(self._percents) < PAGING_SECONDS
                    and time.monotonic() < deadline):
                 self._changed.wait(self._interval)
             if self._sampled_at is None:
@@ -242,9 +248,9 @@ class PagingMonitor:
                 error = self._error
             elif self._clock() - self._sampled_at > 5 * self._interval:
                 error = "the paging sampler stopped"
-            elif len(self._percents) < PAGING_MIN_SECONDS:
+            elif len(self._percents) < PAGING_SECONDS:
                 error = (f"paging history is still being collected "
-                         f"({len(self._percents)} of {PAGING_MIN_SECONDS} s)")
+                         f"({len(self._percents)} of {PAGING_SECONDS} s)")
             else:
                 return Observation(Paging(tuple(self._percents)), self.source, scope=scope)
         return Observation(None, self.source, error=error, scope=scope)
@@ -252,14 +258,18 @@ class PagingMonitor:
 
 def system_engine_ticks(counters: dict[str, list[Sample]], luid: int) -> dict[str, int]:
     """The System process's cumulative engine time on ``luid``, per engine,
-    in 100 ns ticks; LookupError when none is readable."""
-    ticks = {match.group(0): value
-             for match, status, value in _instances(_ENGINE_INSTANCE, counters[_ENGINES], luid)
-             if int(match["pid"]) == _SYSTEM_PID and status in _VALID_DATA}
-    if not ticks:
-        raise LookupError("WDDM reports no readable engine counters for the "
-                          "selected adapter")
-    return ticks
+    in 100 ns ticks. LookupError when any of them is unreadable: an idle engine
+    read beside an unreadable busy one would pass for a quiet adapter."""
+    system = [(match, status, value)
+              for match, status, value in _instances(_ENGINE_INSTANCE, counters[_ENGINES], luid)
+              if int(match["pid"]) == _SYSTEM_PID]
+    if any(int(match["phys"]) != 0 for match, _, _ in system):
+        raise LookupError(_LINKED_ADAPTER)
+    if not system:
+        raise LookupError("WDDM reports no engine counters for the selected adapter")
+    if any(status not in _VALID_DATA for _, status, _ in system):
+        raise LookupError("an engine counter on the selected adapter is unreadable")
+    return {match.group(0): value for match, _, value in system}
 
 
 def _nvml_bus_id(index: int) -> Optional[str]:

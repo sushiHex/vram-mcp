@@ -28,6 +28,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from importlib.metadata import version
@@ -326,18 +327,29 @@ class Holder:
         first = self.lines[0][1] if self.lines else {"error": "it exited silently"}
         return first.get("error") if "allocated_mb" not in first else None
 
-    def passes(self, since: float = 0.0, until: float = math.inf) -> list[dict]:
-        """Passes that ended in ``[since, until]``: ``{"gbps", "seconds"}`` each."""
-        return [line for at, line in self.lines if "gbps" in line and since <= at <= until]
+    def rates(self) -> list[float]:
+        return [line["gbps"] for _, line in self.lines if "gbps" in line]
 
-    def rates(self, since: float = 0.0, until: float = math.inf) -> list[float]:
-        return [line["gbps"] for line in self.passes(since, until)]
+    def slow_spans(self, below_gbps: float) -> list[tuple[float, float]]:
+        """When each pass slower than ``below_gbps`` ran, in monotonic time."""
+        return [(at - line["seconds"], at) for at, line in self.lines
+                if "gbps" in line and line["gbps"] < below_gbps]
 
     async def stop(self) -> None:
         if self.process.returncode is None:
             self.process.kill()
         await self.process.wait()
         await self._reader
+
+
+def covered_seconds(spans: list[tuple[float, float]], start: float, end: float) -> float:
+    """How much of ``[start, end]`` the spans cover, counting overlaps once."""
+    covered, reached = 0.0, start
+    for low, high in sorted((max(low, start), min(high, end)) for low, high in spans):
+        if low < high and high > reached:
+            covered += high - max(low, reached)
+            reached = high
+    return covered
 
 
 OVERCOMMIT = Path(__file__).with_name("overcommit.py")
@@ -404,17 +416,15 @@ async def overcommit_reads_as_thrashing(run: Run, tools: Tools) -> None:
     # Judge paging over the window the verdict reads. One slow pass only shows
     # an eviction; WDDM can absorb an overcommit by evicting idle desktop
     # memory once, and then nothing pages.
-    # Slow passes are long ones, so the time they took is the measure, not
-    # their count; two holders can each page for most of the window.
-    window = [p for holder in holders
-              for p in holder.passes(read_at - PAGING_WINDOW_SECONDS, read_at)]
-    slow_seconds = sum(p["seconds"] for p in window if p["gbps"] < solo * PAGING_RATIO)
+    # Slow passes are long ones, so the measure is the share of the window
+    # some holder spent in one, not how many ended in it.
+    spans = [span for holder in holders for span in holder.slow_spans(solo * PAGING_RATIO)]
+    slow_seconds = covered_seconds(spans, read_at - PAGING_WINDOW_SECONDS, read_at)
     paging = run.check(
         "Overcommitted VRAM keeps paging",
         slow_seconds >= PAGING_WINDOW_SECONDS / 2,
-        f"in the {PAGING_WINDOW_SECONDS} s before the reading, the holders spent "
-        f"{slow_seconds:.1f} s in passes under a tenth of {solo:.0f} GB/s; slowest "
-        f"{min((p['gbps'] for p in window), default=solo):.1f} GB/s")
+        f"for {slow_seconds:.1f} of the {PAGING_WINDOW_SECONDS} s before the reading, "
+        f"a holder was in a pass under a tenth of its {solo:.0f} GB/s")
     pressure = during["pressure"]
     evidence = (f"{pressure['state']}: paging {pressure['paging']}; {pressure['free_mb']} MB "
                 f"free, {pressure['non_local_mb']} MB non-local, the holders' share "
@@ -559,6 +569,7 @@ async def main(args: argparse.Namespace) -> int:
         try:
             env = await acceptance(run, args, Path(tmp))
         except Exception as exc:        # still report what did run
+            traceback.print_exc()       # the report holds one line; this holds the cause
             run.check("The run completed", False, f"{type(exc).__name__}: {exc}")
     text = report(env, run, args.model)
     print(text)

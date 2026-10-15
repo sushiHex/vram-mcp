@@ -212,8 +212,8 @@ _TICKS = wddm._TICKS_PER_SECOND   # one engine busy for one second
 
 
 def _engine(pid: int, luid: int, engine: int, ticks: int, status: int = 0,
-            kind: str = "Copy") -> tuple:
-    return (f"{_process(pid, luid)}_eng_{engine}_engtype_{kind}", status, ticks)
+            kind: str = "Copy", phys: int = 0) -> tuple:
+    return (f"{_process(pid, luid, phys)}_eng_{engine}_engtype_{kind}", status, ticks)
 
 
 def _system(engine: int, ticks: int, **kwargs) -> tuple:
@@ -226,25 +226,27 @@ def test_paging_counts_an_interval_at_the_threshold_as_active():
 
 
 @pytest.mark.parametrize(("percents", "active", "sustained"), [
+    ((), 0, False),                             # an empty window is not paging
     ((0.0,) * 10, 0, False),
-    ((5.0,) * 4 + (4.9,) * 6, 4, False),
-    ((5.0,) * 5 + (4.9,) * 5, 5, True),         # exactly half is sustained
+    ((10.0,) * 3 + (0.0,) * 2, 3, False),       # three of five: not half enough
+    ((5.0,) * 4, 4, False),
+    ((5.0,) * 4 + (0.0,) * 6, 4, False),        # four of ten
+    ((5.0,) * 5, 5, True),                      # five of five
+    ((5.0,) * 5 + (4.9,) * 5, 5, True),         # five of ten
     ((60.0,) * 10, 10, True),
-    ((5.0,) * 2 + (0.0,) * 3, 2, False),        # 2 of 5 (an odd window)
-    ((5.0,) * 3 + (0.0,) * 2, 3, True),         # 3 of 5
     ((4.99,) * 10, 0, False),                   # just under the threshold
 ])
-def test_paging_is_sustained_when_at_least_half_the_intervals_are_active(
-        percents, active, sustained):
+def test_paging_is_sustained_at_five_active_intervals(percents, active, sustained):
     paging = wddm.Paging(percents)
     assert paging.active == active
     assert paging.sustained is sustained
 
 
 def test_paging_summary_reports_the_window_and_its_peak():
-    paging = wddm.Paging((0.0, 5.0, 12.34, 0.0))
-    assert paging.summary() == {"sustained": True, "active_seconds": 2,
-                                "seconds": 4, "peak_percent": 12.3}
+    paging = wddm.Paging((0.0, 5.0, 12.34, 0.0, 7.0, 6.0, 9.0))
+    assert paging.summary() == {"sustained": True, "active_seconds": 5,
+                                "seconds": 7, "peak_percent": 12.3}
+    assert wddm.Paging((0.0, 5.0, 12.34, 0.0)).summary()["sustained"] is False
 
 
 def test_system_engine_ticks_keeps_only_the_system_process_on_the_adapter():
@@ -257,7 +259,8 @@ def test_system_engine_ticks_keeps_only_the_system_process_on_the_adapter():
         _engine(10, _SELECTED, 0, 7),               # another process
         _engine(40, _SELECTED, 0, 7),               # PID 4 is not a prefix match
         _engine(14, _SELECTED, 0, 7),
-        _system(2, 5, status=0xC0000BC6),           # unreadable
+        _engine(10, _SELECTED, 3, 7, status=0xC0000BC6),   # another process's, unreadable
+        _engine(40, _SELECTED, 4, 7, phys=1),       # another process's, linked
         ("_Total", 0, 12345),
     ]}, _SELECTED)
     assert ticks == {kept[0]: 100, new_data[0]: 50}
@@ -273,11 +276,38 @@ def test_system_engine_ticks_matches_lowercase_instances():
     [],
     [_engine(10, _SELECTED, 0, 7)],                 # no System process
     [_engine(4, _OTHER, 0, 7)],                     # only on another adapter
-    [_system(0, 7, status=0xC0000BC6)],             # only unreadable ones
 ])
-def test_system_engine_ticks_raises_when_none_is_readable(rows):
-    with pytest.raises(LookupError, match="no readable engine counters"):
+def test_system_engine_ticks_raises_when_there_are_none(rows):
+    with pytest.raises(LookupError, match="no engine counters"):
         wddm.system_engine_ticks({wddm._ENGINES: rows}, _SELECTED)
+
+
+@pytest.mark.parametrize("rows", [
+    [_system(0, 7, status=0xC0000BC6)],
+    # An idle engine read beside an unreadable busy one would pass for quiet.
+    [_system(0, 7), _system(1, 7, status=0xC0000BC6)],
+    [_system(0, 7, status=1), _system(1, 7, status=0xC0000BC6), _system(2, 7)],
+])
+def test_system_engine_ticks_raises_when_any_engine_is_unreadable(rows):
+    with pytest.raises(LookupError, match="unreadable"):
+        wddm.system_engine_ticks({wddm._ENGINES: rows}, _SELECTED)
+
+
+def test_system_engine_ticks_accepts_new_data_status_on_every_engine():
+    rows = [_system(0, 7, status=1), _system(1, 9, status=1)]
+    assert len(wddm.system_engine_ticks({wddm._ENGINES: rows}, _SELECTED)) == 2
+
+
+@pytest.mark.parametrize("rows", [
+    [_system(0, 7, phys=1)],
+    [_system(0, 7), _system(1, 7, phys=1)],
+    [_system(0, 7, status=0xC0000BC6, phys=1)],     # linked is named before unreadable
+])
+def test_system_engine_ticks_refuses_a_linked_adapter(rows):
+    with pytest.raises(LookupError) as raised:
+        wddm.system_engine_ticks({wddm._ENGINES: rows}, _SELECTED)
+    assert raised.value.args == (wddm._LINKED_ADAPTER,)
+    assert "linked adapter" in wddm._LINKED_ADAPTER
 
 
 class _Clock:
@@ -366,7 +396,7 @@ def test_a_quiet_system_process_reads_zero_percent():
 def test_the_window_needs_five_intervals_before_it_is_judged():
     monitor, engines, clock = _paging_monitor()
 
-    _fill(monitor, engines, clock, wddm.PAGING_MIN_SECONDS - 1)
+    _fill(monitor, engines, clock, wddm.PAGING_SECONDS - 1)
     early = monitor.observe()
     assert not early.known
     assert early.error == "paging history is still being collected (4 of 5 s)"
@@ -407,7 +437,7 @@ def test_a_failed_reading_clears_the_window_and_is_reported():
     engines.error = None
     _tick(monitor, engines, clock, [_system(0, 10 * _TICKS)])
     assert monitor.observe().error == "paging history is still being collected (0 of 5 s)"
-    for _ in range(wddm.PAGING_MIN_SECONDS):
+    for _ in range(wddm.PAGING_SECONDS):
         _tick(monitor, engines, clock, [_system(0, 10 * _TICKS)])
     assert monitor.observe().known
 
@@ -420,7 +450,7 @@ def test_an_adapter_with_no_system_engine_counters_is_reported_not_quiet():
 
     reading = monitor.observe()
     assert not reading.known
-    assert "no readable engine counters" in reading.error
+    assert "no engine counters" in reading.error
 
 
 def test_a_gap_does_not_turn_the_next_reading_into_one_long_interval():
@@ -433,7 +463,7 @@ def test_a_gap_does_not_turn_the_next_reading_into_one_long_interval():
     # Engine time accrued during the gap would read as a huge interval if the
     # pre-gap baseline survived.
     _tick(monitor, engines, clock, [_system(0, 500 * _TICKS)], seconds=30.0)
-    for _ in range(wddm.PAGING_MIN_SECONDS):
+    for _ in range(wddm.PAGING_SECONDS):
         _tick(monitor, engines, clock, [_system(0, 500 * _TICKS)])
 
     assert monitor.observe().data.percents == (0.0,) * 5
@@ -506,6 +536,58 @@ def test_staleness_scales_with_the_sampling_interval():
     assert monitor.observe().known
     clock.now += 0.6
     assert monitor.observe().error == "the paging sampler stopped"
+
+
+def test_a_long_interval_clears_the_window_and_the_next_reading_is_a_baseline():
+    """Sleep/resume or a stalled collector: counters that did not move over 60 s
+    must not be averaged into the window, and old activity must not outlive it."""
+    monitor, engines, clock = _paging_monitor()
+    _fill(monitor, engines, clock, 10, busy_ticks=_TICKS // 5)      # 20%: sustained
+    assert monitor.observe().data.sustained is True
+
+    _tick(monitor, engines, clock, [_system(0, 12 * _TICKS)],
+          seconds=60.0)
+    cleared = monitor.observe()
+    assert not cleared.known
+    assert cleared.error == "paging history is still being collected (0 of 5 s)"
+
+    quiet = [_system(0, 12 * _TICKS)]
+    for _ in range(wddm.PAGING_SECONDS):
+        _tick(monitor, engines, clock, quiet)
+    judged = monitor.observe().data
+    assert judged.percents == (0.0,) * 5
+    assert judged.sustained is False
+
+
+def test_an_interval_of_exactly_three_times_the_sampling_interval_still_counts():
+    monitor, engines, clock = _paging_monitor(interval=1.0)
+    _fill(monitor, engines, clock, wddm.PAGING_SECONDS)
+    assert len(monitor.observe().data.percents) == 5
+
+    _tick(monitor, engines, clock, [_system(0, 10 * _TICKS + 3 * _TICKS // 2)], seconds=3.0)
+
+    data = monitor.observe().data
+    assert len(data.percents) == 6
+    assert data.percents[-1] == pytest.approx(50.0)     # 1.5 s busy over 3 s
+
+
+def test_an_interval_just_over_three_times_the_sampling_interval_clears():
+    monitor, engines, clock = _paging_monitor(interval=1.0)
+    _fill(monitor, engines, clock, wddm.PAGING_SECONDS)
+
+    _tick(monitor, engines, clock, [_system(0, 10 * _TICKS)], seconds=3.01)
+
+    assert monitor.observe().error == "paging history is still being collected (0 of 5 s)"
+
+
+def test_the_long_interval_threshold_scales_with_the_sampling_interval():
+    monitor, engines, clock = _paging_monitor(interval=0.5)
+    _fill(monitor, engines, clock, wddm.PAGING_SECONDS, seconds=0.5)
+
+    _tick(monitor, engines, clock, [_system(0, 10 * _TICKS)], seconds=1.5)   # 3 x 0.5
+    assert len(monitor.observe().data.percents) == 6
+    _tick(monitor, engines, clock, [_system(0, 10 * _TICKS)], seconds=1.6)
+    assert not monitor.observe().known
 
 
 def test_a_reading_error_is_reported_ahead_of_staleness():
