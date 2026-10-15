@@ -9,7 +9,8 @@ model's weights are on every token.
 Usage: python acceptance/overcommit.py <PCI bus ID> <MB> <seconds>
 
 Prints one JSON object per line: ``{"allocated_mb": N}`` once, or
-``{"error": "..."}`` when allocation fails, then ``{"gbps": X}`` per pass.
+``{"error": "..."}`` when allocation fails, then ``{"gbps": X, "seconds": S}``
+per pass.
 """
 
 from __future__ import annotations
@@ -59,7 +60,8 @@ def main(bus_id: str, total_mb: int, seconds: float) -> int:
                 check(cuda.cuMemsetD8_v2(pointer, ctypes.c_ubyte(value),
                                          ctypes.c_size_t(CHUNK)), "cuMemsetD8")
             check(cuda.cuCtxSynchronize(), "cuCtxSynchronize")
-            emit(gbps=round(len(chunks) * CHUNK / (time.perf_counter() - start) / 1e9, 1))
+            seconds = time.perf_counter() - start
+            emit(gbps=round(len(chunks) * CHUNK / seconds / 1e9, 1), seconds=round(seconds, 3))
             time.sleep(0.25)
     except RuntimeError as exc:
         emit(error=str(exc))

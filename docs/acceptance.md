@@ -71,7 +71,7 @@ check failed. It can be combined with `--model`.
   RFC 6761 reserves that domain so it never resolves, so no server can answer.
 - **Overcommit:** `--overcommit` starts `acceptance/overcommit.py` holders that
   allocate GPU memory through the CUDA driver API. One fills VRAM to within
-  256 MB of capacity. A second asks for 3072 MB more. Each touches all its memory
+  256 MB of capacity. A second asks for 6144 MB more. Each touches all its memory
   on every pass and reports its bandwidth. Everything else on the GPU is paged
   while they run, including other Ollama servers the harness cannot see, so run
   it only when nothing else needs the GPU. The holders exit on their own, and the
@@ -108,8 +108,8 @@ With `--overcommit` (Windows only):
 | Scenario | Demonstrates |
 | --- | --- |
 | Full VRAM that is not overcommitted is not thrashing | With VRAM filled to within 256 MB of capacity, `pressure` does not read `thrashing`. It reads `tight`. |
-| Overcommitted VRAM pages | With a second holder asking 3072 MB more than is free, the slowest pass of a holder runs under a tenth of the solo rate. |
-| Pressure reads thrashing while VRAM pages | `pressure` reads `thrashing` while the holders page. |
+| Overcommitted VRAM keeps paging | With a second holder asking 6144 MB more than is free, the holders spend at least half of the 10 s before the reading in passes under a tenth of the solo rate. One slow pass is not enough: WDDM can absorb a small overcommit by evicting idle desktop memory once, after which nothing pages. |
+| Pressure reads thrashing while VRAM pages | `pressure` reads `thrashing` while the holders keep paging. Skipped, saying why, when they did not. |
 | Pressure reads ok once paging stops | After the holders exit, `pressure` reads `ok` again. |
 
 Residency checks fail rather than pass when residency cannot be read: an
@@ -167,9 +167,13 @@ process, so another workload could in principle keep that process busy without
 paging VRAM. The thresholds come from one machine.
 
 The `--overcommit` scenarios check this on real hardware. On the validated host,
-a full but not overcommitted GPU read `tight` at 124 MB free. Overcommitted, it
-read `thrashing`, with the slowest holder pass at 0.4 GB/s against 548 GB/s
-solo. Afterwards it read `ok`.
+a full but not overcommitted GPU read `tight` at 124 MB free. Overcommitted by
+6 GB, the holders spent 13-16 s of each 10 s window in passes at 1.3-1.4 GB/s
+against 620-775 GB/s solo, and it read `thrashing` with all 10 seconds active,
+in three runs out of three. Afterwards it read `ok`. A 3 GB overcommit paged
+steadily in some runs; in another, WDDM absorbed it once by evicting idle
+desktop memory, nothing paged afterwards, and `pressure` correctly read
+`tight`.
 
 ### Non-local memory
 

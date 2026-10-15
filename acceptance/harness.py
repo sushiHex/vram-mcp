@@ -326,8 +326,12 @@ class Holder:
         first = self.lines[0][1] if self.lines else {"error": "it exited silently"}
         return first.get("error") if "allocated_mb" not in first else None
 
-    def rates(self, since: float = 0.0) -> list[float]:
-        return [line["gbps"] for at, line in self.lines if "gbps" in line and at >= since]
+    def passes(self, since: float = 0.0, until: float = math.inf) -> list[dict]:
+        """Passes that ended in ``[since, until]``: ``{"gbps", "seconds"}`` each."""
+        return [line for at, line in self.lines if "gbps" in line and since <= at <= until]
+
+    def rates(self, since: float = 0.0, until: float = math.inf) -> list[float]:
+        return [line["gbps"] for line in self.passes(since, until)]
 
     async def stop(self) -> None:
         if self.process.returncode is None:
@@ -338,9 +342,10 @@ class Holder:
 
 OVERCOMMIT = Path(__file__).with_name("overcommit.py")
 FULL_HEADROOM_MB = 256    # the first holder fills VRAM but fits: full, not paging
-OVERCOMMIT_MB = 3072      # how far the second holder goes past free VRAM
+OVERCOMMIT_MB = 6144      # past free VRAM, by more than idle desktop memory WDDM can evict
 HOLD_SECONDS = 30
 PAGING_RATIO = 0.1        # a pass at a tenth of solo bandwidth went over PCIe
+PAGING_WINDOW_SECONDS = 10    # the server's paging window
 
 
 def refuse_to_overcommit(status: dict) -> str | None:
@@ -385,29 +390,41 @@ async def overcommit_reads_as_thrashing(run: Run, tools: Tools) -> None:
                   f"{full['state']}: {full['free_mb']} MB free, {full['non_local_mb']} MB "
                   "non-local")
         solo = statistics.median(holders[0].rates()[1:] or [0.0])  # the first pass faults pages in
-        overcommitted_at = time.monotonic()
         holders.append(await Holder.start(bus_id, OVERCOMMIT_MB, HOLD_SECONDS))
         if why := await holders[1].allocated():
             run.skip("Overcommit scenarios", f"the driver refused to overcommit: {why}")
             return
         await asyncio.sleep(HOLD_SECONDS / 2)
+        read_at = time.monotonic()
         during = await tools("vram_status")
     finally:
         for holder in holders:
             await holder.stop()
 
-    paging = holders[0].rates(overcommitted_at) + holders[1].rates()
-    slowest = min(paging, default=solo)
-    run.check("Overcommitted VRAM pages",
-              slowest < solo * PAGING_RATIO,
-              f"{solo:.0f} GB/s while VRAM fit; slowest pass {slowest:.1f} GB/s once "
-              f"about {OVERCOMMIT_MB} MB past it")
+    # Judge paging over the window the verdict reads. One slow pass only shows
+    # an eviction; WDDM can absorb an overcommit by evicting idle desktop
+    # memory once, and then nothing pages.
+    # Slow passes are long ones, so the time they took is the measure, not
+    # their count; two holders can each page for most of the window.
+    window = [p for holder in holders
+              for p in holder.passes(read_at - PAGING_WINDOW_SECONDS, read_at)]
+    slow_seconds = sum(p["seconds"] for p in window if p["gbps"] < solo * PAGING_RATIO)
+    paging = run.check(
+        "Overcommitted VRAM keeps paging",
+        slow_seconds >= PAGING_WINDOW_SECONDS / 2,
+        f"in the {PAGING_WINDOW_SECONDS} s before the reading, the holders spent "
+        f"{slow_seconds:.1f} s in passes under a tenth of {solo:.0f} GB/s; slowest "
+        f"{min((p['gbps'] for p in window), default=solo):.1f} GB/s")
     pressure = during["pressure"]
-    run.check("Pressure reads thrashing while VRAM pages",
-              pressure["state"] == "thrashing",
-              f"{pressure['state']}: paging {pressure['paging']}; {pressure['free_mb']} MB "
-              f"free, {pressure['non_local_mb']} MB non-local, the holders' share "
-              f"{_non_local(during, holders)}")
+    evidence = (f"{pressure['state']}: paging {pressure['paging']}; {pressure['free_mb']} MB "
+                f"free, {pressure['non_local_mb']} MB non-local, the holders' share "
+                f"{_non_local(during, holders)}")
+    if paging:
+        run.check("Pressure reads thrashing while VRAM pages",
+                  pressure["state"] == "thrashing", evidence)
+    else:
+        run.skip("Pressure reads thrashing while VRAM pages",
+                 f"VRAM was not paging when it was read; {evidence}")
     for _ in range(10):     # WDDM takes a moment to give the memory back
         after = (await tools("vram_status"))["pressure"]
         if after["state"] == "ok":
