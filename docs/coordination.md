@@ -279,31 +279,52 @@ and graphics query success independently; partial rows remain useful for a
 point-in-time status, but auditing does not update its disappearance baseline
 from a partial process inventory.
 
-On Windows/WDDM, a runner's non-local memory can include deliberately
-CPU-offloaded layers. vram-mcp attributes that memory before judging spill:
+`thrashing` means the driver is paging VRAM. On Windows, a sampler reads the
+System process's engine time on the selected adapter once a second. WDDM's video
+memory manager runs as that process, and its engine time was high in nearly
+every second while VRAM was overcommitted. The verdict reads `thrashing` when,
+for at least 5 of the last 10 seconds, that engine time was 5% of an engine or more. The
+`paging` field reports the window, or is `null` when paging was not read:
+
+- `sustained`: whether that condition holds.
+- `active_seconds`: how many seconds of the window reached 5% of an engine.
+- `seconds`: how many seconds the window covers, up to 10.
+- `peak_percent`: the highest sample, as a percentage of one engine.
+
+Loading a model or filling VRAM without overcommitting it makes a burst of two
+to four seconds, which is too short to read as sustained. Treat the verdict as a
+measured correlation, not a WDDM contract: the driver chooses the paging engine,
+and page-table updates and fills also run as the System process. See
+[acceptance](acceptance.md#paging-non-local-memory-and-why-linux-cannot-read-ok)
+for the measurements.
+
+Non-local memory is reported but decides no verdict. On Windows/WDDM, a
+runner's non-local memory can include deliberately CPU-offloaded layers.
+vram-mcp attributes that memory:
 
 - `non_local_mb`: the selected adapter's measured total.
 - `explained_offload_mb`: memory attributable to Ollama's deliberate CPU offload,
-  capped per correlated runner at `total_size_mb - size_vram_mb`.
+  capped per correlated runner at `total_size_mb - size_vram_mb`, and never more
+  than the total.
 - `unexplained_spill_mb`: the remainder, including other processes' non-local
   memory, any excess above a runner's explained offload, and memory no visible
-  process accounts for.
+  process accounts for. It is bounded by the measured total.
 
-Two limits follow from the counters. Non-local memory includes allocations an
-application deliberately places in system memory, such as upload buffers, not
-only demoted VRAM. And a runner's demoted VRAM, up to its offload allowance, is
-indistinguishable from the offload itself.
+These figures are quantities, not symptoms. A desktop holds 150-490 MB of
+non-local memory, and memory WDDM evicts to its backing store does not appear in
+it. Non-local memory also includes allocations an application deliberately
+places in system memory, such as upload buffers, and a runner's demoted VRAM, up
+to its offload allowance, is indistinguishable from the offload itself.
 
-Spill is flagged when scoped unexplained memory reaches `VRAM_MCP_SPILL_MB`
-(default 256 MB) **and exceeds selected-device free VRAM**. Treat this as a
-diagnostic heuristic. On Windows, non-local memory comes from the selected
-GPU's own WDDM adapter, so other GPUs' memory never counts. Linux has no such
-reading, so spill stays unknown there
-([#27](https://github.com/sushiHex/vram-mcp/issues/27)). When
-`pressure.coverage.non_local_memory=false`, driver spill is unknown rather than
-zero, and the process observation's `gaps.non_local_memory` says why. A
-partially CPU-offloaded model can still read `degraded` without evidence of
-driver paging.
+On Windows, non-local memory comes from the selected GPU's own WDDM adapter, so
+other GPUs' memory never counts. Linux has no paging reading, so `paging` is
+`null` there and `pressure.coverage.paging` is `false`
+([#27](https://github.com/sushiHex/vram-mcp/issues/27)); the verdict reads
+`unknown` where it would read `ok`. When `pressure.coverage.non_local_memory` is
+`false`, the non-local figures are `null`, and the process observation's
+`gaps.non_local_memory` says why. A full GPU without paging reads `tight` when
+less than 1 GiB is free. A partially CPU-offloaded model can still read
+`degraded` without evidence of driver paging.
 
 ### History
 
@@ -338,7 +359,7 @@ not a complete record of every GPU event.
 ### Trends
 
 `trend(hours=1)` summarizes retained samples: direction, min/max/latest free MB,
-and samples showing driver spill. Sampling happens only during `vram_status()`
+and samples that read `thrashing`. Sampling happens only during `vram_status()`
 calls that return selected-GPU readings, at most once per
 `VRAM_MCP_SAMPLE_SECONDS` across sessions. `list_loaded()` does not collect GPU
 readings or trend samples. Samples carry GPU scope, so changing

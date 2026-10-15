@@ -159,13 +159,16 @@ bypass an unreadable coordination ledger or another pending mutation.
 | `ok` | Nothing is wrong, and every input that claim rests on was actually read. Missing evidence yields `unknown`, never `ok`. |
 | `tight` | Less than 1 GiB is free on the selected GPU. |
 | `degraded` | Ollama placed part of a model on the CPU; expect slower inference. |
-| `thrashing` | Unexplained non-local memory meets the spill threshold and, when free VRAM is known, exceeds it. Driver paging is suspected. |
+| `thrashing` | The driver is paging VRAM: in at least 5 of the last 10 seconds, WDDM's memory manager kept the GPU busy. |
 
 Missing required telemetry produces `pressure.state="unknown"`. Read
 `pressure.coverage` and top-level `observations` to see which evidence was
-available. Driver-spill detection is best effort and requires non-local memory
-read for the selected GPU, which vram-mcp does on Windows. On Linux no such
-reading exists, so `pressure` reads `unknown` where it would read `ok`. CPU
+available. Paging detection is best effort. It needs a paging reading for the
+selected GPU, which vram-mcp takes on Windows from a sampler that starts with
+the server. On Linux no such reading exists, so `pressure` reads `unknown`
+where it would read `ok`. The detection is a measured correlation, not a WDDM
+contract; see [the acceptance notes](docs/acceptance.md#paging-non-local-memory-and-why-linux-cannot-read-ok).
+Non-local memory is reported but does not decide the verdict. CPU
 offload is tracked separately. Disabling auditing
 stops history detection and trend sampling, but does not disable current GPU or
 process observations.
