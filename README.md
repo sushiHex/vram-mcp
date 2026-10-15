@@ -94,8 +94,9 @@ Ask your agent:
 > much room is left. Report any unavailable readings.
 
 The agent should call `vram_status()` and `list_claims()`. Status includes a
-readable `summary`, the selected GPU, loaded models, available process details,
-and `observations` metadata. Check each observation's `status`; `unavailable`
+readable `summary`, the selected GPU, loaded models, available process details
+(command lines cut to 160 characters unless `cmdline_chars` says otherwise; see
+[configuration](docs/configuration.md)), and `observations` metadata. Check each observation's `status`; `unavailable`
 means the corresponding value is unknown, rather than empty or zero.
 `list_claims()` also shows capacity reserved for training or other non-Ollama
 work.

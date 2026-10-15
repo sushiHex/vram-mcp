@@ -19,6 +19,9 @@ dependencies = [
     # 1.21.1 is the first that stops importing a private pydantic function that
     # current pydantic no longer has; earlier releases install and then crash.
     "mcp>=1.21.1,<2",
+    # Tool arguments are declared with pydantic Field, as mcp's own are; mcp
+    # 1.21.1 already requires this floor.
+    "pydantic>=2.11,<3",
     "requests>=2.31",
     "nvidia-ml-py>=12.560",
     "typing-extensions>=4.6",
