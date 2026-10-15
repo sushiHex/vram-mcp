@@ -102,7 +102,9 @@ def meaningful_holders(loaded_models, process_table, threshold_mb: int) -> list[
     for p in process_table:
         size = p.get("size_mb")
         if size is not None and size >= threshold_mb:
-            label = p.get("cmdline") or p.get("name") or f"pid {p['pid']}"
+            # Never the command line: it can carry credentials, and this label
+            # is persisted and returned by history().
+            label = f"{p['name']} (pid {p['pid']})" if p.get("name") else f"pid {p['pid']}"
             holders.append({"key": f"process:{p['pid']}", "target": label,
                             "kind": "process", "size_mb": size})
     return holders
