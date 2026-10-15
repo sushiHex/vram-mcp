@@ -50,7 +50,6 @@ clients sharing one GPU and ledger.
 | `VRAM_MCP_MEANINGFUL_MB` | `512` | Minimum dedicated VRAM in MB for tracking a non-Ollama process in appearance/disappearance events. |
 | `VRAM_MCP_EVENT_CAP` | `5000` | Maximum retained events, including samples; oldest entries are pruned. |
 | `VRAM_MCP_SAMPLE_SECONDS` | `60` | Minimum interval between trend samples, shared across sessions. |
-| `VRAM_MCP_SPILL_MB` | `256` | Floor of unexplained non-local memory in MB before spill can be reported. It must also exceed free VRAM when that reading is available. |
 
 For clients using `mcpServers` JSON, add an `env` object to the server entry:
 
@@ -114,6 +113,19 @@ memory in system RAM ([#27](https://github.com/sushiHex/vram-mcp/issues/27)).
 Compute and graphics process-query coverage are reported separately; either
 query may be unavailable while the other's rows remain useful.
 
+Paging has its own observation, `observations.paging`, and its own coverage
+flag, `pressure.coverage.paging`. On Windows a sampler thread starts with the
+server and reads the System process's engine time on the selected adapter once a
+second, and a status call judges the last 10 seconds of them by the clock, so
+old activity ages out even if sampling stops. A status call waits until the
+window covers 5 seconds, at most about 8: once after startup, and again after a
+gap. A
+failed reading, or an interval longer than three seconds (a sleeping machine, a
+stalled collector), starts a new window, so two windows never join. If the
+sampler cannot find the adapter, cannot read every one of its engine counters,
+or has stopped, the observation is unavailable and says why, and `gaps.paging`
+repeats the reason. On Linux no collector reads paging.
+
 ### Audit cost and coverage
 
 On Windows/WDDM, NVML often cannot report per-process memory sizes. The
@@ -141,25 +153,25 @@ audit events remain queryable.
 
 `tight`, `degraded` and `thrashing` report from the evidence they have: each
 rests on a reading that was taken, so incomplete coverage elsewhere does not
-suppress them. `thrashing` grades the non-local memory that was read. Without a
-measured device total, some processes may have had no reading; the spill
-figures are then `null`, since they would understate the total, and `detail`
-names the amount that was observed.
+suppress them. `thrashing` rests on the paging window alone. Non-local memory
+is reported (`non_local_mb`, `explained_offload_mb`, `unexplained_spill_mb`) but
+decides no verdict. Without a measured device total, some processes may have had
+no reading; those figures are then `null`, since they would understate the
+total.
 
 `ok` is the one verdict that asserts a negative — that nothing is wrong — so it
-requires every input it depends on, including that same non-local coverage.
-Without it, spill was never observable and the state is `unknown` with the
-missing evidence named in `detail`, rather than `ok`. Missing process
-information is not evidence that nothing else is using the GPU.
+requires every input it depends on: Ollama residency (`models`) and paging
+(`paging`). Without them the state is `unknown` with the missing evidence named
+in `detail`, rather than `ok`. Missing process information is not evidence that
+nothing else is using the GPU.
 
 On Linux this is the normal case, not an edge one: no collector observes
-non-local memory there, so `vram_status()` reports `unknown` where it would
-otherwise report `ok` ([#27](https://github.com/sushiHex/vram-mcp/issues/27)).
+paging there, so `vram_status()` reports `unknown` where it would otherwise
+report `ok` ([#27](https://github.com/sushiHex/vram-mcp/issues/27)).
 Read `pressure.coverage` to see exactly which evidence was available.
 
 Keep the sample interval high enough that samples do not crowd action events
-out of the bounded log. Raising the spill floor can suppress noisy alerts;
-it does not create additional GPU capacity.
+out of the bounded log.
 
 ## Troubleshooting
 

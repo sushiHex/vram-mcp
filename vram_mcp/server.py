@@ -69,7 +69,6 @@ _AUDIT_ON = os.environ.get("VRAM_MCP_AUDIT", "1") != "0"
 _MEANINGFUL_MB = _numeric_env("VRAM_MCP_MEANINGFUL_MB", 512, whole=True)
 _EVENT_CAP = _numeric_env("VRAM_MCP_EVENT_CAP", 5000, whole=True)
 _SAMPLE_SECONDS = _numeric_env("VRAM_MCP_SAMPLE_SECONDS", 60)
-_SPILL_MB = _numeric_env("VRAM_MCP_SPILL_MB", core.SPILL_THRESHOLD_MB, whole=True)
 # trend() output lands in an agent's context window, so the raw rows are capped
 # even though the SUMMARY is always computed over every row in the window.
 _TREND_SAMPLE_CAP = 200
@@ -82,6 +81,9 @@ def _gpu_reading():
 
 # One per server: its counter query costs ~0.5 s to open and ~0.2 ms to read.
 _non_local = _wddm.NonLocalMemory(_GPU_INDEX) if sys.platform == "win32" else None
+# Samples driver paging once a second from startup, so a status call reads a
+# recent window instead of measuring one itself.
+_paging = _wddm.PagingMonitor(_GPU_INDEX) if sys.platform == "win32" else None
 
 
 def _procinfo_table():
@@ -245,7 +247,7 @@ def _full_status() -> dict:
         _gpu_reading, _ollama,
         snapshot_fn=_snapshot,
         procinfo_fn=_procinfo_table,
-        spill_threshold_mb=_SPILL_MB,
+        paging_fn=_paging.observe if _paging is not None else None,
     )
 
 
@@ -289,7 +291,7 @@ async def vram_status() -> dict:
     Includes device identity, source health/timestamps/coverage, claims, recent
     GPU activity, and pressure (ok|tight|degraded|thrashing|unknown). Unavailable
     residency is null; unavailable telemetry never establishes an empty or
-    healthy GPU. Non-local memory pressure is a best-effort paging heuristic.
+    healthy GPU. ``thrashing`` means the driver was measured paging VRAM.
     """
     return await _in_thread(_vram_status_impl)
 
@@ -297,7 +299,7 @@ async def vram_status() -> dict:
 def _list_loaded_impl() -> dict:
     status = core.combined_status(
         lambda: Observation(None, "gpu", error="Not collected", scope=f"gpu:index={_GPU_INDEX}"),
-        _ollama, snapshot_fn=_snapshot, spill_threshold_mb=_SPILL_MB,
+        _ollama, snapshot_fn=_snapshot,
     )
     _run_detection(status)
     loaded = status["loaded"]
@@ -765,8 +767,8 @@ def _trend_impl(hours: float) -> dict:
             f"{summary['count']} sample(s) over {hours}h: free VRAM is "
             f"{summary['direction']} (min {summary['min_free_mb']} MB, "
             f"max {summary['max_free_mb']} MB, now {now_text}); "
-            f"{summary['thrashing_samples']} sample(s) showed VRAM spilling "
-            "to system RAM."
+            f"{summary['thrashing_samples']} sample(s) showed the driver "
+            "paging VRAM."
         )
     # The summary above already covers EVERY row; only the raw rows are capped,
     # and the caller is told so rather than silently handed a subset.
@@ -799,6 +801,8 @@ async def trend(hours: float = 1.0) -> dict:
 
 def main() -> None:
     """Console entry point: run the MCP server over stdio."""
+    if _paging is not None:
+        _paging.start()
     mcp.run()
 
 

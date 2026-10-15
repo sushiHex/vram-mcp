@@ -17,7 +17,6 @@ from .observations import Observation
 
 _MB_PER_GB = 1024
 
-SPILL_THRESHOLD_MB = 256   # floor only; pressure() also compares against free VRAM
 TIGHT_MB = 1024
 
 # Coverage a healthy verdict depends on, with what its absence means. Ordered:
@@ -26,9 +25,12 @@ TIGHT_MB = 1024
 # `ok` relies on is a line here, not another branch.
 _OK_REQUIRES = {
     "models": "Ollama residency is unavailable",
-    "non_local_memory":
-        "Non-local memory is unavailable; driver spill cannot be ruled out",
+    "paging": "Driver paging is unavailable, so it cannot be ruled out",
 }
+
+# Native Linux keeps cudaMalloc memory on the GPU, but managed memory can
+# oversubscribe it, and no Linux interface reports its paging; see #27.
+_NO_PAGING_READER = "no collector reads driver paging on this platform"
 
 
 def observe_loaded(ollama) -> Observation[list[dict]]:
@@ -169,18 +171,21 @@ def runner_offloads(loaded: list[dict], snap: Snapshot) -> dict[int, int]:
 def pressure(gpus: list[dict], loaded: list[dict], process_table: list[dict],
              *, runner_offloads: Optional[dict] = None,
              non_local_total_mb: Optional[int] = None,
-             spill_threshold_mb: int = SPILL_THRESHOLD_MB,
+             paging: Optional[dict] = None,
              tight_mb: int = TIGHT_MB) -> dict:
     """Assess one selected GPU using the available capacity and residency data.
 
-    Non-local memory beyond known CPU offload, exceeding both the noise floor
-    and free VRAM, suggests paging. This is a heuristic, not proof of driver
-    activity. Missing capacity cannot produce a healthy verdict.
+    ``paging`` summarizes the driver's recent paging activity, where a
+    collector reads it (:meth:`.wddm.Paging.summary`); only sustained paging
+    reads as ``thrashing``. Non-local memory is reported but never graded: a
+    full desktop GPU holds hundreds of MB of it without paging, and memory
+    evicted to the backing store is not in it. Missing capacity cannot produce
+    a healthy verdict.
 
     ``non_local_total_mb`` is the device's measured non-local memory, where a
     collector reads one (WDDM does), and is reported as ``non_local_mb``. The
     rows then attribute it: whatever no runner's offload explains is
-    unexplained, whether a row saw it or not.
+    unexplained, whether a row saw it or not, and never more than the total.
     """
     free_mb = gpus[0].get("free_mb") if gpus else None
     entitlements = runner_offloads or {}
@@ -202,30 +207,22 @@ def pressure(gpus: list[dict], loaded: list[dict], process_table: list[dict],
     non_local_mb = explained_mb + unexplained_mb
     if non_local_total_mb is not None:
         # Rows can miss memory (an unseen process) or count it twice (shared
-        # allocations), so neither view alone bounds what is unexplained.
-        unexplained_mb = max(unexplained_mb, non_local_total_mb - explained_mb)
+        # allocations); the device total is the measurement they attribute.
+        explained_mb = min(explained_mb, non_local_total_mb)
+        unexplained_mb = non_local_total_mb - explained_mb
         non_local_mb = non_local_total_mb
-    # Non-local allocation alone does not establish memory pressure.
-    spilling = unexplained_mb >= spill_threshold_mb and (
-        free_mb is None or unexplained_mb > free_mb
-    )
     offloaded = [
         m["name"] for m in loaded
         if isinstance(m, dict) and m.get("offloaded_to_cpu") and m.get("name")
     ]
 
-    if spilling:
+    if paging is not None and paging.get("sustained"):
         state = "thrashing"
         detail = (
-            f"{unexplained_mb} MB of unexplained non-local memory under VRAM "
-            "pressure suggests paging. Free VRAM or reduce load."
+            "The driver is paging VRAM: its memory manager kept the GPU busy in "
+            f"{paging['active_seconds']} of the last {paging['seconds']} seconds "
+            f"(peak {paging['peak_percent']}% of an engine). Free VRAM or reduce load."
         )
-        # Say so, or the reader assumes the whole non-local figure is paging.
-        if explained_mb:
-            detail += (
-                f" (A further {explained_mb} MB of non-local memory is Ollama's "
-                "deliberate CPU offload, not paging.)"
-            )
     elif offloaded:
         state = "degraded"
         detail = (
@@ -250,7 +247,7 @@ def pressure(gpus: list[dict], loaded: list[dict], process_table: list[dict],
         "non_local_mb": non_local_mb,
         "explained_offload_mb": explained_mb,
         "unexplained_spill_mb": unexplained_mb,
-        "spilling": spilling,
+        "paging": paging,
         "offloaded_models": offloaded,
         "detail": detail,
     }
@@ -258,8 +255,7 @@ def pressure(gpus: list[dict], loaded: list[dict], process_table: list[dict],
 
 def combined_status(
     gpu_status_fn: Callable[[], list[dict]], ollama, *,
-    snapshot_fn=None, nvml_processes_fn=None, procinfo_fn=None,
-    spill_threshold_mb: int = SPILL_THRESHOLD_MB,
+    snapshot_fn=None, nvml_processes_fn=None, procinfo_fn=None, paging_fn=None,
 ) -> dict:
     """Collect a scoped status view with explicit observation health.
 
@@ -267,6 +263,9 @@ def combined_status(
     residency remains server-wide; only correlated selected-device runners
     contribute to the GPU pressure verdict. Each expensive source is read once.
     Unknown sources retain metadata and return null data, never fabricated zeros.
+    ``paging_fn`` reads the selected GPU's driver paging (an
+    ``Observation`` whose data has ``summary()``); without one, paging is
+    uncovered, and ``ok`` cannot be earned.
     """
     gpu_reading = gpu_status_fn()
     if not isinstance(gpu_reading, Observation):
@@ -335,11 +334,19 @@ def combined_status(
         selected_pids = {row["pid"] for row in full_table}
         pressure_models = [row for row in loaded if snap is not None
                            and snap.pid_for(row["name"]) in selected_pids]
+    if paging_fn is None:
+        paging_reading = Observation(None, "paging", error=_NO_PAGING_READER)
+    else:
+        paging_reading = paging_fn()
+        observations["paging"] = paging_reading.metadata()
+    paging = paging_reading.data.summary() if paging_reading.known else None
+    if paging is None:
+        gaps = {**gaps, "paging": paging_reading.error}
     non_local_total = totals.get("non_local_mb")
     result["pressure"] = pressure(gpus, pressure_models, full_table,
                                   runner_offloads=offloads,
                                   non_local_total_mb=non_local_total,
-                                  spill_threshold_mb=spill_threshold_mb)
+                                  paging=paging)
     # A measured device total covers rows without readings; without one, the
     # rows are the measurement and each must have been read.
     non_local_known = (source is not None and process_reading.known
@@ -350,15 +357,16 @@ def combined_status(
         "capacity": gpu_reading.known, "models": model_reading.known,
         "processes": source is not None and process_reading.known,
         "non_local_memory": non_local_known,
+        "paging": paging is not None,
     }
     if not non_local_known:
-        for key in ("non_local_mb", "explained_offload_mb", "unexplained_spill_mb", "spilling"):
+        for key in ("non_local_mb", "explained_offload_mb", "unexplained_spill_mb"):
             result["pressure"][key] = None
     # `ok` is the one verdict that asserts a NEGATIVE — that nothing is wrong —
     # so it is earned only when every input it depends on was actually read.
     # The other states rest on evidence they did observe (`tight` on capacity,
-    # `degraded` on residency, `thrashing` on the non-local figures it grades),
-    # so missing coverage never downgrades them; it would discard a fact.
+    # `degraded` on residency, `thrashing` on the paging it measured), so
+    # missing coverage never downgrades them; it would discard a fact.
     # `capacity` is absent from the table on purpose: pressure() already returns
     # "unknown" when free_mb is None, so a missing-capacity entry here could
     # never fire.

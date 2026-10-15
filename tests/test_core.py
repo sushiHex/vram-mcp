@@ -1,10 +1,28 @@
 """Tests for vram_mcp.core — pure orchestration with injected fakes."""
 
-from vram_mcp import core
+from vram_mcp import core, wddm
 from vram_mcp.observations import Observation
 
 
 _MB = 1024 * 1024
+
+# What a collector that reads driver paging reports: a quiet window, and one
+# where the System process kept an engine busy in most seconds.
+QUIET_PAGING = {"sustained": False, "active_seconds": 0, "seconds": 10,
+                "peak_percent": 0.4}
+SUSTAINED_PAGING = {"sustained": True, "active_seconds": 8, "seconds": 10,
+                    "peak_percent": 41.5}
+
+
+def paging_fn(*percents):
+    """A paging collector whose window holds ``percents`` (quiet by default)."""
+    window = wddm.Paging(tuple((1.0, p) for p in (percents or (0.0,) * 10)))
+    return lambda: Observation(window, "wddm:pdh", scope="gpu:index=0")
+
+
+def paging_gap(error):
+    """A paging collector that could not read the driver."""
+    return lambda: Observation(None, "wddm:pdh", error=error, scope="gpu:index=0")
 
 
 def gb_bytes(gb):
@@ -97,7 +115,9 @@ def test_other_device_process_reading_cannot_invent_local_spill():
     processes = Observation([{"pid": 10, "non_local_mb": 8000}], "nvml", scope="gpu:index=1")
     status = core.combined_status(lambda: gpu, FakeOllama(), procinfo_fn=lambda: processes)
     assert status["other_processes"] is None
-    assert status["pressure"]["spilling"] is None
+    assert status["pressure"]["non_local_mb"] is None
+    assert status["pressure"]["unexplained_spill_mb"] is None
+    assert status["pressure"]["state"] != "thrashing"
 
 
 def test_missing_model_memory_is_not_reported_as_zero():
@@ -209,7 +229,8 @@ GPUS_TIGHT = [{"index": 0, "total_mb": 24576, "used_mb": 24400, "free_mb": 176}]
 def test_pressure_ok():
     p = core.pressure(GPUS_OK, [], [])
     assert p["state"] == "ok"
-    assert p["spilling"] is False
+    assert p["paging"] is None
+    assert "spilling" not in p
     assert p["non_local_mb"] == 0
 
 
@@ -226,11 +247,40 @@ def test_pressure_degraded_on_cpu_offload():
 
 def test_pressure_thrashing_beats_degraded():
     loaded = [{"name": "qwen3:32b", "offloaded_to_cpu": True}]
-    procs = [{"pid": 1, "non_local_mb": 4096}]
-    p = core.pressure(GPUS_TIGHT, loaded, procs)
+    p = core.pressure(GPUS_OK, loaded, [], paging=SUSTAINED_PAGING)
     assert p["state"] == "thrashing"
-    assert p["spilling"] is True
-    assert p["non_local_mb"] == 4096
+    assert p["paging"] == SUSTAINED_PAGING
+    assert "8 of the last 10 seconds" in p["detail"]
+    assert "41.5%" in p["detail"]
+
+
+def test_pressure_thrashing_beats_tight():
+    p = core.pressure(GPUS_TIGHT, [], [], paging=SUSTAINED_PAGING)
+    assert p["state"] == "thrashing"
+
+
+def test_pressure_quiet_paging_does_not_hide_other_states():
+    assert core.pressure(GPUS_TIGHT, [], [], paging=QUIET_PAGING)["state"] == "tight"
+    loaded = [{"name": "qwen3:32b", "offloaded_to_cpu": True}]
+    assert core.pressure(GPUS_OK, loaded, [], paging=QUIET_PAGING)["state"] == "degraded"
+    p = core.pressure(GPUS_OK, [], [], paging=QUIET_PAGING)
+    assert p["state"] == "ok"
+    assert p["paging"] == QUIET_PAGING
+
+
+def test_pressure_sustained_paging_is_thrashing_with_or_without_non_local_memory():
+    """The verdict follows the driver's measured paging, not the non-local
+    figure: none of it, or 4 GiB of it, changes nothing."""
+    bare = core.pressure(GPUS_OK, [], [], paging=SUSTAINED_PAGING)
+    heavy = core.pressure(GPUS_OK, [], [{"pid": 1, "non_local_mb": 4096}],
+                          paging=SUSTAINED_PAGING)
+    assert bare["state"] == heavy["state"] == "thrashing"
+
+
+def test_pressure_sustained_paging_is_thrashing_when_free_vram_is_unreadable():
+    p = core.pressure([{"index": 0, "free_mb": None}], [], [], paging=SUSTAINED_PAGING)
+    assert p["free_mb"] is None
+    assert p["state"] == "thrashing"
 
 
 # The live shape this machine runs: a 32B model deliberately part-offloaded on
@@ -256,40 +306,40 @@ def test_pressure_runner_non_local_within_its_offload_is_not_paging():
     p = core.pressure(GPUS_TIGHT, [_offloaded_model()], procs,
                       runner_offloads={RUNNER_PID: QWEN_OFFLOAD_MB})
     assert p["state"] == "degraded"
-    assert p["spilling"] is False
+    assert p["paging"] is None
     assert p["explained_offload_mb"] == 3906
     assert p["unexplained_spill_mb"] == 0
     assert p["non_local_mb"] == 3906          # the total is still reported
     assert "not paging" in p["detail"]
 
 
-def test_pressure_runner_non_local_beyond_its_offload_is_real_spill():
-    """'My model is being paged because something else ballooned' — the case
-    neither the filtered nor the unfiltered table ever caught.
-
-    The GPU must be CONSTRAINED for this to be paging at all: spill is only
-    credible when the card lacked the room to keep it resident."""
+def test_pressure_runner_non_local_beyond_its_offload_is_reported_not_graded():
+    """Non-local memory is a quantity, not a symptom: a runner holding more than
+    its offload explains is reported as unexplained, but only measured paging
+    reads as thrashing."""
     procs = [{"pid": RUNNER_PID, "size_mb": 22371, "non_local_mb": 9000}]
     p = core.pressure(GPUS_TIGHT, [_offloaded_model()], procs,
                       runner_offloads={RUNNER_PID: QWEN_OFFLOAD_MB})
-    assert p["state"] == "thrashing"
-    assert p["spilling"] is True
+    assert p["state"] == "degraded"
     assert p["explained_offload_mb"] == QWEN_OFFLOAD_MB
     assert p["unexplained_spill_mb"] == 9000 - QWEN_OFFLOAD_MB
+    paged = core.pressure(GPUS_TIGHT, [_offloaded_model()], procs,
+                          runner_offloads={RUNNER_PID: QWEN_OFFLOAD_MB},
+                          paging=SUSTAINED_PAGING)
+    assert paged["state"] == "thrashing"
 
 
-def test_pressure_non_runner_non_local_is_real_spill():
-    """Nothing explains another process's non-local memory -> genuine paging,
-    even while a model is legitimately offloaded."""
+def test_pressure_non_runner_non_local_is_unexplained_not_thrashing():
+    """Nothing explains another process's non-local memory, so it is reported
+    as unexplained; without measured paging it does not make a verdict."""
     procs = [{"pid": RUNNER_PID, "size_mb": 22371, "non_local_mb": 3906},
              {"pid": 3220, "size_mb": 4000, "non_local_mb": 4096}]
     p = core.pressure(GPUS_TIGHT, [_offloaded_model()], procs,
                       runner_offloads={RUNNER_PID: QWEN_OFFLOAD_MB})
-    assert p["state"] == "thrashing"
+    assert p["state"] == "degraded"
     assert p["unexplained_spill_mb"] == 4096
     assert p["explained_offload_mb"] == 3906
     assert p["non_local_mb"] == 3906 + 4096
-    assert "4096 MB" in p["detail"]
 
 
 def test_pressure_sums_runner_excess_and_other_processes():
@@ -297,7 +347,7 @@ def test_pressure_sums_runner_excess_and_other_processes():
              {"pid": 3220, "size_mb": 4000, "non_local_mb": 4096}]
     p = core.pressure(GPUS_TIGHT, [_offloaded_model()], procs,
                       runner_offloads={RUNNER_PID: QWEN_OFFLOAD_MB})
-    assert p["state"] == "thrashing"
+    assert p["state"] == "degraded"
     assert p["unexplained_spill_mb"] == (9000 - QWEN_OFFLOAD_MB) + 4096
     assert p["explained_offload_mb"] == QWEN_OFFLOAD_MB
 
@@ -308,19 +358,19 @@ def test_pressure_unknown_runner_pids_attribute_nothing():
     procs = [{"pid": RUNNER_PID, "non_local_mb": 3906}]
     p = core.pressure(GPUS_TIGHT, [_offloaded_model()], procs)
     assert p["unexplained_spill_mb"] == 3906
-    assert p["state"] == "thrashing"
+    assert p["explained_offload_mb"] == 0
+    assert p["state"] == "degraded"
 
 
-# The driver only evicts when it runs out of room. Non-local memory while the
-# card has plenty free is routine allocation (staging buffers, shared surfaces),
-# not paging — and "free VRAM or reduce load" is nonsense advice with 2.6 GB free.
+# A full GPU that is not overcommitted already holds more desktop non-local
+# memory than it has free VRAM, so neither the amount nor its ratio to free VRAM
+# says anything about paging.
 GPUS_ROOMY = [{"index": 0, "total_mb": 24576, "used_mb": 21894, "free_mb": 2682}]
 
 
-def test_pressure_spill_below_free_vram_is_not_paging():
+def test_pressure_small_non_local_with_room_is_ok():
     """The live false alarm: 386 MB non-local spread across ordinary desktop
-    apps while 2682 MB is free read as 'the driver is paging'. It cannot be —
-    with that much free the driver had no reason to evict anything."""
+    apps while 2682 MB is free."""
     procs = [{"pid": 32220, "non_local_mb": 244},   # UnrealEditor
              {"pid": 19808, "non_local_mb": 82},    # a CUDA python job
              {"pid": 26344, "non_local_mb": 30},
@@ -328,36 +378,26 @@ def test_pressure_spill_below_free_vram_is_not_paging():
              {"pid": 29572, "non_local_mb": 10},
              {"pid": 1500, "non_local_mb": 8}]
     p = core.pressure(GPUS_ROOMY, [], procs)
-    assert p["unexplained_spill_mb"] == 386   # still reported, just not alarming
-    assert p["spilling"] is False
+    assert p["unexplained_spill_mb"] == 386   # still reported, just not graded
     assert p["state"] == "ok"
 
 
-def test_pressure_spill_exceeding_free_vram_is_paging():
-    """More has been pushed to system RAM than the card has free — the driver
-    would have kept it resident if there were room."""
+def test_pressure_large_non_local_without_paging_is_not_thrashing():
+    """More non-local memory than free VRAM used to read as paging. A full,
+    healthy desktop GPU does exactly that, so it is only `tight` (free < 1024)."""
     p = core.pressure(GPUS_TIGHT, [], [{"pid": 1, "non_local_mb": 3949}])
-    assert p["spilling"] is True
-    assert p["state"] == "thrashing"
+    assert p["unexplained_spill_mb"] == 3949
+    assert p["state"] == "tight"
+    quiet = core.pressure(GPUS_TIGHT, [], [{"pid": 1, "non_local_mb": 3949}],
+                          paging=QUIET_PAGING)
+    assert quiet["state"] == "tight"
 
 
-def test_pressure_spill_gate_needs_both_the_floor_and_the_free_comparison():
-    """A spill larger than free VRAM but below the absolute floor is still
-    noise: 200 MB of non-local memory is not a multi-x slowdown."""
-    p = core.pressure([{"index": 0, "free_mb": 100}], [],
-                      [{"pid": 1, "non_local_mb": 200}])
-    assert p["unexplained_spill_mb"] == 200
-    assert p["spilling"] is False
-
-
-def test_pressure_spill_alarms_when_free_vram_is_unreadable():
-    """No nvidia-smi -> no free figure to compare against. We cannot prove the
-    card had room, so a large unexplained spill still warrants the warning."""
+def test_pressure_large_non_local_with_free_vram_unreadable_is_unknown_not_thrashing():
     p = core.pressure([{"index": 0, "free_mb": None}], [],
                       [{"pid": 1, "non_local_mb": 4096}])
     assert p["free_mb"] is None
-    assert p["spilling"] is True
-    assert p["state"] == "thrashing"
+    assert p["state"] == "unknown"
 
 
 def test_runner_offloads_maps_pid_to_deliberate_offload():
@@ -389,16 +429,15 @@ def test_combined_status_live_offload_shape_is_degraded_not_thrashing():
     )
     p = status["pressure"]
     assert p["state"] == "degraded"
-    assert p["spilling"] is False
+    assert p["paging"] is None
     assert p["unexplained_spill_mb"] == 3
     assert p["explained_offload_mb"] == 3906
 
 
-def test_pressure_ignores_noise_below_threshold():
+def test_pressure_reports_small_non_local_without_grading_it():
     procs = [{"pid": 1, "non_local_mb": 10}, {"pid": 2, "non_local_mb": 20}]
     p = core.pressure(GPUS_OK, [], procs)
     assert p["non_local_mb"] == 30
-    assert p["spilling"] is False
     assert p["state"] == "ok"
 
 
@@ -413,16 +452,18 @@ def test_pressure_tolerates_none_values():
 def test_combined_status_includes_pressure():
     status = core.combined_status(
         lambda: GPUS_OK, FakeOllama([]), procinfo_fn=lambda: [],
+        paging_fn=paging_fn(),
     )
     assert status["pressure"]["state"] == "ok"
 
 
 # ---- `ok` is earned, not defaulted to ---------------------------------------
 #
-# Windows/WDDM is the live case: NVML cannot report per-process memory and the
-# GPU counters aggregate adapters, so non-local coverage is always false there
-# and driver spill can never be observed. A healthy verdict on that evidence
-# would be an assertion about something never measured.
+# `ok` asserts that nothing is wrong, so it needs the Ollama residency and the
+# driver's paging to have been read. Where no collector reads paging (anywhere
+# but Windows/WDDM) or it is not yet readable, a healthy verdict would be an
+# assertion about something never measured. Non-local memory is not required:
+# it is reported, never graded.
 
 def _blind_to_non_local(rows=()):
     """A process reading from a platform that cannot see non-local memory."""
@@ -430,21 +471,34 @@ def _blind_to_non_local(rows=()):
                                coverage={"non_local_memory": False})
 
 
-def test_ok_is_withheld_when_spill_could_not_be_ruled_out():
+def test_ok_is_withheld_when_paging_could_not_be_ruled_out():
     status = core.combined_status(
-        lambda: GPUS_OK, FakeOllama([]), procinfo_fn=_blind_to_non_local(),
+        lambda: GPUS_OK, FakeOllama([]), procinfo_fn=lambda: [],
     )
     pressure = status["pressure"]
     assert pressure["state"] == "unknown"
     assert pressure["detail"] == (
-        "Non-local memory is unavailable; driver spill cannot be ruled out.")
-    assert pressure["coverage"]["non_local_memory"] is False
-    # The figures stay null rather than reading as a measured zero.
-    assert pressure["unexplained_spill_mb"] is None
-    assert pressure["spilling"] is None
+        "Driver paging is unavailable, so it cannot be ruled out "
+        "(no collector reads driver paging on this platform).")
+    assert pressure["coverage"]["paging"] is False
+    assert pressure["paging"] is None
+    assert "paging" not in status["observations"]
 
 
-def test_missing_residency_is_reported_before_missing_spill_coverage():
+def test_ok_withheld_detail_carries_the_paging_reading_error():
+    status = core.combined_status(
+        lambda: GPUS_OK, FakeOllama([]), procinfo_fn=lambda: [],
+        paging_fn=paging_gap("paging history is still being collected (2 of 5 s)"),
+    )
+    assert status["pressure"]["state"] == "unknown"
+    assert status["pressure"]["detail"] == (
+        "Driver paging is unavailable, so it cannot be ruled out "
+        "(paging history is still being collected (2 of 5 s)).")
+    assert status["pressure"]["coverage"]["paging"] is False
+    assert status["observations"]["paging"]["status"] == "unavailable"
+
+
+def test_missing_residency_is_reported_before_missing_paging_coverage():
     """Both requirements unmet: the reason names the nearer one rather than
     whichever branch happens to run first."""
     class _Blind:
@@ -452,22 +506,22 @@ def test_missing_residency_is_reported_before_missing_spill_coverage():
             return Observation(None, "ollama:/api/ps", error="transport down")
 
     status = core.combined_status(
-        lambda: GPUS_OK, _Blind(), procinfo_fn=_blind_to_non_local(),
+        lambda: GPUS_OK, _Blind(), procinfo_fn=lambda: [],
     )
     assert status["pressure"]["state"] == "unknown"
     assert status["pressure"]["detail"] == "Ollama residency is unavailable."
 
 
-def test_missing_spill_coverage_does_not_suppress_tight():
+def test_missing_paging_coverage_does_not_suppress_tight():
     """`tight` rests on a capacity reading it did observe. Downgrading it would
     discard a fact, not withhold a guess."""
     status = core.combined_status(
-        lambda: GPUS_TIGHT, FakeOllama([]), procinfo_fn=_blind_to_non_local(),
+        lambda: GPUS_TIGHT, FakeOllama([]), procinfo_fn=lambda: [],
     )
     assert status["pressure"]["state"] == "tight"
 
 
-def test_missing_spill_coverage_does_not_suppress_degraded():
+def test_missing_paging_coverage_does_not_suppress_degraded():
     models = [{"name": "m1", "size": gb_bytes(20), "size_vram": gb_bytes(16),
                "expires_at": None}]
     status = core.combined_status(
@@ -480,37 +534,32 @@ def test_missing_spill_coverage_does_not_suppress_degraded():
 
 
 def test_ok_survives_when_every_requirement_is_covered():
-    """The downgrade must not fire on a platform that CAN see non-local
-    memory and reports none — that is a measurement, not an absence."""
+    """The downgrade must not fire on a platform that CAN see paging and
+    reports none — that is a measurement, not an absence."""
     status = core.combined_status(
         lambda: GPUS_OK, FakeOllama([]),
         procinfo_fn=lambda: Observation(
             [{"pid": 999, "size_mb": 100, "non_local_mb": 0}], "procs",
             coverage={"non_local_memory": True}),
+        paging_fn=paging_fn(),
     )
     assert status["pressure"]["state"] == "ok"
-    assert status["pressure"]["coverage"]["non_local_memory"] is True
+    assert status["pressure"]["coverage"]["paging"] is True
+    assert status["pressure"]["paging"]["sustained"] is False
+    assert status["observations"]["paging"]["status"] == "available"
 
 
-def test_ok_withheld_detail_carries_the_process_gap():
-    status = core.combined_status(
-        lambda: GPUS_OK, FakeOllama([]),
-        procinfo_fn=lambda: Observation(
-            [], "procs", coverage={"non_local_memory": False},
-            gaps={"non_local_memory": "no non-local reading for PID(s) 5, 9"}),
-    )
-    assert status["pressure"]["state"] == "unknown"
-    assert status["pressure"]["detail"] == (
-        "Non-local memory is unavailable; driver spill cannot be ruled out "
-        "(no non-local reading for PID(s) 5, 9).")
-
-
-def test_ok_withheld_detail_without_gap_has_no_parentheses():
+def test_ok_does_not_need_non_local_coverage_when_paging_is_read():
     status = core.combined_status(
         lambda: GPUS_OK, FakeOllama([]), procinfo_fn=_blind_to_non_local(),
+        paging_fn=paging_fn(),
     )
-    assert status["pressure"]["detail"] == (
-        "Non-local memory is unavailable; driver spill cannot be ruled out.")
+    pressure = status["pressure"]
+    assert pressure["state"] == "ok"
+    assert pressure["coverage"]["non_local_memory"] is False
+    # The figures stay null rather than reading as a measured zero.
+    assert pressure["unexplained_spill_mb"] is None
+    assert pressure["non_local_mb"] is None
 
 
 def test_ok_with_full_coverage_and_integer_non_local_readings():
@@ -520,32 +569,62 @@ def test_ok_with_full_coverage_and_integer_non_local_readings():
             [{"pid": 100, "size_mb": None, "non_local_mb": 40, "kind": "compute"},
              {"pid": 900, "size_mb": None, "non_local_mb": 0, "kind": "wddm"}],
             "procs", coverage={"non_local_memory": True}),
+        paging_fn=paging_fn(),
     )
     assert status["pressure"]["state"] == "ok"
 
 
-def test_thrashing_from_unexplained_wddm_row_exceeding_free_vram():
+def test_sustained_paging_reads_thrashing_through_combined_status():
+    status = core.combined_status(
+        lambda: GPUS_OK, FakeOllama([]), procinfo_fn=lambda: [],
+        paging_fn=paging_fn(*[20.0] * 8, 0.0, 0.0),
+    )
+    pressure = status["pressure"]
+    assert pressure["state"] == "thrashing"
+    assert pressure["paging"] == {"sustained": True, "active_seconds": 8,
+                                  "seconds": 10, "peak_percent": 20.0}
+    assert pressure["coverage"]["paging"] is True
+
+
+def test_sustained_paging_is_thrashing_even_without_other_coverage():
+    """`thrashing` rests on the paging it measured; missing residency does not
+    downgrade it."""
+    class _Blind:
+        def observe_loaded(self):
+            return Observation(None, "ollama:/api/ps", error="transport down")
+
+    status = core.combined_status(
+        lambda: GPUS_OK, _Blind(), procinfo_fn=_blind_to_non_local(),
+        paging_fn=paging_fn(*[20.0] * 10),
+    )
+    assert status["pressure"]["state"] == "thrashing"
+
+
+def test_unexplained_wddm_row_exceeding_free_vram_is_not_thrashing():
+    """The false positive this verdict used to give: a full GPU already holds
+    more non-local memory than it has free, with no paging."""
     status = core.combined_status(
         lambda: GPUS_TIGHT, FakeOllama([]),
         procinfo_fn=lambda: Observation(
             [{"pid": 900, "size_mb": None, "non_local_mb": 2048, "kind": "wddm"}],
             "procs", coverage={"non_local_memory": True}),
+        paging_fn=paging_fn(),
     )
     pressure = status["pressure"]
-    assert pressure["state"] == "thrashing"
+    assert pressure["state"] == "tight"
     assert pressure["unexplained_spill_mb"] == 2048
-    assert pressure["spilling"] is True
+    assert "spilling" not in pressure
 
 
-def test_wddm_row_below_free_vram_is_not_thrashing():
+def test_wddm_row_below_free_vram_is_ok_without_paging():
     status = core.combined_status(
         lambda: GPUS_OK, FakeOllama([]),
         procinfo_fn=lambda: Observation(
             [{"pid": 900, "size_mb": None, "non_local_mb": 2048, "kind": "wddm"}],
             "procs", coverage={"non_local_memory": True}),
+        paging_fn=paging_fn(),
     )
     assert status["pressure"]["state"] == "ok"
-    assert status["pressure"]["spilling"] is False
 
 
 # ---- a measured adapter total: rows only attribute it ------------------------
@@ -556,18 +635,18 @@ def _with_total(rows, total_mb, *, coverage=None):
         totals={"non_local_mb": total_mb})
 
 
-def test_memory_no_row_accounts_for_is_unexplained_spill():
+def test_memory_no_row_accounts_for_is_unexplained_but_not_thrashing():
     status = core.combined_status(
         gpu_fn_const(1000), FakeOllama([]),
         procinfo_fn=_with_total(
             [{"pid": 900, "size_mb": None, "non_local_mb": 10, "kind": "wddm"}],
             2048),
+        paging_fn=paging_fn(),
     )
     p = status["pressure"]
     assert p["unexplained_spill_mb"] == 2048      # the total, not the 10 MB rows
     assert p["non_local_mb"] == 2048
-    assert p["spilling"] is True
-    assert p["state"] == "thrashing"
+    assert p["state"] == "tight"                  # free < 1024, no paging
 
 
 def test_hidden_memory_with_room_to_spare_is_ok_and_covered():
@@ -576,11 +655,11 @@ def test_hidden_memory_with_room_to_spare_is_ok_and_covered():
         procinfo_fn=_with_total(
             [{"pid": 900, "size_mb": None, "non_local_mb": 10, "kind": "wddm"}],
             2048),
+        paging_fn=paging_fn(),
     )
     p = status["pressure"]
     assert p["state"] == "ok"
-    assert p["spilling"] is False
-    assert p["unexplained_spill_mb"] == 2048       # reported, just not alarming
+    assert p["unexplained_spill_mb"] == 2048       # reported, just not graded
     assert p["coverage"]["non_local_memory"] is True
 
 
@@ -590,20 +669,27 @@ def test_row_without_reading_is_covered_when_the_adapter_total_is_known():
         procinfo_fn=_with_total(
             [{"pid": 900, "size_mb": None, "non_local_mb": None, "kind": "wddm"}],
             0),
+        paging_fn=paging_fn(),
     )
     assert status["pressure"]["coverage"]["non_local_memory"] is True
     assert status["pressure"]["state"] == "ok"
 
 
-def test_row_without_reading_and_no_total_is_still_unknown():
+def test_row_without_reading_and_no_total_leaves_non_local_figures_null():
+    """Without a measured total, a row with no reading leaves the figures
+    unknown. `ok` no longer depends on them, only on paging."""
     status = core.combined_status(
         gpu_fn_const(20000), FakeOllama([]),
         procinfo_fn=lambda: Observation(
             [{"pid": 900, "size_mb": None, "non_local_mb": None, "kind": "wddm"}],
             "procs", coverage={"non_local_memory": True}),
+        paging_fn=paging_fn(),
     )
-    assert status["pressure"]["coverage"]["non_local_memory"] is False
-    assert status["pressure"]["state"] == "unknown"
+    p = status["pressure"]
+    assert p["coverage"]["non_local_memory"] is False
+    assert p["non_local_mb"] is None
+    assert p["unexplained_spill_mb"] is None
+    assert p["state"] == "ok"
 
 
 def test_runner_offload_is_still_explained_under_a_total():
@@ -614,13 +700,13 @@ def test_runner_offload_is_still_explained_under_a_total():
         procinfo_fn=_with_total(
             [{"pid": 999, "size_mb": 10000, "non_local_mb": 3000,
               "kind": "compute"}], 3010),
+        paging_fn=paging_fn(),
     )
     p = status["pressure"]
     assert p["explained_offload_mb"] == 3000
     assert p["unexplained_spill_mb"] == 10
     assert p["non_local_mb"] == 3010
-    assert p["spilling"] is False
-    assert p["state"] != "thrashing"
+    assert p["state"] == "degraded"
 
 
 def test_pressure_total_below_explained_never_goes_negative():
@@ -629,22 +715,35 @@ def test_pressure_total_below_explained_never_goes_negative():
     p = core.pressure(GPUS_TIGHT, [_offloaded_model()], procs,
                       runner_offloads={RUNNER_PID: QWEN_OFFLOAD_MB},
                       non_local_total_mb=1000)
-    assert p["explained_offload_mb"] == 3906
+    assert p["explained_offload_mb"] == 1000      # clamped to the measurement
     assert p["unexplained_spill_mb"] == 0
-    assert p["non_local_mb"] == 1000      # the measurement, not the attribution
-    assert p["spilling"] is False
+    assert p["non_local_mb"] == 1000
 
 
-def test_double_counted_runner_memory_cannot_hide_another_process_spill():
-    """Two runners each report one shared 2 GiB allocation; a third process has
-    1 GiB of spill. The adapter measures 3 GiB, but the rows still see the spill."""
+def test_double_counted_rows_cannot_push_unexplained_above_the_total():
+    """Two processes each report one shared 2 GiB allocation, and a third
+    process another 2 GiB, while the adapter measures 3 GiB. The rows add up to
+    6 GiB, but what is unexplained cannot exceed the 3 GiB the adapter holds."""
+    procs = [{"pid": 1, "non_local_mb": 2048}, {"pid": 2, "non_local_mb": 2048},
+             {"pid": 3, "non_local_mb": 2048}]
+    p = core.pressure([{"free_mb": 512}], [], procs,
+                      runner_offloads={1: 1024}, non_local_total_mb=3072)
+    assert p["non_local_mb"] == 3072
+    assert p["unexplained_spill_mb"] <= p["non_local_mb"]
+    assert p["explained_offload_mb"] == 1024
+    assert p["unexplained_spill_mb"] == 3072 - 1024
+    assert p["explained_offload_mb"] + p["unexplained_spill_mb"] == 3072
+
+
+def test_explained_and_unexplained_always_add_up_to_a_measured_total():
     procs = [{"pid": 1, "non_local_mb": 2048}, {"pid": 2, "non_local_mb": 2048},
              {"pid": 3, "non_local_mb": 1024}]
-    p = core.pressure([{"free_mb": 512}], [], procs,
-                      runner_offloads={1: 2048, 2: 2048}, non_local_total_mb=3072)
-    assert p["unexplained_spill_mb"] == 1024
-    assert p["non_local_mb"] == 3072
-    assert p["state"] == "thrashing"
+    for total in (0, 500, 3072, 5120, 9000):
+        p = core.pressure([{"free_mb": 512}], [], procs,
+                          runner_offloads={1: 2048, 2: 2048}, non_local_total_mb=total)
+        assert p["non_local_mb"] == total
+        assert 0 <= p["unexplained_spill_mb"] <= total
+        assert p["explained_offload_mb"] + p["unexplained_spill_mb"] == total
 
 
 # ---- combined_status full wiring -------------------------------------------------
@@ -689,13 +788,10 @@ def test_combined_status_other_processes_from_procinfo():
 
 def test_pressure_sees_ollama_runner_spill():
     """The runner is filtered out of other_processes but MUST still count
-    toward spill: it is the biggest holder and the thing that actually spills.
+    toward the non-local figures: it is the biggest holder.
 
     The model here is DELIBERATELY OFFLOADED (4 GB of a 20 GB model on the CPU)
-    and its runner holds 8 GB non-local — double what that placement explains.
-    An earlier version of this test used size == size_vram, the one shape where
-    'any runner non-local means thrashing' happens to be right, so it could not
-    see the offloaded case regressing."""
+    and its runner holds 8 GB non-local — double what that placement explains."""
     calls = []
 
     def source():
@@ -712,32 +808,38 @@ def test_pressure_sees_ollama_runner_spill():
     p = status["pressure"]
     assert p["non_local_mb"] == 8192
     assert p["explained_offload_mb"] == 4096      # the deliberate placement
-    assert p["unexplained_spill_mb"] == 4096      # the excess: real paging
-    assert p["state"] == "thrashing"
+    assert p["unexplained_spill_mb"] == 4096      # the excess, reported
+    assert p["state"] == "degraded"               # the model is part-offloaded
     # the runner is still excluded from the "other processes" view
     assert [p["pid"] for p in status["other_processes"]] == [111]
     # and the expensive source was sampled exactly once
     assert len(calls) == 1
 
 
-def test_combined_status_forwards_spill_threshold():
-    """A caller-supplied spill threshold must reach pressure(); the same
-    non-local MB is a verdict either way depending on the knob.
+def test_combined_status_reads_paging_once_and_forwards_its_summary():
+    calls = []
 
-    Constrained GPU: the threshold is only the floor half of the gate, so the
-    free-VRAM comparison has to pass before the knob decides anything."""
-    procs = [{"pid": 7, "size_mb": 900, "non_local_mb": 300}]
-    loud = core.combined_status(
-        lambda: GPUS_TIGHT, FakeOllama([]), procinfo_fn=lambda: list(procs),
-        spill_threshold_mb=4096,
+    def reading():
+        calls.append(1)
+        return paging_fn(*[10.0] * 10)()
+
+    status = core.combined_status(
+        lambda: GPUS_OK, FakeOllama([]), procinfo_fn=lambda: [], paging_fn=reading,
     )
-    assert loud["pressure"]["spilling"] is False
-    quiet = core.combined_status(
-        lambda: GPUS_TIGHT, FakeOllama([]), procinfo_fn=lambda: list(procs),
-        spill_threshold_mb=128,
-    )
-    assert quiet["pressure"]["spilling"] is True
-    assert quiet["pressure"]["state"] == "thrashing"
+    assert len(calls) == 1
+    assert status["pressure"]["paging"] == {
+        "sustained": True, "active_seconds": 10, "seconds": 10, "peak_percent": 10.0}
+    assert status["observations"]["paging"]["source"] == "wddm:pdh"
+
+
+def test_combined_status_has_no_spill_threshold_parameter():
+    """The non-local threshold was retired with the verdict it gated."""
+    assert not hasattr(core, "SPILL_THRESHOLD_MB")
+    try:
+        core.combined_status(lambda: GPUS_OK, FakeOllama([]), spill_threshold_mb=128)
+    except TypeError:
+        return
+    raise AssertionError("spill_threshold_mb must no longer be accepted")
 
 
 def test_combined_status_reads_only_the_ledger_when_nothing_is_loaded():
