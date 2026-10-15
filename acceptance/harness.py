@@ -335,6 +335,14 @@ class Holder:
         return [(at - line["seconds"], at) for at, line in self.lines
                 if "gbps" in line and line["gbps"] < below_gbps]
 
+    async def finish_pass(self, after: float, timeout: float) -> None:
+        """Wait for a pass that ends after ``after``: a slow pass crossing it
+        reports only when it ends, and stopping first would lose it."""
+        deadline = time.monotonic() + timeout
+        while (self.process.returncode is None and time.monotonic() < deadline
+               and not any(at > after for at, line in self.lines if "gbps" in line)):
+            await asyncio.sleep(0.1)
+
     async def stop(self) -> None:
         if self.process.returncode is None:
             self.process.kill()
@@ -409,6 +417,8 @@ async def overcommit_reads_as_thrashing(run: Run, tools: Tools) -> None:
         await asyncio.sleep(HOLD_SECONDS / 2)
         read_at = time.monotonic()
         during = await tools("vram_status")
+        for holder in holders:
+            await holder.finish_pass(read_at, timeout=PAGING_WINDOW_SECONDS)
     finally:
         for holder in holders:
             await holder.stop()

@@ -101,7 +101,7 @@ class _StubPaging:
     """A paging monitor whose window is quiet (non-sustained)."""
 
     def observe(self):
-        return Observation(wddm.Paging((0.0,) * 10), "wddm:pdh", scope="gpu:index=0")
+        return Observation(wddm.Paging(((1.0, 0.0),) * 10), "wddm:pdh", scope="gpu:index=0")
 
 
 def _capture_combined_status(monkeypatch):

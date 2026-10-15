@@ -156,10 +156,11 @@ while VRAM was overcommitted. It was 0% when VRAM was idle or merely full.
 Loading a model or filling VRAM made a burst of 2-4 seconds. Ollama generation
 stayed under 4%.
 
-A sampler thread, started with the server, reads those ticks once a second and
-keeps the last 10 intervals. `thrashing` means at least 5 of them reach 5% of
-an engine: longer than the bursts loading causes. A status call waits until 5
-intervals exist, at most about 7 seconds, after startup or a gap.
+A sampler thread, started with the server, reads those ticks once a second. A
+status call judges the last 10 seconds by the clock: `thrashing` means the
+engine time was at 5% of an engine or more for at least 5 of them, longer than
+the bursts loading causes. A call waits until the window covers 5 seconds, at
+most about 8, after startup or a gap.
 
 This is a measured correlation, not a WDDM contract. The driver chooses which
 engine does the paging, and page-table updates and fills also run as the System
@@ -167,13 +168,13 @@ process, so another workload could in principle keep that process busy without
 paging VRAM. The thresholds come from one machine.
 
 The `--overcommit` scenarios check this on real hardware. On the validated host,
-a full but not overcommitted GPU read `tight` at 124 MB free. Overcommitted by
-6 GB, the holders spent 13-16 s of each 10 s window in passes at 1.3-1.4 GB/s
-against 620-775 GB/s solo, and it read `thrashing` with all 10 seconds active,
-in three runs out of three. Afterwards it read `ok`. A 3 GB overcommit paged
-steadily in some runs; in another, WDDM absorbed it once by evicting idle
-desktop memory, nothing paged afterwards, and `pressure` correctly read
-`tight`.
+a full but not overcommitted GPU read `tight` at 73-165 MB free. Overcommitted
+by 6 GB, a holder was in a pass at about 1 GB/s, against 420-775 GB/s solo, for
+nearly all of the 10 s before each reading, and `pressure` read `thrashing` with
+8-10 of the last 10 seconds active, in every one of seven runs. Afterwards it
+read `ok`. A 3 GB overcommit paged steadily in some runs; in another, WDDM
+absorbed it once by evicting idle desktop memory, nothing paged afterwards, and
+`pressure` correctly read `tight`.
 
 ### Non-local memory
 

@@ -4,6 +4,7 @@
 imports ``mcp`` and ``requests`` and runs nothing unless executed as a script.
 """
 
+import asyncio
 import importlib.util
 import sys
 from pathlib import Path
@@ -64,3 +65,61 @@ def test_spans_after_the_window_cover_nothing(harness):
 def test_the_holder_can_still_be_stopped(harness):
     """`stop` is a method of Holder, not of whatever follows it in the file."""
     assert hasattr(harness.Holder, "stop")
+
+
+class _Process:
+    def __init__(self, returncode=None):
+        self.returncode = returncode
+
+
+def _holder(harness, *lines, returncode=None):
+    """A Holder with printed ``lines`` and no subprocess or reader task."""
+    holder = harness.Holder.__new__(harness.Holder)
+    holder.process = _Process(returncode)
+    holder.lines = list(lines)
+    return holder
+
+
+def _finish(harness, holder, after, timeout, monkeypatch):
+    """Run finish_pass, counting its polls; a poll replaces the real sleep."""
+    polls = []
+
+    async def poll(seconds):
+        polls.append(seconds)
+        if on_poll:
+            holder.lines.append(on_poll.pop(0))
+
+    on_poll = getattr(holder, "_on_poll", [])
+    monkeypatch.setattr(harness.asyncio, "sleep", poll)
+    asyncio.run(holder.finish_pass(after, timeout))
+    return polls
+
+
+def test_finish_pass_returns_at_once_when_a_pass_ended_after_the_mark(harness, monkeypatch):
+    holder = _holder(harness, (50.0, {"gbps": 3.0, "seconds": 2.0}))
+    assert _finish(harness, holder, 40.0, 30.0, monkeypatch) == []
+
+
+def test_finish_pass_returns_for_an_exited_process_that_printed_no_pass(harness, monkeypatch):
+    holder = _holder(harness, (50.0, {"allocated_mb": 1024}), returncode=0)
+    # Not a pass, but the process has exited, so there is nothing to wait for.
+    assert _finish(harness, holder, 40.0, 30.0, monkeypatch) == []
+
+
+def test_finish_pass_returns_once_the_process_has_exited(harness, monkeypatch):
+    holder = _holder(harness, (10.0, {"gbps": 3.0, "seconds": 2.0}), returncode=0)
+    assert _finish(harness, holder, 40.0, 30.0, monkeypatch) == []
+
+
+def test_finish_pass_gives_up_when_the_timeout_has_passed(harness, monkeypatch):
+    holder = _holder(harness, (10.0, {"gbps": 3.0, "seconds": 2.0}))
+    assert _finish(harness, holder, 40.0, 0.0, monkeypatch) == []
+
+
+def test_finish_pass_polls_until_a_pass_ends_after_the_mark(harness, monkeypatch):
+    holder = _holder(harness, (10.0, {"gbps": 3.0, "seconds": 2.0}))   # ended before it
+    holder._on_poll = [(20.0, {"gbps": 3.0, "seconds": 2.0}),          # still before
+                       (harness.time.monotonic() + 1000, {"gbps": 0.2, "seconds": 9.0})]
+    polls = _finish(harness, holder, 40.0, 30.0, monkeypatch)
+    assert polls == [0.1, 0.1]
+    assert len(holder.lines) == 3

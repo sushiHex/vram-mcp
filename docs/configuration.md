@@ -116,8 +116,10 @@ query may be unavailable while the other's rows remain useful.
 Paging has its own observation, `observations.paging`, and its own coverage
 flag, `pressure.coverage.paging`. On Windows a sampler thread starts with the
 server and reads the System process's engine time on the selected adapter once a
-second, keeping the last 10 readings. A status call waits until 5 readings
-exist, at most about 7 seconds: once after startup, and again after a gap. A
+second, and a status call judges the last 10 seconds of them by the clock, so
+old activity ages out even if sampling stops. A status call waits until the
+window covers 5 seconds, at most about 8: once after startup, and again after a
+gap. A
 failed reading, or an interval longer than three seconds (a sleeping machine, a
 stalled collector), starts a new window, so two windows never join. If the
 sampler cannot find the adapter, cannot read every one of its engine counters,

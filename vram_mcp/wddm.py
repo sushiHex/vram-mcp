@@ -63,10 +63,10 @@ _TICKS_PER_SECOND = 10_000_000
 _LINKED_ADAPTER = ("the GPU belongs to a linked adapter, whose physical GPUs "
                    "these counters cannot tell apart")
 
-PAGING_PERCENT = 5.0      # of one engine, in one interval
-PAGING_WINDOW = 10        # intervals kept
-PAGING_SECONDS = 5        # active intervals that make paging sustained; also
-                          # the history a window needs before it is judged
+PAGING_PERCENT = 5.0          # of one engine, over an interval
+PAGING_WINDOW_SECONDS = 10.0  # how far back a read looks
+PAGING_SECONDS = 5.0          # active seconds that make paging sustained; also
+                              # the history a window needs before it is judged
 
 
 def parse_bus_id(bus_id: str) -> tuple[int, Address]:
@@ -132,32 +132,38 @@ def non_local(counters: dict[str, list[Sample]], luid: int) -> NonLocal:
 
 @dataclass(frozen=True)
 class Paging:
-    """How busy the System process kept the adapter's engines, per interval.
+    """How busy the System process kept the adapter's engines over the window.
 
     WDDM's video memory manager pages allocations in and out as the System
     process (PID 4). Measured on an RTX 3090 (#34), overcommitted VRAM kept it
     at 5-54% of an engine in nearly every second, while loading a model or
     filling VRAM without overcommitting it made a burst of two to four
     seconds, and generation stayed under 4%. Paging is therefore *sustained*
-    when :data:`PAGING_SECONDS` intervals of the window reach
-    :data:`PAGING_PERCENT`, however many the window holds. This is a measured
-    correlation, not a WDDM contract: the paging engine is chosen by the
-    driver, and page-table updates and fills run there too.
+    when the engines were at :data:`PAGING_PERCENT` or more for
+    :data:`PAGING_SECONDS` of the last :data:`PAGING_WINDOW_SECONDS`. This is
+    a measured correlation, not a WDDM contract: the paging engine is chosen
+    by the driver, and page-table updates and fills run there too.
     """
-    percents: tuple[float, ...]
+    intervals: tuple[tuple[float, float], ...]   # (seconds, percent), oldest first
 
     @property
-    def active(self) -> int:
-        return sum(percent >= PAGING_PERCENT for percent in self.percents)
+    def seconds(self) -> float:
+        return sum(seconds for seconds, _ in self.intervals)
+
+    @property
+    def active_seconds(self) -> float:
+        return sum(seconds for seconds, percent in self.intervals
+                   if percent >= PAGING_PERCENT)
 
     @property
     def sustained(self) -> bool:
-        return self.active >= PAGING_SECONDS
+        return self.active_seconds >= PAGING_SECONDS
 
     def summary(self) -> dict:
-        return {"sustained": self.sustained, "active_seconds": self.active,
-                "seconds": len(self.percents),
-                "peak_percent": round(max(self.percents, default=0.0), 1)}
+        return {"sustained": self.sustained,
+                "active_seconds": round(self.active_seconds, 1),
+                "seconds": round(self.seconds, 1),
+                "peak_percent": round(max((p for _, p in self.intervals), default=0.0), 1)}
 
 
 class PagingMonitor:
@@ -165,11 +171,12 @@ class PagingMonitor:
     a second, in a daemon thread. One per server.
 
     A status call cannot measure activity by itself: paging comes in bursts,
-    and a window as long as the gap between calls averages it away. The
-    thread keeps the last :data:`PAGING_WINDOW` intervals; a read waits until
-    :data:`PAGING_SECONDS` exist, which happens after startup and after a gap.
-    A gap is any reading that failed, or one interval longer than three: a
-    sleeping machine, or a stalled collector, must not join two windows.
+    and a window as long as the gap between calls averages it away. A read
+    judges the intervals in the last :data:`PAGING_WINDOW_SECONDS` before it,
+    by the clock, so evidence ages out even if sampling stops; it waits until
+    they cover :data:`PAGING_SECONDS`, which happens after startup and after
+    a gap. A gap is any reading that failed, or an interval longer than three:
+    a sleeping machine, or a stalled collector, must not join two windows.
     """
 
     source = "wddm:pdh"
@@ -187,7 +194,7 @@ class PagingMonitor:
         self._clock = clock
         self._interval = interval
         self._changed = threading.Condition()
-        self._percents: deque[float] = deque(maxlen=PAGING_WINDOW)
+        self._intervals: deque[tuple[float, float, float]] = deque()  # end, seconds, %
         self._previous: Optional[tuple[float, dict[str, int]]] = None
         self._bus_id: Optional[str] = None
         self._error: Optional[str] = None
@@ -224,35 +231,45 @@ class PagingMonitor:
             self._error = error
             previous, self._previous = self._previous, (now, ticks) if ticks else None
             if ticks is None or previous is None or now - previous[0] > 3 * self._interval:
-                self._percents.clear()      # a gap must not join two windows
+                self._intervals.clear()     # a gap must not join two windows
             else:
                 then, before = previous
                 # Engines that appear, vanish, or restart count from now on.
                 busy = sum(value - before[key] for key, value in ticks.items()
                            if before.get(key, value + 1) <= value)
-                self._percents.append(100 * busy / _TICKS_PER_SECOND / (now - then))
+                self._intervals.append(
+                    (now, now - then, 100 * busy / _TICKS_PER_SECOND / (now - then)))
+                while self._intervals[0][0] <= now - PAGING_WINDOW_SECONDS:
+                    self._intervals.popleft()
             self._changed.notify_all()
+
+    def _window(self) -> Paging:
+        """The intervals inside the window ending now, clipped to it."""
+        start = self._clock() - PAGING_WINDOW_SECONDS
+        return Paging(tuple((min(seconds, end - start), percent)
+                            for end, seconds, percent in self._intervals if end > start))
 
     def observe(self) -> Observation[Paging]:
         """The recent window. A sampler just started is waited for, briefly."""
         scope = f"gpu:index={self.index}"
-        deadline = time.monotonic() + (PAGING_SECONDS + 2) * self._interval
+        deadline = time.monotonic() + PAGING_SECONDS + 3 * self._interval
         with self._changed:
             while (self._thread is not None and self._error is None
-                   and len(self._percents) < PAGING_SECONDS
+                   and self._window().seconds < PAGING_SECONDS
                    and time.monotonic() < deadline):
                 self._changed.wait(self._interval)
+            window = self._window()
             if self._sampled_at is None:
                 error = "the paging sampler is not running"
             elif self._error is not None:
                 error = self._error
-            elif self._clock() - self._sampled_at > 5 * self._interval:
+            elif self._clock() - self._sampled_at > 3 * self._interval:
                 error = "the paging sampler stopped"
-            elif len(self._percents) < PAGING_SECONDS:
+            elif window.seconds < PAGING_SECONDS:
                 error = (f"paging history is still being collected "
-                         f"({len(self._percents)} of {PAGING_SECONDS} s)")
+                         f"({window.seconds:.0f} of {PAGING_SECONDS:.0f} s)")
             else:
-                return Observation(Paging(tuple(self._percents)), self.source, scope=scope)
+                return Observation(window, self.source, scope=scope)
         return Observation(None, self.source, error=error, scope=scope)
 
 

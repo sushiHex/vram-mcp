@@ -16,7 +16,7 @@ SUSTAINED_PAGING = {"sustained": True, "active_seconds": 8, "seconds": 10,
 
 def paging_fn(*percents):
     """A paging collector whose window holds ``percents`` (quiet by default)."""
-    window = wddm.Paging(tuple(percents) or (0.0,) * 10)
+    window = wddm.Paging(tuple((1.0, p) for p in (percents or (0.0,) * 10)))
     return lambda: Observation(window, "wddm:pdh", scope="gpu:index=0")
 
 

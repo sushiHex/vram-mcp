@@ -283,12 +283,12 @@ from a partial process inventory.
 System process's engine time on the selected adapter once a second. WDDM's video
 memory manager runs as that process, and its engine time was high in nearly
 every second while VRAM was overcommitted. The verdict reads `thrashing` when,
-in the last 10 one-second samples, at least 5 reach 5% of an engine. The
+for at least 5 of the last 10 seconds, that engine time was 5% of an engine or more. The
 `paging` field reports the window, or is `null` when paging was not read:
 
 - `sustained`: whether that condition holds.
-- `active_seconds`: how many samples in the window reached 5% of an engine.
-- `seconds`: how many samples the window holds.
+- `active_seconds`: how many seconds of the window reached 5% of an engine.
+- `seconds`: how many seconds the window covers, up to 10.
 - `peak_percent`: the highest sample, as a percentage of one engine.
 
 Loading a model or filling VRAM without overcommitting it makes a burst of two

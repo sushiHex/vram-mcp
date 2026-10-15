@@ -220,15 +220,20 @@ def _system(engine: int, ticks: int, **kwargs) -> tuple:
     return _engine(4, _SELECTED, engine, ticks, **kwargs)
 
 
+def _paging(*percents, seconds=1.0):
+    """A window of equal ``seconds``-long intervals at ``percents``."""
+    return wddm.Paging(tuple((seconds, percent) for percent in percents))
+
+
 def test_paging_counts_an_interval_at_the_threshold_as_active():
-    assert wddm.Paging((wddm.PAGING_PERCENT,)).active == 1
-    assert wddm.Paging((wddm.PAGING_PERCENT - 0.1,)).active == 0
+    assert _paging(wddm.PAGING_PERCENT).active_seconds == 1.0
+    assert _paging(wddm.PAGING_PERCENT - 0.1).active_seconds == 0.0
 
 
 @pytest.mark.parametrize(("percents", "active", "sustained"), [
     ((), 0, False),                             # an empty window is not paging
     ((0.0,) * 10, 0, False),
-    ((10.0,) * 3 + (0.0,) * 2, 3, False),       # three of five: not half enough
+    ((10.0,) * 3 + (0.0,) * 2, 3, False),       # three active seconds
     ((5.0,) * 4, 4, False),
     ((5.0,) * 4 + (0.0,) * 6, 4, False),        # four of ten
     ((5.0,) * 5, 5, True),                      # five of five
@@ -236,17 +241,33 @@ def test_paging_counts_an_interval_at_the_threshold_as_active():
     ((60.0,) * 10, 10, True),
     ((4.99,) * 10, 0, False),                   # just under the threshold
 ])
-def test_paging_is_sustained_at_five_active_intervals(percents, active, sustained):
-    paging = wddm.Paging(percents)
-    assert paging.active == active
+def test_paging_is_sustained_at_five_active_seconds(percents, active, sustained):
+    paging = _paging(*percents)
+    assert paging.active_seconds == active
     assert paging.sustained is sustained
 
 
+def test_paging_counts_seconds_not_intervals():
+    assert _paging(10.0, 10.0, seconds=2.0).active_seconds == 4.0
+    assert _paging(10.0, 10.0, seconds=2.5).sustained is True      # 5.0 s exactly
+    assert _paging(10.0, 10.0, seconds=2.4).sustained is False
+    assert _paging(10.0, 0.0, 10.0, seconds=3.0).seconds == 9.0
+    assert _paging(10.0, 0.0, 10.0, seconds=3.0).sustained is True
+
+
 def test_paging_summary_reports_the_window_and_its_peak():
-    paging = wddm.Paging((0.0, 5.0, 12.34, 0.0, 7.0, 6.0, 9.0))
-    assert paging.summary() == {"sustained": True, "active_seconds": 5,
-                                "seconds": 7, "peak_percent": 12.3}
-    assert wddm.Paging((0.0, 5.0, 12.34, 0.0)).summary()["sustained"] is False
+    paging = _paging(0.0, 5.0, 12.34, 0.0, 7.0, 6.0, 9.0)
+    assert paging.summary() == {"sustained": True, "active_seconds": 5.0,
+                                "seconds": 7.0, "peak_percent": 12.3}
+    assert _paging(0.0, 5.0, 12.34, 0.0).summary()["sustained"] is False
+
+
+def test_paging_summary_rounds_seconds_to_one_decimal():
+    summary = wddm.Paging(((0.333, 10.0), (4.77, 10.0), (1.0, 0.0))).summary()
+    assert summary["active_seconds"] == 5.1
+    assert summary["seconds"] == 6.1
+    assert wddm.Paging(()).summary() == {"sustained": False, "active_seconds": 0.0,
+                                         "seconds": 0.0, "peak_percent": 0.0}
 
 
 def test_system_engine_ticks_keeps_only_the_system_process_on_the_adapter():
@@ -355,6 +376,14 @@ def _fill(monitor, engines, clock, intervals, *, busy_ticks=0, seconds=1.0):
         _tick(monitor, engines, clock, [_system(0, total)], seconds)
 
 
+def _percents(reading):
+    return [percent for _, percent in reading.data.intervals]
+
+
+def _lengths(reading):
+    return [seconds for seconds, _ in reading.data.intervals]
+
+
 def test_a_monitor_never_sampled_reports_it_is_not_running():
     monitor, _, _ = _paging_monitor()
 
@@ -367,7 +396,7 @@ def test_a_monitor_never_sampled_reports_it_is_not_running():
 
 
 def test_paging_percent_is_engine_time_over_elapsed_clock_time():
-    monitor, engines, clock = _paging_monitor()
+    monitor, engines, clock = _paging_monitor(interval=2.0)
     # Two engines, each busy for 0.25 s of every 2 s: 25% of one engine.
     first = [_system(0, 1 * _TICKS), _system(1, 2 * _TICKS)]
     _tick(monitor, engines, clock, first)
@@ -379,7 +408,8 @@ def test_paging_percent_is_engine_time_over_elapsed_clock_time():
     reading = monitor.observe()
 
     assert reading.known
-    assert reading.data.percents == pytest.approx((25.0,) * 5)
+    assert _percents(reading) == pytest.approx([25.0] * 5)
+    assert _lengths(reading) == pytest.approx([2.0] * 5)
     assert reading.data.sustained is True
 
 
@@ -389,20 +419,32 @@ def test_a_quiet_system_process_reads_zero_percent():
 
     reading = monitor.observe()
 
-    assert reading.data.percents == (0.0,) * 5
+    assert _percents(reading) == [0.0] * 5
     assert reading.data.sustained is False
 
 
-def test_the_window_needs_five_intervals_before_it_is_judged():
+def test_the_window_needs_five_seconds_before_it_is_judged():
     monitor, engines, clock = _paging_monitor()
 
-    _fill(monitor, engines, clock, wddm.PAGING_SECONDS - 1)
+    _fill(monitor, engines, clock, 4)
     early = monitor.observe()
     assert not early.known
     assert early.error == "paging history is still being collected (4 of 5 s)"
 
     _tick(monitor, engines, clock, [_system(0, 10 * _TICKS)])
     assert monitor.observe().known
+
+
+def test_history_is_counted_in_seconds_not_samples():
+    monitor, engines, clock = _paging_monitor(interval=0.5)
+
+    _fill(monitor, engines, clock, 9, seconds=0.5)          # 4.5 s: nine intervals
+    assert not monitor.observe().known
+
+    _tick(monitor, engines, clock, [_system(0, 10 * _TICKS)], seconds=0.5)
+    reading = monitor.observe()
+    assert reading.known                                    # ten intervals: 5 s
+    assert len(reading.data.intervals) == 10
 
 
 def test_the_first_reading_only_sets_the_baseline():
@@ -412,14 +454,82 @@ def test_the_first_reading_only_sets_the_baseline():
     assert monitor.observe().error == "paging history is still being collected (0 of 5 s)"
 
 
-def test_the_window_keeps_only_the_latest_ten_intervals():
+def test_the_window_keeps_only_the_latest_ten_seconds():
     monitor, engines, clock = _paging_monitor()
     _fill(monitor, engines, clock, 12, busy_ticks=_TICKS // 10)   # 10% each
 
-    data = monitor.observe().data
+    reading = monitor.observe()
 
-    assert len(data.percents) == wddm.PAGING_WINDOW
-    assert data.percents == pytest.approx((10.0,) * 10)
+    assert reading.data.seconds == pytest.approx(wddm.PAGING_WINDOW_SECONDS)
+    assert len(reading.data.intervals) == 10
+    assert _percents(reading) == pytest.approx([10.0] * 10)
+
+
+def test_old_activity_ages_out_of_the_window_by_the_clock():
+    """Sampling has stopped, but a read still judges the last ten seconds."""
+    monitor, engines, clock = _paging_monitor(interval=2.0)
+    _fill(monitor, engines, clock, 5, busy_ticks=_TICKS // 5,    # 0.2 s per 2 s
+          seconds=2.0)
+    assert monitor.observe().data.sustained is True          # ten active seconds
+
+    # Four seconds on, the sampler is not yet stale (3 x 2 s), and the oldest
+    # intervals have left the window.
+    clock.now += 4.0
+    later = monitor.observe()
+    assert later.known
+    assert later.data.sustained is True
+    assert later.data.seconds == pytest.approx(6.0)
+
+    # Five seconds on: the oldest remaining interval is clipped to one second.
+    clock.now += 1.0
+    clipped = monitor.observe()
+    assert _lengths(clipped) == pytest.approx([1.0, 2.0, 2.0])
+    assert clipped.data.active_seconds == pytest.approx(5.0)
+    assert clipped.data.sustained is True
+
+    # Just under six seconds on: only 4.1 s of activity remain, too little
+    # history to judge, though the sampler is still within three of its intervals.
+    clock.now += 0.9
+    aged = monitor.observe()
+    assert not aged.known
+    assert aged.error == "paging history is still being collected (4 of 5 s)"
+
+
+def test_a_window_is_clipped_to_its_start():
+    monitor, engines, clock = _paging_monitor(interval=2.0)
+    _fill(monitor, engines, clock, 5, seconds=2.0)
+
+    clock.now += 3.0                    # window now starts 7 s before the last sample
+
+    assert _lengths(monitor.observe()) == pytest.approx([1.0, 2.0, 2.0, 2.0])
+
+
+def test_five_active_three_second_intervals_then_quiet_is_not_sustained():
+    """Intervals of exactly three times the sampling interval are accepted, but
+    15 s of activity followed by 12 s of quiet leave nothing in the last ten."""
+    monitor, engines, clock = _paging_monitor(interval=1.0)
+    total = 10 * _TICKS
+    _tick(monitor, engines, clock, [_system(0, total)])
+    for _ in range(5):
+        total += _TICKS * 6 // 10                           # 0.6 s per 3 s: 20%
+        _tick(monitor, engines, clock, [_system(0, total)], seconds=3.0)
+    busy = monitor.observe()
+    assert busy.data.sustained is True
+    assert busy.data.seconds == pytest.approx(10.0)
+
+    for _ in range(6):
+        _tick(monitor, engines, clock, [_system(0, total)])
+    # 6 quiet seconds: 3 + 1 s of the two newest active intervals remain.
+    partial = monitor.observe()
+    assert partial.data.active_seconds == pytest.approx(4.0)
+    assert partial.data.sustained is False
+
+    for _ in range(6):
+        _tick(monitor, engines, clock, [_system(0, total)])
+    quiet = monitor.observe()
+    assert quiet.known
+    assert quiet.data.active_seconds == 0
+    assert quiet.data.sustained is False
 
 
 def test_a_failed_reading_clears_the_window_and_is_reported():
@@ -437,7 +547,7 @@ def test_a_failed_reading_clears_the_window_and_is_reported():
     engines.error = None
     _tick(monitor, engines, clock, [_system(0, 10 * _TICKS)])
     assert monitor.observe().error == "paging history is still being collected (0 of 5 s)"
-    for _ in range(wddm.PAGING_SECONDS):
+    for _ in range(5):
         _tick(monitor, engines, clock, [_system(0, 10 * _TICKS)])
     assert monitor.observe().known
 
@@ -463,10 +573,10 @@ def test_a_gap_does_not_turn_the_next_reading_into_one_long_interval():
     # Engine time accrued during the gap would read as a huge interval if the
     # pre-gap baseline survived.
     _tick(monitor, engines, clock, [_system(0, 500 * _TICKS)], seconds=30.0)
-    for _ in range(wddm.PAGING_SECONDS):
+    for _ in range(5):
         _tick(monitor, engines, clock, [_system(0, 500 * _TICKS)])
 
-    assert monitor.observe().data.percents == (0.0,) * 5
+    assert _percents(monitor.observe()) == [0.0] * 5
 
 
 def test_an_unresolvable_adapter_is_reported_and_retried():
@@ -490,7 +600,7 @@ def test_an_engine_counter_that_decreased_contributes_nothing_that_interval():
     for _ in range(3):
         _tick(monitor, engines, clock, [_system(0, 3.25 * _TICKS), _system(1, 100.5 * _TICKS)])
 
-    assert monitor.observe().data.percents == pytest.approx((50.0, 25.0, 0.0, 0.0, 0.0))
+    assert _percents(monitor.observe()) == pytest.approx([50.0, 25.0, 0.0, 0.0, 0.0])
 
 
 def test_an_engine_that_appears_contributes_nothing_until_its_next_interval():
@@ -502,7 +612,7 @@ def test_an_engine_that_appears_contributes_nothing_until_its_next_interval():
     for _ in range(3):
         _tick(monitor, engines, clock, [_system(0, 100 * _TICKS), _system(1, 5000.1 * _TICKS)])
 
-    assert monitor.observe().data.percents == pytest.approx((0.0, 10.0, 0.0, 0.0, 0.0))
+    assert _percents(monitor.observe()) == pytest.approx([0.0, 10.0, 0.0, 0.0, 0.0])
 
 
 def test_an_engine_that_vanishes_is_forgotten_not_counted_as_a_decrease():
@@ -512,14 +622,14 @@ def test_an_engine_that_vanishes_is_forgotten_not_counted_as_a_decrease():
     for _ in range(4):
         _tick(monitor, engines, clock, [_system(0, 100.5 * _TICKS)])
 
-    assert monitor.observe().data.percents == pytest.approx((50.0, 0.0, 0.0, 0.0, 0.0))
+    assert _percents(monitor.observe()) == pytest.approx([50.0, 0.0, 0.0, 0.0, 0.0])
 
 
 def test_a_sampler_that_stopped_is_reported_once_its_last_reading_is_stale():
     monitor, engines, clock = _paging_monitor(interval=1.0)
     _fill(monitor, engines, clock, 6)
 
-    clock.now += 5.0                    # five intervals old: still current
+    clock.now += 3.0                    # three intervals old: still current
     assert monitor.observe().known
 
     clock.now += 0.5
@@ -530,11 +640,11 @@ def test_a_sampler_that_stopped_is_reported_once_its_last_reading_is_stale():
 
 def test_staleness_scales_with_the_sampling_interval():
     monitor, engines, clock = _paging_monitor(interval=0.5)
-    _fill(monitor, engines, clock, 6, seconds=0.5)
+    _fill(monitor, engines, clock, 10, seconds=0.5)
 
-    clock.now += 2.0
+    clock.now += 1.5
     assert monitor.observe().known
-    clock.now += 0.6
+    clock.now += 0.1
     assert monitor.observe().error == "the paging sampler stopped"
 
 
@@ -545,35 +655,34 @@ def test_a_long_interval_clears_the_window_and_the_next_reading_is_a_baseline():
     _fill(monitor, engines, clock, 10, busy_ticks=_TICKS // 5)      # 20%: sustained
     assert monitor.observe().data.sustained is True
 
-    _tick(monitor, engines, clock, [_system(0, 12 * _TICKS)],
-          seconds=60.0)
+    _tick(monitor, engines, clock, [_system(0, 12 * _TICKS)], seconds=60.0)
     cleared = monitor.observe()
     assert not cleared.known
     assert cleared.error == "paging history is still being collected (0 of 5 s)"
 
     quiet = [_system(0, 12 * _TICKS)]
-    for _ in range(wddm.PAGING_SECONDS):
+    for _ in range(5):
         _tick(monitor, engines, clock, quiet)
-    judged = monitor.observe().data
-    assert judged.percents == (0.0,) * 5
-    assert judged.sustained is False
+    judged = monitor.observe()
+    assert _percents(judged) == [0.0] * 5
+    assert judged.data.sustained is False
 
 
 def test_an_interval_of_exactly_three_times_the_sampling_interval_still_counts():
     monitor, engines, clock = _paging_monitor(interval=1.0)
-    _fill(monitor, engines, clock, wddm.PAGING_SECONDS)
-    assert len(monitor.observe().data.percents) == 5
+    _fill(monitor, engines, clock, 5)
+    assert len(monitor.observe().data.intervals) == 5
 
     _tick(monitor, engines, clock, [_system(0, 10 * _TICKS + 3 * _TICKS // 2)], seconds=3.0)
 
     data = monitor.observe().data
-    assert len(data.percents) == 6
-    assert data.percents[-1] == pytest.approx(50.0)     # 1.5 s busy over 3 s
+    assert len(data.intervals) == 6
+    assert data.intervals[-1] == pytest.approx((3.0, 50.0))     # 1.5 s busy over 3 s
 
 
 def test_an_interval_just_over_three_times_the_sampling_interval_clears():
     monitor, engines, clock = _paging_monitor(interval=1.0)
-    _fill(monitor, engines, clock, wddm.PAGING_SECONDS)
+    _fill(monitor, engines, clock, 5)
 
     _tick(monitor, engines, clock, [_system(0, 10 * _TICKS)], seconds=3.01)
 
@@ -582,10 +691,10 @@ def test_an_interval_just_over_three_times_the_sampling_interval_clears():
 
 def test_the_long_interval_threshold_scales_with_the_sampling_interval():
     monitor, engines, clock = _paging_monitor(interval=0.5)
-    _fill(monitor, engines, clock, wddm.PAGING_SECONDS, seconds=0.5)
+    _fill(monitor, engines, clock, 10, seconds=0.5)
 
     _tick(monitor, engines, clock, [_system(0, 10 * _TICKS)], seconds=1.5)   # 3 x 0.5
-    assert len(monitor.observe().data.percents) == 6
+    assert len(monitor.observe().data.intervals) == 11
     _tick(monitor, engines, clock, [_system(0, 10 * _TICKS)], seconds=1.6)
     assert not monitor.observe().known
 
