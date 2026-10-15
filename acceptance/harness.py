@@ -39,7 +39,7 @@ import requests
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-from vram_mcp import __version__, claims
+from vram_mcp import __version__, claims, wddm
 from vram_mcp.models import canonical_model
 
 KEEP_ALIVE = "2m"       # an interrupted run's model still leaves VRAM on its own
@@ -512,6 +512,15 @@ def environment(ollama: str, gpu: int, status: dict) -> dict:
         ollama_version = requests.get(f"{ollama}/api/version", timeout=10).json()["version"]
     except (requests.RequestException, ValueError, KeyError):
         ollama_version = "unavailable"
+    platform_rows = {}
+    if sys.platform == "win32":
+        # The paging thresholds were measured with it on (#34).
+        try:
+            device = status["observations"]["processes"]["device"]
+            scheduling = "on" if wddm.hardware_scheduling(device) else "off"
+        except (OSError, LookupError, ValueError, TypeError) as exc:
+            scheduling = f"unavailable ({exc})"
+        platform_rows["Hardware-accelerated GPU scheduling"] = scheduling
     return {
         "OS": platform.platform(),
         "Python": platform.python_version(),
@@ -521,6 +530,7 @@ def environment(ollama: str, gpu: int, status: dict) -> dict:
         "mcp": version("mcp"),
         "GPU": run_quietly("nvidia-smi", f"--id={gpu}", "--format=csv,noheader",
                            "--query-gpu=name,driver_version,memory.total"),
+        **platform_rows,
         "Ollama": ollama_version,
         "Pressure coverage": json.dumps(status["pressure"]["coverage"]),
     }
