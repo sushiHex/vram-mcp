@@ -33,11 +33,11 @@ from __future__ import annotations
 import json
 import os
 import re
-import subprocess
 import sys
 from pathlib import Path
 from typing import Optional
 
+from . import winproc
 from ._util import run_capture
 
 _BLOB_DIGEST_RE = re.compile(r"sha256-([0-9a-f]{64})", re.IGNORECASE)
@@ -52,55 +52,20 @@ def _default_manifests_root() -> Path:
     return Path.home() / ".ollama" / "models" / "manifests"
 
 
-def _parse_pid_cmdline_lines(lines: list[str]) -> list[dict]:
-    """Parse ``pid|cmdline`` lines (PowerShell CIM output) into process dicts."""
-    out = []
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        parts = line.split("|", 1)
-        if len(parts) != 2 or not parts[0].strip().isdigit():
-            continue
-        out.append({"pid": int(parts[0].strip()), "cmdline": parts[1].strip()})
-    return out
-
-
-def _list_llama_server_processes_windows(timeout: int = 5) -> list[dict]:
-    """``[{"pid": int, "cmdline": str}, ...]`` via ``wmic``, falling back to
-    PowerShell CIM where wmic is absent (Windows 11 24H2+ fresh installs no
-    longer ship it). ``[]`` on any failure."""
+def _list_llama_server_processes_windows() -> list[dict]:
+    """``[{"pid": int, "cmdline": str}, ...]`` via :mod:`.winproc`. A runner
+    whose command line Windows denies is skipped; ``[]`` on any failure."""
     try:
-        result = subprocess.run(
-            ["wmic", "process", "where", "name='llama-server.exe'",
-             "get", "ProcessId,CommandLine"],
-            capture_output=True, text=True, timeout=timeout, check=True,
-        )
-    except FileNotFoundError:
-        return _list_llama_server_processes_windows_cim(timeout)
-    except (subprocess.TimeoutExpired, subprocess.CalledProcessError, OSError):
-        # Anything but a missing binary: no fallback, degrade to [].
+        out = []
+        for pid, name in winproc.process_names().items():
+            if name.lower() != "llama-server.exe":
+                continue
+            cmdline = winproc.command_line(pid)
+            if cmdline is not None:
+                out.append({"pid": pid, "cmdline": cmdline})
+        return out
+    except OSError:
         return []
-    out = []
-    lines = [ln.rstrip() for ln in result.stdout.splitlines() if ln.strip()]
-    for line in lines[1:]:  # skip the header row
-        parts = line.rsplit(None, 1)  # PID is the trailing whitespace-separated token
-        if len(parts) != 2 or not parts[1].isdigit():
-            continue
-        out.append({"pid": int(parts[1]), "cmdline": parts[0].strip()})
-    return out
-
-
-def _list_llama_server_processes_windows_cim(timeout: int = 5) -> list[dict]:
-    """wmic-free fallback via ``Get-CimInstance Win32_Process``. ``[]`` on failure."""
-    command = (
-        "Get-CimInstance Win32_Process -Filter \"Name='llama-server.exe'\" "
-        "| ForEach-Object { '{0}|{1}' -f $_.ProcessId, $_.CommandLine }"
-    )
-    out = run_capture(["powershell", "-NoProfile", "-Command", command], timeout)
-    if out is None:
-        return []
-    return _parse_pid_cmdline_lines(out.splitlines())
 
 
 def _list_llama_server_processes_posix(timeout: int = 5) -> list[dict]:
@@ -122,7 +87,7 @@ def _list_llama_server_processes_posix(timeout: int = 5) -> list[dict]:
 
 def _list_llama_server_processes(timeout: int = 5) -> list[dict]:
     if sys.platform == "win32":
-        return _list_llama_server_processes_windows(timeout)
+        return _list_llama_server_processes_windows()
     return _list_llama_server_processes_posix(timeout)
 
 

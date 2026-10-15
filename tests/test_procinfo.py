@@ -3,98 +3,109 @@ from vram_mcp import procinfo, wddm
 from vram_mcp.observations import Observation
 
 
-def test_process_table_uses_nvml_sizes_when_present():
-    # Linux/TCC: NVML gives real sizes; names come from the posix reader.
-    nvml = lambda: [{"pid": 100, "size_mb": 8000, "kind": "compute"}]
+def _fake_winproc(monkeypatch, names, cmdlines=None):
+    """Stand in for the ctypes readers; a missing cmdline is a denied process."""
+    cmdlines = cmdlines or {}
+    calls = []
+
+    def command_line(pid):
+        calls.append(pid)
+        return cmdlines.get(pid)
+
+    monkeypatch.setattr(procinfo.winproc, "process_names", lambda: dict(names))
+    monkeypatch.setattr(procinfo.winproc, "command_line", command_line)
+    return calls
+
+
+def test_windows_name_reader_returns_name_and_cmdline_for_requested_pids(monkeypatch):
+    calls = _fake_winproc(
+        monkeypatch, {11924: "python.exe", 1336: "dwm.exe", 5: "other.exe"},
+        {11924: "python.exe train_lora_kg.py"})
+    assert procinfo.windows_name_reader([11924, 1336]) == {
+        11924: {"name": "python.exe", "cmdline": "python.exe train_lora_kg.py"},
+        1336: {"name": "dwm.exe", "cmdline": None},      # denied: name only
+    }
+    assert sorted(calls) == [1336, 11924]               # others never opened
+
+
+def test_windows_name_reader_omits_pids_windows_does_not_list(monkeypatch):
+    _fake_winproc(monkeypatch, {7: "a.exe"})
+    assert procinfo.windows_name_reader([7, 99]) == {
+        7: {"name": "a.exe", "cmdline": None}}
+
+
+def test_windows_name_reader_ignores_junk_pids(monkeypatch):
+    """The module promises to degrade, not raise: junk PIDs are dropped."""
+    calls = _fake_winproc(monkeypatch, {7: "a.exe", 1: "b.exe"}, {7: "a"})
+    for junk in (["abc"], [None], [1.5], [{}], [True], [-1], []):
+        assert procinfo.windows_name_reader(junk) == {}
+    assert procinfo.windows_name_reader([7, "abc", None]) == {
+        7: {"name": "a.exe", "cmdline": "a"}}
+    assert calls == [7]
+
+
+def test_windows_name_reader_empty_when_snapshot_fails(monkeypatch):
+    def fail():
+        raise OSError("CreateToolhelp32Snapshot failed")
+
+    monkeypatch.setattr(procinfo.winproc, "process_names", fail)
+    assert procinfo.windows_name_reader([7]) == {}
+
+
+def test_windows_name_reader_empty_when_command_line_apis_are_unavailable(monkeypatch):
+    def fail(pid):
+        raise OSError("Windows process APIs are unavailable")
+
+    monkeypatch.setattr(procinfo.winproc, "process_names", lambda: {7: "a.exe"})
+    monkeypatch.setattr(procinfo.winproc, "command_line", fail)
+    assert procinfo.windows_name_reader([7]) == {}
+
+
+def test_observe_processes_attaches_identity_to_rows():
     names = lambda pids: {100: {"name": "python", "cmdline": "python train.py"}}
-    out = procinfo.process_table(
-        nvml_processes=nvml, posix_name_reader=names, platform="linux",
+    result = procinfo.observe_processes(
+        platform="linux",
+        nvml_observer=_nvml_rows({"pid": 100, "size_mb": 8000, "kind": "compute"},
+                                 {"pid": 200, "size_mb": 5, "kind": "graphics"}),
+        name_reader=names,
     )
-    assert out == [{"pid": 100, "size_mb": 8000, "shared_mb": None,
-                    "non_local_mb": None, "name": "python",
-                    "cmdline": "python train.py", "kind": "compute"}]
+    by_pid = {row["pid"]: row for row in result.data}
+    assert by_pid[100] == {"pid": 100, "size_mb": 8000, "shared_mb": None,
+                           "non_local_mb": None, "name": "python",
+                           "cmdline": "python train.py", "kind": "compute"}
+    assert by_pid[200]["name"] is None                  # reader skipped it
+    assert by_pid[200]["cmdline"] is None
 
 
-def test_process_table_windows_counters_only_fill_identity():
-    # WDDM counters aggregate adapters, so they cannot size one selected GPU.
-    nvml = lambda: [{"pid": 100, "size_mb": None, "kind": "compute"},
-                    {"pid": 200, "size_mb": None, "kind": "graphics"}]
-    win = lambda pids: [{"pid": 100, "size_mb": None, "name": "python.exe",
-                         "cmdline": "python.exe train_lora_kg.py"}]
-    out = procinfo.process_table(
-        nvml_processes=nvml, win_gpu_reader=win, platform="win32",
-    )
-    by_pid = {p["pid"]: p for p in out}
-    assert by_pid[100]["size_mb"] is None
-    assert by_pid[100]["shared_mb"] is None
-    assert by_pid[100]["non_local_mb"] is None
-    assert by_pid[100]["name"] == "python.exe"
-    assert by_pid[100]["kind"] == "compute"          # kind preserved from NVML
-    assert by_pid[200]["size_mb"] is None             # win reader didn't see it -> stays null
-    assert by_pid[200]["name"] is None
-
-
-def test_process_table_windows_reader_does_not_add_unattributed_pid():
-    # A counter-only PID cannot be attributed to the selected adapter.
-    nvml = lambda: []
-    win = lambda pids: [{"pid": 300, "size_mb": 2048, "shared_mb": 0,
-                         "non_local_mb": 0, "name": "UnrealEditor.exe",
-                         "cmdline": "UnrealEditor.exe Project.uproject"}]
-    out = procinfo.process_table(
-        nvml_processes=nvml, win_gpu_reader=win, platform="win32",
-    )
-    assert out == []
-
-
-def test_process_table_no_readers_returns_nvml_only_unnamed():
-    nvml = lambda: [{"pid": 100, "size_mb": None, "kind": "compute"}]
-    out = procinfo.process_table(nvml_processes=nvml)
-    assert out == [{"pid": 100, "size_mb": None, "shared_mb": None,
-                    "non_local_mb": None, "name": None,
-                    "cmdline": None, "kind": "compute"}]
-
-
-def test_process_table_does_not_assign_adapter_aggregated_spill_fields():
-    rows = procinfo.process_table(
-        nvml_processes=lambda: [{"pid": 7, "size_mb": None, "kind": "compute"}],
-        win_gpu_reader=lambda pids: [
-            {"pid": 7, "size_mb": 500, "shared_mb": 12, "non_local_mb": 300,
-             "name": "a.exe", "cmdline": "a"},
-        ],
+def test_observe_processes_ignores_reader_pids_outside_the_table():
+    result = procinfo.observe_processes(
         platform="win32",
+        nvml_observer=_nvml_rows(),
+        name_reader=lambda pids: {300: {"name": "UnrealEditor.exe", "cmdline": "x"}},
     )
-    assert rows[0]["non_local_mb"] is None
-    assert rows[0]["shared_mb"] is None
-    assert rows[0]["size_mb"] is None
-    assert rows[0]["name"] == "a.exe"
+    assert result.data == []
 
 
-def test_process_table_defaults_spill_fields_to_none():
-    # Linux/TCC has no perf counter — "unreported" must not read as "no spill".
-    rows = procinfo.process_table(
-        nvml_processes=lambda: [{"pid": 7, "size_mb": 100, "kind": "compute"}],
-    )
-    assert rows[0]["shared_mb"] is None
-    assert rows[0]["non_local_mb"] is None
+def test_observe_processes_names_the_source_by_platform():
+    rows = _nvml_rows({"pid": 1, "size_mb": 1, "kind": "compute"})
+    win = procinfo.observe_processes(
+        platform="win32", nvml_observer=rows, name_reader=lambda pids: {})
+    posix = procinfo.observe_processes(
+        platform="linux", nvml_observer=rows, name_reader=lambda pids: {})
+    assert win.source == "nvml+windows-process-identity"
+    assert posix.source == "nvml+ps"
 
 
-def test_process_table_dispatches_reader_for_actual_platform():
-    calls = {"windows": 0, "posix": 0}
-
-    def windows(pids):
-        calls["windows"] += 1
-        return [{"pid": 7, "name": "win.exe", "cmdline": "win"}]
-
-    def posix(pids):
-        calls["posix"] += 1
-        return {7: {"name": "python", "cmdline": "python train.py"}}
-
-    rows = procinfo.process_table(
-        nvml_processes=lambda: [{"pid": 7, "size_mb": 100}],
-        win_gpu_reader=windows, posix_name_reader=posix, platform="linux",
-    )
-    assert calls == {"windows": 0, "posix": 1}
-    assert rows[0]["name"] == "python"
+def test_observe_processes_defaults_the_reader_to_the_platform(monkeypatch):
+    seen = []
+    monkeypatch.setattr(procinfo, "windows_name_reader",
+                        lambda pids: seen.append("windows") or {})
+    monkeypatch.setattr(procinfo, "posix_name_reader",
+                        lambda pids: seen.append("posix") or {})
+    rows = _nvml_rows({"pid": 1, "size_mb": 1, "kind": "compute"})
+    procinfo.observe_processes(platform="win32", nvml_observer=rows)
+    procinfo.observe_processes(platform="linux", nvml_observer=rows)
+    assert seen == ["windows", "posix"]
 
 
 def test_observe_processes_preserves_failed_vs_empty_and_scope():
@@ -107,11 +118,11 @@ def test_observe_processes_preserves_failed_vs_empty_and_scope():
 
     unavailable = procinfo.observe_processes(
         1, platform="linux", nvml_observer=failed,
-        posix_reader=lambda pids: {},
+        name_reader=lambda pids: {},
     )
     available = procinfo.observe_processes(
         1, platform="linux", nvml_observer=empty,
-        posix_reader=lambda pids: {},
+        name_reader=lambda pids: {},
     )
     assert unavailable.known is False
     assert unavailable.data is None
@@ -129,93 +140,13 @@ def test_observe_processes_propagates_nvml_query_coverage():
         )
 
     result = procinfo.observe_processes(
-        platform="linux", nvml_observer=partial, posix_reader=lambda pids: {},
+        platform="linux", nvml_observer=partial, name_reader=lambda pids: {},
     )
     assert result.coverage == {
         "compute_processes": True,
         "graphics_processes": False,
         "non_local_memory": False,
     }
-
-
-def test_win_gpu_procs_queries_only_selected_pids(monkeypatch):
-    fake = ("11924|python.exe|python.exe train_lora_kg.py\n"
-            "1336|dwm.exe|dwm.exe\n")
-    calls = []
-    monkeypatch.setattr(procinfo, "_run_powershell",
-                        lambda cmd, timeout: calls.append(cmd) or fake)
-    monkeypatch.setattr(procinfo.sys, "platform", "win32")
-    out = {p["pid"]: p for p in procinfo.win_gpu_procs([11924, 1336])}
-    assert set(out) == {11924, 1336}
-    assert out[11924]["size_mb"] is None
-    assert out[11924]["name"] == "python.exe"
-    assert "Get-Counter" not in calls[0]
-    assert "ProcessId=1336 OR ProcessId=11924" in calls[0]
-
-
-def test_win_gpu_procs_empty_pid_set_skips_reader(monkeypatch):
-    monkeypatch.setattr(procinfo.sys, "platform", "win32")
-    monkeypatch.setattr(procinfo, "_run_powershell",
-                        lambda *args: (_ for _ in ()).throw(AssertionError()))
-    assert procinfo.win_gpu_procs([]) == []
-
-
-def test_win_gpu_procs_keeps_pipe_in_cmdline(monkeypatch):
-    # cmdline is last so split("|", 2) leaves its own pipes intact.
-    out = "42|sh.exe|sh -c 'a | b | c'\n"
-    monkeypatch.setattr(procinfo, "_run_powershell", lambda cmd, timeout: out)
-    monkeypatch.setattr(procinfo.sys, "platform", "win32")
-    (row,) = procinfo.win_gpu_procs([42])
-    assert row["cmdline"] == "sh -c 'a | b | c'"
-
-
-def test_win_gpu_procs_skips_malformed_lines(monkeypatch):
-    out = "not-a-pid|x|y\n7|a.exe|a\nshort-line\n"
-    monkeypatch.setattr(procinfo, "_run_powershell", lambda cmd, timeout: out)
-    monkeypatch.setattr(procinfo.sys, "platform", "win32")
-    assert [r["pid"] for r in procinfo.win_gpu_procs([7])] == [7]
-
-
-def test_win_gpu_procs_never_raises_on_non_integer_pids(monkeypatch):
-    """The module promises to degrade, not raise. Coercing would break that
-    for values NVML cannot produce, so junk PIDs are dropped instead."""
-    monkeypatch.setattr(procinfo.sys, "platform", "win32")
-    monkeypatch.setattr(procinfo, "_run_powershell",
-                        lambda *args: (_ for _ in ()).throw(AssertionError(
-                            "no query should run when nothing is usable")))
-    for junk in (["abc"], [None], [1.5], [{}], [True], [-1]):
-        assert procinfo.win_gpu_procs(junk) == []
-
-
-def test_win_gpu_procs_queries_only_the_usable_pids(monkeypatch):
-    """A usable PID alongside junk still gets its identity."""
-    calls = []
-    monkeypatch.setattr(procinfo, "_run_powershell",
-                        lambda cmd, timeout: calls.append(cmd) or "7|a.exe|a\n")
-    monkeypatch.setattr(procinfo.sys, "platform", "win32")
-    (row,) = procinfo.win_gpu_procs([7, "abc", None])
-    assert row["pid"] == 7
-    assert calls[0].count("ProcessId=") == 1
-
-
-def test_win_gpu_identity_filter_is_bounded(monkeypatch):
-    """Past the cap the query truncates into "identity unavailable" for the
-    excess, rather than building a command line Windows will reject."""
-    pids = list(range(1000, 1000 + procinfo._MAX_FILTER_PIDS + 50))
-    command = procinfo._win_gpu_identity_ps(procinfo._filter_pids(pids))
-    assert command.count("ProcessId=") == procinfo._MAX_FILTER_PIDS
-    assert len(command) < 32767
-
-
-def test_win_gpu_procs_empty_off_windows(monkeypatch):
-    monkeypatch.setattr(procinfo.sys, "platform", "linux")
-    assert procinfo.win_gpu_procs([7]) == []
-
-
-def test_win_gpu_procs_empty_on_reader_failure(monkeypatch):
-    monkeypatch.setattr(procinfo.sys, "platform", "win32")
-    monkeypatch.setattr(procinfo, "_run_powershell", lambda cmd, timeout: None)
-    assert procinfo.win_gpu_procs([7]) == []
 
 
 # ---- non-local memory merged into observe_processes -------------------------
@@ -251,7 +182,7 @@ def test_observe_processes_merges_non_local_into_nvml_rows():
         platform="linux",
         nvml_observer=_nvml_rows({"pid": 100, "size_mb": 8000, "kind": "compute"},
                                  {"pid": 200, "size_mb": 500, "kind": "graphics"}),
-        posix_reader=lambda pids: {},
+        name_reader=lambda pids: {},
         non_local=_usage({100: 300, 200: 0}),
     )
     by_pid = {row["pid"]: row for row in result.data}
@@ -268,12 +199,12 @@ def test_observe_processes_wddm_only_pid_joins_with_identity():
 
     def win(pids):
         seen.append(sorted(pids))
-        return [{"pid": 900, "name": "chrome.exe", "cmdline": "chrome.exe --gpu"}]
+        return {900: {"name": "chrome.exe", "cmdline": "chrome.exe --gpu"}}
 
     result = procinfo.observe_processes(
         platform="win32",
         nvml_observer=_nvml_rows({"pid": 100, "size_mb": None, "kind": "compute"}),
-        win_gpu_reader=win,
+        name_reader=win,
         non_local=_usage({100: 10, 900: 2048}),
     )
     by_pid = {row["pid"]: row for row in result.data}
@@ -292,7 +223,7 @@ def test_observe_processes_zero_mb_wddm_only_pid_joins():
     result = procinfo.observe_processes(
         platform="linux",
         nvml_observer=_nvml_rows({"pid": 100, "size_mb": 1, "kind": "compute"}),
-        posix_reader=lambda pids: {},
+        name_reader=lambda pids: {},
         non_local=_usage({100: 5, 777: 0}),
     )
     by_pid = {row["pid"]: row for row in result.data}
@@ -313,7 +244,7 @@ def test_observe_processes_passes_nvml_device_to_reader_and_carries_it():
 
     result = procinfo.observe_processes(
         platform="linux", nvml_observer=nvml,
-        posix_reader=lambda pids: {}, non_local=reader,
+        name_reader=lambda pids: {}, non_local=reader,
     )
     assert reader.devices == [bus_id]
     assert result.device == bus_id
@@ -330,7 +261,7 @@ def test_observe_processes_carries_device_when_nvml_unavailable():
 
     result = procinfo.observe_processes(
         platform="linux", nvml_observer=failed,
-        posix_reader=lambda pids: {}, non_local=reader,
+        name_reader=lambda pids: {}, non_local=reader,
     )
     assert result.known is False
     assert reader.calls == 0
@@ -342,7 +273,7 @@ def test_observe_processes_unreadable_unknown_pid_joins_and_stays_covered():
     result = procinfo.observe_processes(
         platform="linux",
         nvml_observer=_nvml_rows({"pid": 100, "size_mb": 1, "kind": "compute"}),
-        posix_reader=lambda pids: {},
+        name_reader=lambda pids: {},
         non_local=_usage({100: 5, 777: None}, total=4096),
     )
     by_pid = {row["pid"]: row for row in result.data}
@@ -361,7 +292,7 @@ def test_observe_processes_nvml_pid_missing_from_usage_keeps_coverage_and_total(
         nvml_observer=_nvml_rows({"pid": 9, "size_mb": 1, "kind": "compute"},
                                  {"pid": 5, "size_mb": 1, "kind": "compute"},
                                  {"pid": 7, "size_mb": 1, "kind": "compute"}),
-        posix_reader=lambda pids: {},
+        name_reader=lambda pids: {},
         non_local=_usage({7: 64}, total=1000),
     )
     by_pid = {row["pid"]: row for row in result.data}
@@ -378,7 +309,7 @@ def test_observe_processes_total_is_the_measured_adapter_total_not_the_row_sum()
     result = procinfo.observe_processes(
         platform="linux",
         nvml_observer=_nvml_rows({"pid": 100, "size_mb": 1, "kind": "compute"}),
-        posix_reader=lambda pids: {},
+        name_reader=lambda pids: {},
         non_local=_usage({100: 10}, total=2048),
     )
     assert result.data[0]["non_local_mb"] == 10
@@ -389,7 +320,7 @@ def test_observe_processes_measured_zero_total_is_carried():
     result = procinfo.observe_processes(
         platform="linux",
         nvml_observer=_nvml_rows({"pid": 100, "size_mb": 1, "kind": "compute"}),
-        posix_reader=lambda pids: {},
+        name_reader=lambda pids: {},
         non_local=_usage({}, total=0),
     )
     assert result.totals == {"non_local_mb": 0}
@@ -401,7 +332,7 @@ def test_observe_processes_unavailable_reader_gap_is_its_error():
     result = procinfo.observe_processes(
         platform="linux",
         nvml_observer=_nvml_rows({"pid": 100, "size_mb": 1, "kind": "compute"}),
-        posix_reader=lambda pids: {},
+        name_reader=lambda pids: {},
         non_local=reader,
     )
     assert result.known is True
@@ -416,7 +347,7 @@ def test_observe_processes_without_reader_gap_names_missing_collector():
     result = procinfo.observe_processes(
         platform="linux",
         nvml_observer=_nvml_rows({"pid": 100, "size_mb": 1, "kind": "compute"}),
-        posix_reader=lambda pids: {},
+        name_reader=lambda pids: {},
     )
     assert result.data[0]["non_local_mb"] is None
     assert result.coverage["non_local_memory"] is False
@@ -435,7 +366,7 @@ def test_observe_processes_does_not_call_reader_when_nvml_unavailable():
 
     result = procinfo.observe_processes(
         platform="linux", nvml_observer=failed,
-        posix_reader=lambda pids: {}, non_local=reader,
+        name_reader=lambda pids: {}, non_local=reader,
     )
     assert result.known is False
     assert reader.calls == 0
