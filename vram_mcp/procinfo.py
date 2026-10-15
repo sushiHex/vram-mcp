@@ -129,18 +129,17 @@ def _enrich_processes(
     """Attach non-local memory and process identity to selected-GPU rows.
 
     ``non_local`` maps PID to non-local MB on the selected adapter. It may name
-    a process NVML did not report: WDDM accounts for every process with memory
-    on the adapter, and a process holding non-local memory there joins the
-    table as ``kind="wddm"``, because its memory counts toward driver spill.
+    processes NVML did not report: WDDM accounts for every process using the
+    adapter, and each joins the table as ``kind="wddm"``. Their non-local
+    memory counts toward driver spill, and their membership tells which
+    runners are on this GPU.
     """
     table = _base_table(rows)
     if non_local is not None:
+        table.update(_base_table([{"pid": pid, "kind": "wddm"}
+                                  for pid in non_local if pid not in table]))
         for pid, entry in table.items():
             entry["non_local_mb"] = non_local.get(pid)
-        for pid, mb in non_local.items():
-            if pid not in table and mb != 0:
-                table[pid] = {**_base_table([{"pid": pid, "kind": "wddm"}])[pid],
-                              "non_local_mb": mb}
     if platform == "win32" and win_gpu_reader is not None:
         for windows_row in win_gpu_reader(list(table.keys())):
             entry = table.get(windows_row["pid"])
@@ -180,14 +179,15 @@ def observe_processes(
     nvml_observation = nvml_observer(index, nvml=nvml)
     source = "nvml+windows-process-identity" if platform == "win32" else "nvml+ps"
     scope = f"gpu:index={index}"
+    device = nvml_observation.device
     coverage = {**(nvml_observation.coverage or {}), "non_local_memory": False}
     if not nvml_observation.known:
         return Observation(
             None, source, observed_at=nvml_observation.observed_at,
             error=nvml_observation.error or "NVML process telemetry unavailable",
-            scope=scope, coverage=coverage,
+            scope=scope, device=device, coverage=coverage,
         )
-    usage = non_local.observe() if non_local is not None else None
+    usage = non_local.observe(device) if non_local is not None else None
     rows = _enrich_processes(
         nvml_observation.data or [], platform=platform,
         win_gpu_reader=win_gpu_reader, posix_reader=posix_reader,
@@ -204,7 +204,8 @@ def observe_processes(
     coverage["non_local_memory"] = gap is None
     return Observation(
         rows, source, observed_at=nvml_observation.observed_at, scope=scope,
-        coverage=coverage, gaps={"non_local_memory": gap} if gap else None,
+        device=device, coverage=coverage,
+        gaps={"non_local_memory": gap} if gap else None,
     )
 
 

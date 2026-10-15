@@ -121,7 +121,10 @@ vram-mcp reads it from WDDM ([#22](https://github.com/sushiHex/vram-mcp/issues/2
 - Per-process *Dedicated* Usage is not used: Chrome's GPU process and `dwm`
   reported 488 GB and 209 GB on a 24 GB card, with valid counter status.
 - WDDM listed processes on the adapter that NVML did not, one holding 31 MB of
-  non-local memory. Such processes count toward spill, as `kind: "wddm"`.
+  non-local memory. They join the process table as `kind: "wddm"`.
+- PDH reports missing privileges as no data. The adapter's own
+  `\GPU Adapter Memory(*)\Shared Usage` instance must therefore be readable
+  before an empty process list is believed.
 
 On Linux, `non_local_memory` stays `false`, so `pressure` reads `unknown` where
 it would otherwise read `ok`. Ordinary CUDA allocations are not demoted to

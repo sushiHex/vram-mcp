@@ -120,10 +120,13 @@ On Windows/WDDM, NVML often cannot report per-process memory sizes. The
 process observation starts from the selected GPU's NVML PID set and reads each
 process's non-local memory from the WDDM adapter at that GPU's PCI address,
 through the `GPU Process Memory` performance counters. Other adapters' readings
-are never counted. A process that NVML did not list but that holds non-local
-memory on the adapter joins the table with `kind: "wddm"`. The counter query
-opens once per server, which takes about half a second on the first status
-call; later reads take well under a millisecond. One bounded `Win32_Process`
+are never counted, and the adapter's own memory counter must be readable, so
+missing permissions read as unavailable rather than as no processes. Every
+process WDDM reports on the adapter is in the table; one NVML did not list
+appears with `kind: "wddm"`. The counter query opens once per server, which
+takes about half a second on the first status call; later reads take well
+under a millisecond. The observation's `device` is the GPU's PCI address, from
+the same NVML session as its processes. One bounded `Win32_Process`
 lookup then adds identity. Missing, inaccessible, or exited processes remain in
 the inventory with `name: null` and `cmdline: null`.
 
@@ -132,10 +135,11 @@ and new trend samples. It does not disable current GPU, process, model, or
 activity observations. Claims and model operations remain enabled, and old
 audit events remain queryable.
 
-`tight` and `degraded` report from the evidence they have: each rests on a
-reading that was taken, so incomplete coverage elsewhere does not suppress them.
-`thrashing` requires scoped non-local-memory coverage, since that is the figure
-it grades.
+`tight`, `degraded` and `thrashing` report from the evidence they have: each
+rests on a reading that was taken, so incomplete coverage elsewhere does not
+suppress them. `thrashing` grades the non-local memory that was read. When some
+processes had no reading, the spill figures are `null`, since they would
+understate the total, and `detail` names the amount that was observed.
 
 `ok` is the one verdict that asserts a negative — that nothing is wrong — so it
 requires every input it depends on, including that same non-local coverage.

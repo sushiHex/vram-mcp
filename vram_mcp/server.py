@@ -80,7 +80,7 @@ def _gpu_reading():
     return observe_gpu(_GPU_INDEX)
 
 
-# One per server: its counter query costs ~0.4 s to open and ~0.1 ms to read.
+# One per server: its counter query costs ~0.5 s to open and ~0.2 ms to read.
 _non_local = _wddm.NonLocalMemory(_GPU_INDEX) if sys.platform == "win32" else None
 
 

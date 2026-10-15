@@ -5,13 +5,16 @@ do, per process AND per adapter: each ``\\GPU Process Memory(*)\\Non Local
 Usage`` instance is named ``pid_<pid>_luid_0x<high>_0x<low>_phys_<n>``. The
 NVML device is matched to its WDDM adapter by PCI address, which
 ``D3DKMTQueryAdapterInfo`` reports for every adapter, so only the selected
-GPU's instances are counted.
+GPU's instances are counted. The adapter's own ``\\GPU Adapter Memory`` instance
+must be readable too: it proves the counters are visible to this process and
+the LUID is current, so an empty process list means no processes, never no
+access.
 
 Costs measured on an RTX 3090 (#22) set the shape. Listing adapters takes
-~0.03 ms, so the LUID is resolved on every read: it changes across boots and
-driver restarts. Opening the PDH query takes ~0.4 s, so one query is kept per
-server and each read costs ~0.1 ms. Finding the GPU's PCI address takes an NVML
-session (~17 ms), and the address cannot change, so it is looked up once.
+~0.03 ms, so the LUID is resolved on every read: it changed across a driver
+update. Opening the PDH query takes ~0.5 s, so one query is kept per server and
+each read costs ~0.2 ms. The PCI address arrives with NVML's process reading,
+so both always describe the same device.
 
 Per-process *Dedicated* Usage is deliberately not read: it reports hundreds of
 gigabytes for some processes on a 24 GB card, with valid counter status. NVML
@@ -29,17 +32,18 @@ import threading
 from typing import Callable, Optional
 
 from ._util import bytes_to_mb
-from . import nvml as _nvml
 from .observations import Observation
 
 Address = tuple[int, int, int]   # PCI bus, device, function
 Sample = tuple[str, int, int]    # PDH instance name, counter status, bytes
 
-_NON_LOCAL = r"\GPU Process Memory(*)\Non Local Usage"
+_PROCESSES = r"\GPU Process Memory(*)\Non Local Usage"
+_ADAPTERS = r"\GPU Adapter Memory(*)\Shared Usage"
 _BUS_ID = re.compile(r"([0-9a-f]{1,8}):([0-9a-f]{1,2}):([0-9a-f]{1,2})\.([0-7])", re.I)
 # The hex in instance names is uppercase; match it either way.
-_INSTANCE = re.compile(
-    r"pid_(\d+)_luid_0x([0-9a-f]{1,8})_0x([0-9a-f]{1,8})_phys_(\d+)", re.I)
+_LUID = r"luid_0x(?P<high>[0-9a-f]{1,8})_0x(?P<low>[0-9a-f]{1,8})_phys_(?P<phys>\d+)"
+_PROCESS_INSTANCE = re.compile(rf"pid_(?P<pid>\d+)_{_LUID}", re.I)
+_ADAPTER_INSTANCE = re.compile(_LUID, re.I)
 _VALID_DATA = (0, 1)  # PDH_CSTATUS_VALID_DATA, PDH_CSTATUS_NEW_DATA
 
 
@@ -67,18 +71,28 @@ def adapter_luid(domain: int, address: Address,
     return matches[0]
 
 
-def non_local_by_pid(samples: list[Sample], luid: int) -> dict[int, Optional[int]]:
-    """Non-local MB per process on adapter ``luid``; None where unreadable."""
-    usage: dict[int, Optional[int]] = {}
+def _instances(pattern: re.Pattern, samples: list[Sample], luid: int):
+    """``(match, status, value)`` for each instance on adapter ``luid``."""
     for name, status, value in samples:
-        match = _INSTANCE.fullmatch(name)
-        if match is None or (int(match[2], 16) << 32 | int(match[3], 16)) != luid:
-            continue
-        if int(match[4]) != 0:
-            raise LookupError("the GPU belongs to a linked adapter, whose physical "
-                              "GPUs these counters cannot tell apart")
-        usage[int(match[1])] = bytes_to_mb(value) if status in _VALID_DATA else None
-    return usage
+        match = pattern.fullmatch(name)
+        if match is not None and (int(match["high"], 16) << 32
+                                  | int(match["low"], 16)) == luid:
+            yield match, status, value
+
+
+def non_local_by_pid(counters: dict[str, list[Sample]],
+                     luid: int) -> dict[int, Optional[int]]:
+    """Non-local MB per process on adapter ``luid``; None where unreadable."""
+    adapter = list(_instances(_ADAPTER_INSTANCE, counters[_ADAPTERS], luid))
+    if any(int(match["phys"]) != 0 for match, _, _ in adapter):
+        raise LookupError("the GPU belongs to a linked adapter, whose physical "
+                          "GPUs these counters cannot tell apart")
+    if not any(status in _VALID_DATA for _, status, _ in adapter):
+        raise LookupError("WDDM reports no readable memory counters for the "
+                          "selected adapter")
+    return {int(match["pid"]): bytes_to_mb(value) if status in _VALID_DATA else None
+            for match, status, value in _instances(
+                _PROCESS_INSTANCE, counters[_PROCESSES], luid)}
 
 
 class NonLocalMemory:
@@ -87,24 +101,20 @@ class NonLocalMemory:
     source = "wddm:pdh"
 
     def __init__(self, index: int, *,
-                 bus_id_fn: Optional[Callable[[], Optional[str]]] = None,
                  adapters_fn: Optional[Callable[[], list]] = None,
                  counters: Optional["CounterReader"] = None) -> None:
         self.index = index
-        self._bus_id_fn = bus_id_fn or (lambda: _nvml.nvml_pci_bus_id(index))
         self._adapters_fn = adapters_fn or wddm_adapters
-        self._counters = counters or CounterReader(_NON_LOCAL)
-        self._pci: Optional[tuple[int, Address]] = None
+        self._counters = counters or CounterReader((_PROCESSES, _ADAPTERS))
 
-    def observe(self) -> Observation[dict[int, Optional[int]]]:
+    def observe(self, bus_id: Optional[str]) -> Observation[dict[int, Optional[int]]]:
+        """Read the adapter at ``bus_id``: NVML's PCI address for the GPU, from
+        the same reading as its processes, so both describe one device."""
         scope = f"gpu:index={self.index}"
         try:
-            if self._pci is None:
-                bus_id = self._bus_id_fn()
-                if bus_id is None:
-                    raise LookupError("NVML did not report the GPU's PCI address")
-                self._pci = parse_bus_id(bus_id)
-            luid = adapter_luid(*self._pci, self._adapters_fn())
+            if bus_id is None:
+                raise LookupError("NVML did not report the GPU's PCI address")
+            luid = adapter_luid(*parse_bus_id(bus_id), self._adapters_fn())
             usage = non_local_by_pid(self._counters.read(), luid)
         except (LookupError, OSError, ValueError) as exc:
             return Observation(None, self.source, error=str(exc), scope=scope)
@@ -144,9 +154,13 @@ class _CloseAdapter(ctypes.Structure):      # D3DKMT_CLOSEADAPTER
     _fields_ = [("hAdapter", ctypes.c_uint32)]
 
 
-class _FormattedItem(ctypes.Structure):     # PDH_FMT_COUNTERVALUE_ITEM_W, LARGE
-    _fields_ = [("szName", ctypes.c_wchar_p), ("CStatus", ctypes.c_uint32),
-                ("largeValue", ctypes.c_int64)]
+class _CounterValue(ctypes.Structure):      # PDH_FMT_COUNTERVALUE, read as LARGE
+    _fields_ = [("CStatus", ctypes.c_uint32), ("largeValue", ctypes.c_int64)]
+
+
+class _FormattedItem(ctypes.Structure):     # PDH_FMT_COUNTERVALUE_ITEM_W
+    # Nested, as declared: flattened, 32-bit Python would misplace the value.
+    _fields_ = [("szName", ctypes.c_wchar_p), ("FmtValue", _CounterValue)]
 
 
 _KMTQAITYPE_ADAPTERADDRESS = 6
@@ -197,21 +211,23 @@ def wddm_adapters() -> list[tuple[int, Optional[Address]]]:
 
 
 class CounterReader:
-    """One PDH query on one wildcard counter path, opened on first read and kept.
+    """One PDH query on wildcard counter paths, opened on first read and kept.
 
     Instances that appear after the query opens are still reported, and the
     query may be read from any thread (both verified, #22). Reads are
-    serialized, because a collection and the array read after it must pair.
+    serialized, because a collection and the array reads after it must pair.
+    PDH reports missing privileges as no data, so an empty result is only as
+    good as the caller's proof that the counters were visible.
     """
 
-    def __init__(self, path: str) -> None:
-        self._path = path
+    def __init__(self, paths: tuple[str, ...]) -> None:
+        self._paths = paths
         self._lock = threading.Lock()
         self._pdh = None
         self._query = ctypes.c_void_p()
-        self._counter = ctypes.c_void_p()
+        self._counters: dict[str, ctypes.c_void_p] = {}
 
-    def read(self) -> list[Sample]:
+    def read(self) -> dict[str, list[Sample]]:
         with self._lock:
             if self._pdh is None:
                 self._open()
@@ -228,33 +244,40 @@ class CounterReader:
                          "PdhCloseQuery"):
             getattr(pdh, function).restype = ctypes.c_uint32
         _check(pdh.PdhOpenQueryW(None, None, ctypes.byref(self._query)), "PdhOpenQueryW")
-        status = pdh.PdhAddEnglishCounterW(self._query, self._path, None,
-                                           ctypes.byref(self._counter))
-        if status:
-            pdh.PdhCloseQuery(self._query)
-            _check(status, f"PdhAddEnglishCounterW({self._path})")
         self._pdh = pdh
+        for path in self._paths:
+            counter = ctypes.c_void_p()
+            status = pdh.PdhAddEnglishCounterW(self._query, path, None, ctypes.byref(counter))
+            if status:
+                self._close()
+                _check(status, f"PdhAddEnglishCounterW({path})")
+            self._counters[path] = counter
 
     def _close(self) -> None:
         self._pdh.PdhCloseQuery(self._query)
         self._pdh = None
+        self._counters = {}
 
-    def _collect(self) -> list[Sample]:
-        pdh = self._pdh
-        status = pdh.PdhCollectQueryData(self._query)
-        if status == _PDH_NO_DATA:      # no instance exists
-            return []
+    def _collect(self) -> dict[str, list[Sample]]:
+        status = self._pdh.PdhCollectQueryData(self._query)
+        if status == _PDH_NO_DATA:
+            return {path: [] for path in self._paths}
         _check(status, "PdhCollectQueryData")
+        return {path: self._array(counter) for path, counter in self._counters.items()}
+
+    def _array(self, counter: ctypes.c_void_p) -> list[Sample]:
+        pdh = self._pdh
         size, count = ctypes.c_uint32(0), ctypes.c_uint32(0)
         status = pdh.PdhGetFormattedCounterArrayW(
-            self._counter, _PDH_FMT_LARGE, ctypes.byref(size), ctypes.byref(count), None)
+            counter, _PDH_FMT_LARGE, ctypes.byref(size), ctypes.byref(count), None)
+        if status in (0, _PDH_NO_DATA):
+            return []
         if status != _PDH_MORE_DATA:
             _check(status, "PdhGetFormattedCounterArrayW")
-            return []
         buffer = (ctypes.c_byte * size.value)()
         _check(pdh.PdhGetFormattedCounterArrayW(
-            self._counter, _PDH_FMT_LARGE, ctypes.byref(size), ctypes.byref(count),
-            buffer), "PdhGetFormattedCounterArrayW")
+            counter, _PDH_FMT_LARGE, ctypes.byref(size), ctypes.byref(count), buffer),
+            "PdhGetFormattedCounterArrayW")
         items = ctypes.cast(buffer, ctypes.POINTER(_FormattedItem))
-        return [(items[i].szName, items[i].CStatus, items[i].largeValue)
+        return [(items[i].szName, items[i].FmtValue.CStatus, items[i].FmtValue.largeValue)
                 for i in range(count.value)]

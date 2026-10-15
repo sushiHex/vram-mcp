@@ -16,6 +16,8 @@ class Observation(Generic[T]):
     observed_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     error: str | None = None
     scope: str | None = None
+    # The physical device a scope resolved to (a PCI bus ID), where known.
+    device: str | None = None
     coverage: dict[str, bool] | None = None
     # Why each uncovered input is missing, keyed like ``coverage``.
     gaps: dict[str, str] | None = None
@@ -28,6 +30,8 @@ class Observation(Generic[T]):
         result = {"status": "available" if self.known else "unavailable",
                   "source": self.source, "observed_at": self.observed_at,
                   "scope": self.scope}
+        if self.device is not None:
+            result["device"] = self.device
         if self.error is not None:
             result["error"] = self.error
         if self.coverage is not None:

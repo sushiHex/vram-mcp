@@ -226,9 +226,11 @@ class FakeNonLocal:
     def __init__(self, observation):
         self._observation = observation
         self.calls = 0
+        self.devices = []
 
-    def observe(self):
+    def observe(self, device=None):
         self.calls += 1
+        self.devices.append(device)
         return self._observation
 
 
@@ -281,15 +283,56 @@ def test_observe_processes_wddm_only_pid_joins_with_identity():
     assert result.coverage["non_local_memory"] is True
 
 
-def test_observe_processes_zero_mb_unknown_pid_is_skipped():
+def test_observe_processes_zero_mb_wddm_only_pid_joins():
+    # Table membership decides which runners are on the selected GPU, so a
+    # WDDM-only PID joins even when its non-local memory is a measured zero.
     result = procinfo.observe_processes(
         platform="linux",
         nvml_observer=_nvml_rows({"pid": 100, "size_mb": 1, "kind": "compute"}),
         posix_reader=lambda pids: {},
         non_local=_usage({100: 5, 777: 0}),
     )
-    assert [row["pid"] for row in result.data] == [100]
+    by_pid = {row["pid"]: row for row in result.data}
+    assert sorted(by_pid) == [100, 777]
+    assert by_pid[777]["kind"] == "wddm"
+    assert by_pid[777]["non_local_mb"] == 0
     assert result.coverage["non_local_memory"] is True
+    assert result.gaps is None
+
+
+def test_observe_processes_passes_nvml_device_to_reader_and_carries_it():
+    bus_id = "00000000:2D:00.0"
+    reader = _usage({100: 5})
+
+    def nvml(index, *, nvml=None):
+        return Observation([{"pid": 100, "size_mb": 1, "kind": "compute"}],
+                           "nvml", scope=f"gpu:index={index}", device=bus_id)
+
+    result = procinfo.observe_processes(
+        platform="linux", nvml_observer=nvml,
+        posix_reader=lambda pids: {}, non_local=reader,
+    )
+    assert reader.devices == [bus_id]
+    assert result.device == bus_id
+    assert result.metadata()["device"] == bus_id
+
+
+def test_observe_processes_carries_device_when_nvml_unavailable():
+    bus_id = "00000000:2D:00.0"
+    reader = _usage({100: 5})
+
+    def failed(index, *, nvml=None):
+        return Observation(None, "nvml", error="process query failed",
+                           device=bus_id)
+
+    result = procinfo.observe_processes(
+        platform="linux", nvml_observer=failed,
+        posix_reader=lambda pids: {}, non_local=reader,
+    )
+    assert result.known is False
+    assert reader.calls == 0
+    assert result.device == bus_id
+    assert result.metadata()["device"] == bus_id
 
 
 def test_observe_processes_unreadable_unknown_pid_joins_and_uncovers():
