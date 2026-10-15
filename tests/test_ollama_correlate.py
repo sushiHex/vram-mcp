@@ -326,61 +326,49 @@ def test_find_pid_for_model_digest_mismatch_returns_none(tmp_path):
     assert pid is None
 
 
-# ------------------------------------------------- windows process parsing
+# ------------------------------------------------- windows process listing
 
 
-def test_parse_pid_cmdline_lines_cim_format():
-    lines = [
-        rf"43176|C:\Ollama\llama-server.exe --model C:\x\blobs\sha256-{_REAL_DIGEST}",
-        "",
-        "garbage-without-pipe",
-        "notanumber|exe --model x",
-    ]
-    assert oc._parse_pid_cmdline_lines(lines) == [
-        {"pid": 43176,
-         "cmdline": rf"C:\Ollama\llama-server.exe --model C:\x\blobs\sha256-{_REAL_DIGEST}"},
-    ]
+def _fake_winproc(monkeypatch, names, cmdlines):
+    monkeypatch.setattr(oc.winproc, "process_names", lambda: dict(names))
+    monkeypatch.setattr(oc.winproc, "command_line", lambda pid: cmdlines.get(pid))
 
 
-def test_windows_wmic_missing_falls_back_to_cim(monkeypatch):
-    calls = []
-
-    def fake_run(cmd, **kwargs):
-        calls.append(cmd[0])
-        if cmd[0] == "wmic":
-            raise FileNotFoundError("wmic gone on 24H2")
-
-        class R:
-            stdout = rf"7|llama-server.exe --model /b/sha256-{_REAL_DIGEST}"
-        return R()
-
-    monkeypatch.setattr(oc.subprocess, "run", fake_run)
-    procs = oc._list_llama_server_processes_windows()
-    assert calls == ["wmic", "powershell"]
-    assert procs == [{"pid": 7,
-                      "cmdline": rf"llama-server.exe --model /b/sha256-{_REAL_DIGEST}"}]
+def test_windows_lists_llama_server_processes_with_cmdlines(monkeypatch):
+    cmdline = rf"C:\Ollama\llama-server.exe --model C:\x\blobs\sha256-{_REAL_DIGEST}"
+    _fake_winproc(monkeypatch,
+                  {7: "llama-server.exe", 8: "ollama.exe", 9: "notepad.exe"},
+                  {7: cmdline, 8: "ollama.exe serve"})
+    assert oc._list_llama_server_processes_windows() == [
+        {"pid": 7, "cmdline": cmdline}]
 
 
-def test_windows_wmic_and_cim_both_missing_returns_empty(monkeypatch):
-    def fake_run(cmd, **kwargs):
-        raise FileNotFoundError(cmd[0])
+def test_windows_llama_server_name_matches_case_insensitively(monkeypatch):
+    _fake_winproc(monkeypatch, {7: "LLAMA-Server.EXE"}, {7: "runner"})
+    assert oc._list_llama_server_processes_windows() == [
+        {"pid": 7, "cmdline": "runner"}]
 
-    monkeypatch.setattr(oc.subprocess, "run", fake_run)
+
+def test_windows_runner_without_a_command_line_is_excluded(monkeypatch):
+    _fake_winproc(monkeypatch, {7: "llama-server.exe", 8: "llama-server.exe"},
+                  {8: "runner"})
+    assert oc._list_llama_server_processes_windows() == [
+        {"pid": 8, "cmdline": "runner"}]
+
+
+def test_windows_listing_degrades_to_empty_on_oserror(monkeypatch):
+    def fail():
+        raise OSError("Windows process APIs are unavailable")
+
+    monkeypatch.setattr(oc.winproc, "process_names", fail)
     assert oc._list_llama_server_processes_windows() == []
 
 
-def test_windows_wmic_other_failure_returns_empty_without_fallback(monkeypatch):
-    # A timeout/nonzero-exit from wmic still swallows to [] (only absence
-    # triggers the CIM fallback).
-    calls = []
-
-    def fake_run(cmd, **kwargs):
-        calls.append(cmd[0])
-        raise oc.subprocess.CalledProcessError(1, cmd)
-
-    monkeypatch.setattr(oc.subprocess, "run", fake_run)
-    assert oc._list_llama_server_processes_windows() == []
-    assert calls == ["wmic"]
+def test_list_llama_server_processes_dispatches_windows_without_timeout(monkeypatch):
+    monkeypatch.setattr(oc.sys, "platform", "win32")
+    monkeypatch.setattr(oc, "_list_llama_server_processes_windows",
+                        lambda: [{"pid": 1, "cmdline": "x"}])
+    assert oc._list_llama_server_processes() == [{"pid": 1, "cmdline": "x"}]
 
 
 # ---- resolve_tag: Ollama's bare-name -> ":latest" rule ----------------------
