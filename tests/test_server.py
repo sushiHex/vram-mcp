@@ -9,7 +9,7 @@ import json
 
 import pytest
 
-from vram_mcp import core, server
+from vram_mcp import core, server, wddm
 from vram_mcp.observations import Observation
 
 
@@ -97,8 +97,14 @@ def test_run_detection_samples_the_unexplained_spill_not_the_raw_non_local(audit
     assert "non_local_mb" not in sample
 
 
-def test_full_status_forwards_the_spill_threshold(monkeypatch):
-    """VRAM_MCP_SPILL_MB is only a knob if it actually reaches pressure()."""
+class _StubPaging:
+    """A paging monitor whose window is quiet (non-sustained)."""
+
+    def observe(self):
+        return Observation(wddm.Paging((0.0,) * 10), "wddm:pdh", scope="gpu:index=0")
+
+
+def _capture_combined_status(monkeypatch):
     seen = {}
 
     def fake_combined_status(gpu_fn, ollama, **kwargs):
@@ -106,9 +112,34 @@ def test_full_status_forwards_the_spill_threshold(monkeypatch):
         return {"gpus": [], "loaded": [], "free_mb": None, "pressure": {}}
 
     monkeypatch.setattr(core, "combined_status", fake_combined_status)
-    monkeypatch.setattr(server, "_SPILL_MB", 777)
+    return seen
+
+
+def test_full_status_reads_paging_from_the_monitor(monkeypatch):
+    """Without paging_fn the verdict could never be `ok` or `thrashing`."""
+    seen = _capture_combined_status(monkeypatch)
+    paging = _StubPaging()
+    monkeypatch.setattr(server, "_paging", paging)
     server._full_status()
-    assert seen["spill_threshold_mb"] == 777
+    assert seen["paging_fn"] == paging.observe
+    assert "spill_threshold_mb" not in seen
+
+
+def test_full_status_has_no_paging_reader_where_there_is_no_monitor(monkeypatch):
+    """The monitor exists on Windows only; elsewhere paging stays uncovered."""
+    seen = _capture_combined_status(monkeypatch)
+    monkeypatch.setattr(server, "_paging", None)
+    server._full_status()
+    assert seen["paging_fn"] is None
+
+
+def test_the_monitor_exists_on_windows_only():
+    import sys
+    assert (server._paging is not None) == (sys.platform == "win32")
+
+
+def test_the_spill_knob_is_gone():
+    assert not hasattr(server, "_SPILL_MB")
 
 
 def test_reserve_tool_surfaces_a_rejected_gb_as_a_structured_error(monkeypatch, tmp_path):
@@ -160,14 +191,15 @@ def test_status_summary_says_why_pressure_is_unknown(monkeypatch):
                                   "used_mb": 4000, "free_mb": 20576}])
     monkeypatch.setattr(server, "_procinfo_table",
                         lambda: Observation([], "procs",
-                                            coverage={"non_local_memory": False}))
+                                            coverage={"non_local_memory": True}))
+    monkeypatch.setattr(server, "_paging", None)
     monkeypatch.setattr(server, "_ollama", _StubResidency([]))
     monkeypatch.setattr(server, "_run_detection", lambda status: None)
 
     status = server._vram_status_impl()
     assert status["pressure"]["state"] == "unknown"
     assert "pressure: unknown." in status["summary"]
-    assert "driver spill cannot be ruled out" in status["summary"]
+    assert "Driver paging is unavailable" in status["summary"]
 
 
 def test_status_summary_stays_terse_when_pressure_is_ok(monkeypatch):
@@ -178,6 +210,7 @@ def test_status_summary_stays_terse_when_pressure_is_ok(monkeypatch):
     monkeypatch.setattr(server, "_procinfo_table",
                         lambda: Observation([], "procs",
                                             coverage={"non_local_memory": True}))
+    monkeypatch.setattr(server, "_paging", _StubPaging())
     monkeypatch.setattr(server, "_ollama", _StubResidency([]))
     monkeypatch.setattr(server, "_run_detection", lambda status: None)
 

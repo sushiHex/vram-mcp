@@ -159,18 +159,19 @@ async def read_only(run: Run, tools: Tools, gpu: int) -> dict:
               f"coverage {process_coverage}")
     coverage = status["pressure"]["coverage"]
     run.check("Pressure states the evidence it rests on",
-              set(coverage) == {"capacity", "models", "processes", "non_local_memory"},
+              set(coverage) == {"capacity", "models", "processes", "non_local_memory",
+                                "paging"},
               f"pressure {status['pressure']['state']}, coverage {coverage}")
-    gap = (processes.get("gaps") or {}).get("non_local_memory")
     if sys.platform == "win32":
-        run.check("Windows reads the selected adapter's non-local memory, so "
-                  "pressure reaches a verdict",
-                  coverage["non_local_memory"] and status["pressure"]["state"] != "unknown",
+        run.check("Windows reads the selected adapter's non-local memory and "
+                  "paging, so pressure reaches a verdict",
+                  coverage["non_local_memory"] and coverage["paging"]
+                  and status["pressure"]["state"] != "unknown",
                   f"pressure {status['pressure']['state']}: {status['pressure']['detail']}")
     else:
-        run.check("Uncovered non-local memory says why",
-                  coverage["non_local_memory"] or bool(gap),
-                  f"non-local covered: {coverage['non_local_memory']}; gap: {gap}")
+        run.check("Uncovered paging says why",
+                  coverage["paging"] or "paging" in status["pressure"]["detail"],
+                  f"paging covered: {coverage['paging']}; {status['pressure']['detail']}")
     return status
 
 
@@ -404,8 +405,9 @@ async def overcommit_reads_as_thrashing(run: Run, tools: Tools) -> None:
     pressure = during["pressure"]
     run.check("Pressure reads thrashing while VRAM pages",
               pressure["state"] == "thrashing",
-              f"{pressure['state']}: {pressure['free_mb']} MB free, {pressure['non_local_mb']} "
-              f"MB non-local, the holders' share {_non_local(during, holders)}")
+              f"{pressure['state']}: paging {pressure['paging']}; {pressure['free_mb']} MB "
+              f"free, {pressure['non_local_mb']} MB non-local, the holders' share "
+              f"{_non_local(during, holders)}")
     for _ in range(10):     # WDDM takes a moment to give the memory back
         after = (await tools("vram_status"))["pressure"]
         if after["state"] == "ok":

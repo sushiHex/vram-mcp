@@ -1,4 +1,5 @@
-"""The selected GPU's non-local memory on Windows, from WDDM's own accounting.
+"""The selected GPU's non-local memory and paging on Windows, from WDDM's own
+accounting.
 
 NVML reports no per-process memory under WDDM. The GPU performance counters
 do, per process AND per adapter: each ``\\GPU Process Memory(*)\\Non Local
@@ -9,6 +10,11 @@ GPU's instances are counted. The measurement is the adapter's own ``\\GPU
 Adapter Memory(*)\\Shared Usage``; per-process readings only attribute it, so
 memory that no visible process accounts for still counts, and an adapter whose
 counter cannot be read is unavailable rather than idle.
+
+Non-local memory is a quantity, not a symptom: a desktop holds hundreds of MB
+of it, and memory evicted to the backing store is not in it at all. Paging is
+read separately, as the engine time WDDM's memory manager spends on the
+adapter (:class:`PagingMonitor`).
 
 Costs measured on an RTX 3090 (#22) set the shape. Listing adapters takes
 ~0.03 ms, so the LUID is resolved on every read: it changed across a driver
@@ -29,23 +35,34 @@ from __future__ import annotations
 import ctypes
 import re
 import threading
+import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Callable, Optional
 
+from . import nvml as _nvml
 from ._util import bytes_to_mb
 from .observations import Observation
 
 Address = tuple[int, int, int]   # PCI bus, device, function
-Sample = tuple[str, int, int]    # PDH instance name, counter status, bytes
+Sample = tuple[str, int, int]    # PDH instance name, counter status, value
 
 _PROCESSES = r"\GPU Process Memory(*)\Non Local Usage"
 _ADAPTERS = r"\GPU Adapter Memory(*)\Shared Usage"
+_ENGINES = r"\GPU Engine(*)\Running Time"   # cumulative, in 100 ns ticks
 _BUS_ID = re.compile(r"([0-9a-f]{1,8}):([0-9a-f]{1,2}):([0-9a-f]{1,2})\.([0-7])", re.I)
 # The hex in instance names is uppercase; match it either way.
 _LUID = r"luid_0x(?P<high>[0-9a-f]{1,8})_0x(?P<low>[0-9a-f]{1,8})_phys_(?P<phys>\d+)"
 _PROCESS_INSTANCE = re.compile(rf"pid_(?P<pid>\d+)_{_LUID}", re.I)
 _ADAPTER_INSTANCE = re.compile(_LUID, re.I)
+_ENGINE_INSTANCE = re.compile(rf"pid_(?P<pid>\d+)_{_LUID}_eng_\d+_engtype_.*", re.I)
 _VALID_DATA = (0, 1)  # PDH_CSTATUS_VALID_DATA, PDH_CSTATUS_NEW_DATA
+_SYSTEM_PID = 4
+_TICKS_PER_SECOND = 10_000_000
+
+PAGING_PERCENT = 5.0      # of one engine, in one interval
+PAGING_WINDOW = 10        # intervals kept
+PAGING_MIN_SECONDS = 5    # intervals before a window is judged
 
 
 def parse_bus_id(bus_id: str) -> tuple[int, Address]:
@@ -108,6 +125,145 @@ def non_local(counters: dict[str, list[Sample]], luid: int) -> NonLocal:
         {int(match["pid"]): bytes_to_mb(value) if status in _VALID_DATA else None
          for match, status, value in _instances(
              _PROCESS_INSTANCE, counters[_PROCESSES], luid)})
+
+
+@dataclass(frozen=True)
+class Paging:
+    """How busy the System process kept the adapter's engines, per interval.
+
+    WDDM's video memory manager pages allocations in and out as the System
+    process (PID 4). Measured on an RTX 3090 (#34), overcommitted VRAM kept it
+    at 5-54% of an engine in nearly every second, while loading a model or
+    filling VRAM without overcommitting it made a burst of two to four
+    seconds, and generation stayed under 4%. Paging is therefore *sustained*
+    when at least half the intervals reach :data:`PAGING_PERCENT`. This is a
+    measured correlation, not a WDDM contract: the paging engine is chosen by
+    the driver, and page-table updates and fills run there too.
+    """
+    percents: tuple[float, ...]
+
+    @property
+    def active(self) -> int:
+        return sum(percent >= PAGING_PERCENT for percent in self.percents)
+
+    @property
+    def sustained(self) -> bool:
+        return bool(self.percents) and self.active * 2 >= len(self.percents)
+
+    def summary(self) -> dict:
+        return {"sustained": self.sustained, "active_seconds": self.active,
+                "seconds": len(self.percents),
+                "peak_percent": round(max(self.percents, default=0.0), 1)}
+
+
+class PagingMonitor:
+    """Samples the System process's engine time on the selected adapter, once
+    a second, in a daemon thread. One per server.
+
+    A status call cannot measure activity by itself: paging comes in bursts,
+    and a window as long as the gap between calls averages it away. The
+    thread keeps the last :data:`PAGING_WINDOW` intervals; the first read
+    waits until :data:`PAGING_MIN_SECONDS` exist, at most once per server.
+    """
+
+    source = "wddm:pdh"
+
+    def __init__(self, index: int, *,
+                 bus_id_fn: Optional[Callable[[], Optional[str]]] = None,
+                 adapters_fn: Optional[Callable[[], list]] = None,
+                 counters: Optional["CounterReader"] = None,
+                 clock: Callable[[], float] = time.monotonic,
+                 interval: float = 1.0) -> None:
+        self.index = index
+        self._bus_id_fn = bus_id_fn or (lambda: _nvml_bus_id(index))
+        self._adapters_fn = adapters_fn or wddm_adapters
+        self._counters = counters or CounterReader((_ENGINES,))
+        self._clock = clock
+        self._interval = interval
+        self._changed = threading.Condition()
+        self._percents: deque[float] = deque(maxlen=PAGING_WINDOW)
+        self._previous: Optional[tuple[float, dict[str, int]]] = None
+        self._bus_id: Optional[str] = None
+        self._error: Optional[str] = None
+        self._sampled_at: Optional[float] = None
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        with self._changed:
+            if self._thread is None:
+                self._thread = threading.Thread(target=self._run, daemon=True,
+                                                name="vram-mcp-paging")
+                self._thread.start()
+
+    def _run(self) -> None:
+        while True:
+            self.sample()
+            time.sleep(self._interval)
+
+    def sample(self) -> None:
+        """Take one reading; the interval since the previous one joins the window."""
+        try:
+            if self._bus_id is None:
+                self._bus_id = self._bus_id_fn()
+                if self._bus_id is None:
+                    raise LookupError("NVML did not report the GPU's PCI address")
+            luid = adapter_luid(*parse_bus_id(self._bus_id), self._adapters_fn())
+            ticks = system_engine_ticks(self._counters.read(), luid)
+            error = None
+        except Exception as exc:    # anything else would end the thread unseen
+            ticks, error = None, str(exc) or type(exc).__name__
+        now = self._clock()
+        with self._changed:
+            self._sampled_at = now
+            self._error = error
+            if ticks is None:
+                self._percents.clear()      # a gap must not join two windows
+            elif self._previous is not None:
+                then, before = self._previous
+                # Engines that appear, vanish, or restart count from now on.
+                busy = sum(value - before[key] for key, value in ticks.items()
+                           if before.get(key, value + 1) <= value)
+                self._percents.append(100 * busy / _TICKS_PER_SECOND / (now - then))
+            self._previous = (now, ticks) if ticks is not None else None
+            self._changed.notify_all()
+
+    def observe(self) -> Observation[Paging]:
+        """The recent window. A sampler just started is waited for, briefly."""
+        scope = f"gpu:index={self.index}"
+        deadline = time.monotonic() + (PAGING_MIN_SECONDS + 2) * self._interval
+        with self._changed:
+            while (self._thread is not None and self._error is None
+                   and len(self._percents) < PAGING_MIN_SECONDS
+                   and time.monotonic() < deadline):
+                self._changed.wait(self._interval)
+            if self._sampled_at is None:
+                error = "the paging sampler is not running"
+            elif self._error is not None:
+                error = self._error
+            elif self._clock() - self._sampled_at > 5 * self._interval:
+                error = "the paging sampler stopped"
+            elif len(self._percents) < PAGING_MIN_SECONDS:
+                error = (f"paging history is still being collected "
+                         f"({len(self._percents)} of {PAGING_MIN_SECONDS} s)")
+            else:
+                return Observation(Paging(tuple(self._percents)), self.source, scope=scope)
+        return Observation(None, self.source, error=error, scope=scope)
+
+
+def system_engine_ticks(counters: dict[str, list[Sample]], luid: int) -> dict[str, int]:
+    """The System process's cumulative engine time on ``luid``, per engine,
+    in 100 ns ticks; LookupError when none is readable."""
+    ticks = {match.group(0): value
+             for match, status, value in _instances(_ENGINE_INSTANCE, counters[_ENGINES], luid)
+             if int(match["pid"]) == _SYSTEM_PID and status in _VALID_DATA}
+    if not ticks:
+        raise LookupError("WDDM reports no readable engine counters for the "
+                          "selected adapter")
+    return ticks
+
+
+def _nvml_bus_id(index: int) -> Optional[str]:
+    return _nvml.observe_processes(index).device
 
 
 class NonLocalMemory:
