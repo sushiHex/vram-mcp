@@ -289,6 +289,11 @@ CPU-offloaded layers. vram-mcp attributes that memory before judging spill:
   memory, any excess above a runner's explained offload, and memory no visible
   process accounts for.
 
+Two limits follow from the counters. Non-local memory includes allocations an
+application deliberately places in system memory, such as upload buffers, not
+only demoted VRAM. And a runner's demoted VRAM, up to its offload allowance, is
+indistinguishable from the offload itself.
+
 Spill is flagged when scoped unexplained memory reaches `VRAM_MCP_SPILL_MB`
 (default 256 MB) **and exceeds selected-device free VRAM**. Treat this as a
 diagnostic heuristic. On Windows, non-local memory comes from the selected

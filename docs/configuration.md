@@ -108,8 +108,8 @@ from “the source could not be queried.”
 
 Process metadata also reports whether non-local memory is covered, and when it
 is not, `gaps.non_local_memory` says why. On Windows, `non_local_memory` is
-`true` when the selected GPU's WDDM adapter is found and every listed process
-has a reading. On Linux it is `false`: no interface reports a process's GPU
+`true` when the selected GPU's WDDM adapter is found and its shared-memory
+total is read. On Linux it is `false`: no interface reports a process's GPU
 memory in system RAM ([#27](https://github.com/sushiHex/vram-mcp/issues/27)).
 Compute and graphics process-query coverage are reported separately; either
 query may be unavailable while the other's rows remain useful.
@@ -139,9 +139,10 @@ audit events remain queryable.
 
 `tight`, `degraded` and `thrashing` report from the evidence they have: each
 rests on a reading that was taken, so incomplete coverage elsewhere does not
-suppress them. `thrashing` grades the non-local memory that was read. When some
-processes had no reading, the spill figures are `null`, since they would
-understate the total, and `detail` names the amount that was observed.
+suppress them. `thrashing` grades the non-local memory that was read. Without a
+measured device total, some processes may have had no reading; the spill
+figures are then `null`, since they would understate the total, and `detail`
+names the amount that was observed.
 
 `ok` is the one verdict that asserts a negative — that nothing is wrong — so it
 requires every input it depends on, including that same non-local coverage.

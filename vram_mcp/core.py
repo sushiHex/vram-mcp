@@ -178,8 +178,9 @@ def pressure(gpus: list[dict], loaded: list[dict], process_table: list[dict],
     activity. Missing capacity cannot produce a healthy verdict.
 
     ``non_local_total_mb`` is the device's measured non-local memory, where a
-    collector reads one (WDDM does). The rows then only attribute it: whatever
-    no runner's offload explains is unexplained, whether a row saw it or not.
+    collector reads one (WDDM does), and is reported as ``non_local_mb``. The
+    rows then attribute it: whatever no runner's offload explains is
+    unexplained, whether a row saw it or not.
     """
     free_mb = gpus[0].get("free_mb") if gpus else None
     entitlements = runner_offloads or {}
@@ -198,9 +199,12 @@ def pressure(gpus: list[dict], loaded: list[dict], process_table: list[dict],
         covered = min(non_local, max(entitled, 0))
         explained_mb += covered
         unexplained_mb += non_local - covered
-    if non_local_total_mb is not None:
-        unexplained_mb = max(0, non_local_total_mb - explained_mb)
     non_local_mb = explained_mb + unexplained_mb
+    if non_local_total_mb is not None:
+        # Rows can miss memory (an unseen process) or count it twice (shared
+        # allocations), so neither view alone bounds what is unexplained.
+        unexplained_mb = max(unexplained_mb, non_local_total_mb - explained_mb)
+        non_local_mb = non_local_total_mb
     # Non-local allocation alone does not establish memory pressure.
     spilling = unexplained_mb >= spill_threshold_mb and (
         free_mb is None or unexplained_mb > free_mb

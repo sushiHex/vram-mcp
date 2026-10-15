@@ -116,8 +116,7 @@ vram-mcp reads it from WDDM ([#22](https://github.com/sushiHex/vram-mcp/issues/2
 - PDH, read directly rather than through PowerShell, returns
   `\GPU Process Memory(*)\Non Local Usage` per process and adapter. One query
   per server costs about 0.5 s to open; each read after that takes under a
-  millisecond, and still sees processes started after it opened. The
-  per-process values summed exactly to the adapter's shared usage.
+  millisecond, and still sees processes started after it opened.
 - Per-process *Dedicated* Usage is not used: Chrome's GPU process and `dwm`
   reported 488 GB and 209 GB on a 24 GB card, with valid counter status.
 - WDDM listed processes on the adapter that NVML did not, one holding 31 MB of

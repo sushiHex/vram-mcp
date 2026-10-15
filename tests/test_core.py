@@ -631,7 +631,20 @@ def test_pressure_total_below_explained_never_goes_negative():
                       non_local_total_mb=1000)
     assert p["explained_offload_mb"] == 3906
     assert p["unexplained_spill_mb"] == 0
+    assert p["non_local_mb"] == 1000      # the measurement, not the attribution
     assert p["spilling"] is False
+
+
+def test_double_counted_runner_memory_cannot_hide_another_process_spill():
+    """Two runners each report one shared 2 GiB allocation; a third process has
+    1 GiB of spill. The adapter measures 3 GiB, but the rows still see the spill."""
+    procs = [{"pid": 1, "non_local_mb": 2048}, {"pid": 2, "non_local_mb": 2048},
+             {"pid": 3, "non_local_mb": 1024}]
+    p = core.pressure([{"free_mb": 512}], [], procs,
+                      runner_offloads={1: 2048, 2: 2048}, non_local_total_mb=3072)
+    assert p["unexplained_spill_mb"] == 1024
+    assert p["non_local_mb"] == 3072
+    assert p["state"] == "thrashing"
 
 
 # ---- combined_status full wiring -------------------------------------------------
