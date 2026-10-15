@@ -79,6 +79,15 @@ def nvml_memory(device_index: int = 0, *, nvml=None) -> Optional[dict]:
     return _with_device(nvml, device_index, _query, None)
 
 
+def _pci_bus_id(nvml, handle) -> Optional[str]:
+    """The device's PCI bus ID, such as ``"00000000:2D:00.0"``; ``None`` if unknown."""
+    try:
+        bus_id = nvml.nvmlDeviceGetPciInfo(handle).busId
+        return bus_id.decode() if isinstance(bus_id, bytes) else bus_id
+    except Exception:
+        return None
+
+
 def nvml_processes(device_index: int = 0, *, nvml=None) -> list[dict]:
     """Every process holding VRAM on this GPU: compute AND graphics contexts.
 
@@ -169,7 +178,7 @@ def observe_processes(
                 scope=scope, coverage=no_coverage,
             )
         return Observation(
-            out, source, scope=scope,
+            out, source, scope=scope, device=_pci_bus_id(nvml, handle),
             coverage={
                 "compute_processes": compute_ok,
                 "graphics_processes": graphics_ok,

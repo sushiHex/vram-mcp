@@ -60,6 +60,25 @@ def test_verified_warm_canonicalizes_alias_and_encodes_indefinite_duration():
     assert session.post_calls[0]["json"]["keep_alive"] == -1
 
 
+def test_residency_changes_outwait_a_slow_load_but_connect_fast():
+    """Ollama aborts a load when its client disconnects: 0.40 on Windows took
+    over 10 s to load a 2.5 GB model, and the old read timeout killed it."""
+    session = FakeSession(get_response=FakeResponse(200, {"models": []}),
+                          post_response=FakeResponse(200, {"done": True}))
+    client = OllamaClient(session=session)
+
+    client.change_residency("llama3", 0, resident=False)
+    client.warm("llama3")
+
+    assert [call["timeout"] for call in session.post_calls] == [(10, 110)] * 2
+    assert session.get_calls[0]["timeout"] == 10
+
+
+def test_a_residency_request_ends_inside_its_operation_lease():
+    from vram_mcp import claims
+    assert OllamaClient().residency_timeout < claims._OPERATION_LEASE_SECONDS
+
+
 def test_invalid_acknowledgement_cannot_verify_keep_alive():
     session = FakeSession(
         get_response=FakeResponse(200, {"models": [{"name": "llama3:latest"}]}),

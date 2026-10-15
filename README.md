@@ -164,8 +164,9 @@ bypass an unreadable coordination ledger or another pending mutation.
 Missing required telemetry produces `pressure.state="unknown"`. Read
 `pressure.coverage` and top-level `observations` to see which evidence was
 available. Driver-spill detection is best effort and requires non-local memory
-that can be attributed to the selected GPU; adapter-aggregated Windows counters
-do not establish that. CPU offload is tracked separately. Disabling auditing
+read for the selected GPU, which vram-mcp does on Windows. On Linux no such
+reading exists, so `pressure` reads `unknown` where it would read `ok`. CPU
+offload is tracked separately. Disabling auditing
 stops history detection and trend sampling, but does not disable current GPU or
 process observations.
 

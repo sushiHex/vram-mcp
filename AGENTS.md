@@ -3,7 +3,7 @@
 ## Project Structure & Module Organization
 
 - `vram_mcp/` contains the Python package. `server.py` exposes MCP tools; `core.py` coordinates VRAM decisions. Keep MCP imports confined to `server.py`.
-- `gpu.py`, `nvml.py`, `procinfo.py`, `ollama.py`, and `ollama_correlate.py` collect and correlate GPU, process, and model data. `claims.py` manages shared claims/reservations; `audit.py` records events and samples; `_util.py` holds shared helpers.
+- `gpu.py`, `nvml.py`, `procinfo.py`, `ollama.py`, and `ollama_correlate.py` collect and correlate GPU, process, and model data. `wddm.py` reads the selected GPU's non-local memory on Windows, through ctypes. `claims.py` manages shared claims/reservations; `audit.py` records events and samples; `_util.py` holds shared helpers.
 - `tests/test_*.py` mirrors package modules. Design specifications and implementation plans live under `docs/superpowers/`. Packaging is configured in `pyproject.toml`; CI lives in `.github/workflows/ci.yml`, and publishing a GitHub Release builds, attaches, and uploads to PyPI through `.github/workflows/release.yml` (see `docs/releasing.md`).
 
 ## Build, Test, and Development Commands
@@ -26,7 +26,7 @@ Keep core logic injectable and testable. MCP tools are asynchronous; dispatch bl
 
 Use pytest with descriptive `test_<behavior>` names. Mock hardware, subprocesses, and HTTP; tests should not require a GPU or Ollama daemon. Use `tmp_path`, `monkeypatch`, and injected clocks for ledger/audit isolation; never touch live `~/.cache/vram-mcp/` files.
 
-Add regression tests for changed behavior, including unavailable telemetry and claim/reservation protection. No coverage threshold is configured. CI tests Python 3.10-3.14 on Windows and Linux, plus one job with direct dependencies at the lowest versions they resolve to. Server tests require `mcp`, as the package does: a missing or broken SDK fails them rather than skipping them.
+Add regression tests for changed behavior, including unavailable telemetry and claim/reservation protection. No coverage threshold is configured. CI tests Python 3.10-3.14 on Windows and Linux, plus one job with direct dependencies at the lowest versions they resolve to. It also runs weekly, so a dependency release that breaks us fails CI with no change here; GitHub disables that schedule after 60 days without repository activity. Server tests require `mcp`, as the package does: a missing or broken SDK fails them rather than skipping them.
 
 ## Commit & Pull Request Guidelines
 
