@@ -39,7 +39,8 @@ python acceptance/harness.py --model phi4-mini --ollama http://127.0.0.1:11434 -
 
 `--model` changes Ollama's residency, so it is refused unless `--ollama` and
 `--gpu` are also given explicitly. The harness prints a Markdown report with the
-OS, Python, package, GPU, driver and Ollama versions, and one row per scenario.
+OS, Python, package, GPU, driver and Ollama versions, on Windows whether
+hardware-accelerated GPU scheduling is on, and one row per scenario.
 It never includes process command lines. The exit status is non-zero if any
 scenario fails.
 
@@ -165,7 +166,9 @@ most about 8, after startup or a gap.
 This is a measured correlation, not a WDDM contract. The driver chooses which
 engine does the paging, and page-table updates and fills also run as the System
 process, so another workload could in principle keep that process busy without
-paging VRAM. The thresholds come from one machine.
+paging VRAM. The thresholds come from one machine, with hardware-accelerated
+GPU scheduling on; with it off, the CPU schedules the GPU's work and the signal
+is unverified ([#34](https://github.com/sushiHex/vram-mcp/issues/34)).
 
 The `--overcommit` scenarios check this on real hardware. On the validated host,
 a full but not overcommitted GPU read `tight` at 73-165 MB free. Overcommitted

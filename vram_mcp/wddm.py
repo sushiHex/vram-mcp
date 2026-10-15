@@ -37,6 +37,7 @@ import re
 import threading
 import time
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -362,6 +363,8 @@ class _FormattedItem(ctypes.Structure):     # PDH_FMT_COUNTERVALUE_ITEM_W
 
 
 _KMTQAITYPE_ADAPTERADDRESS = 6
+_KMTQAITYPE_WDDM_2_7_CAPS = 70
+_HW_SCH_ENABLED = 0x2          # D3DKMT_WDDM_2_7_CAPS.HwSchEnabled, bit 1
 _NO_PCI_ADDRESS = 0xFFFFFFFF   # the Microsoft Basic Render Driver, for one
 _PDH_FMT_LARGE = 0x00000400
 _PDH_MORE_DATA = 0x800007D2
@@ -380,32 +383,59 @@ def _check(status: int, call: str) -> None:
         raise OSError(f"{call} failed with status 0x{status & 0xFFFFFFFF:08X}")
 
 
-def wddm_adapters() -> list[tuple[int, Optional[Address]]]:
-    """Every WDDM adapter's LUID and PCI address; None where it has no address."""
+@contextmanager
+def _open_adapters():
+    """``(query, [(luid, handle), ...])`` for every WDDM adapter, open for the
+    block. ``query(handle, type, value)`` fills ``value``; False if it failed."""
     gdi32 = _library("gdi32")
     count = _EnumAdapters2(0, None)
     _check(gdi32.D3DKMTEnumAdapters2(ctypes.byref(count)), "D3DKMTEnumAdapters2")
     infos = (_AdapterInfo * count.NumAdapters)()
     request = _EnumAdapters2(count.NumAdapters, infos)
     _check(gdi32.D3DKMTEnumAdapters2(ctypes.byref(request)), "D3DKMTEnumAdapters2")
-    adapters = []
+    infos = infos[:request.NumAdapters]
+
+    def query(handle: int, kind: int, value) -> bool:
+        info_query = _QueryAdapterInfo(handle, kind,
+                                       ctypes.cast(ctypes.byref(value), ctypes.c_void_p),
+                                       ctypes.sizeof(value))
+        return gdi32.D3DKMTQueryAdapterInfo(ctypes.byref(info_query)) == 0
+
     try:
-        for info in infos[:request.NumAdapters]:
-            address = _AdapterAddress()
-            query = _QueryAdapterInfo(
-                info.hAdapter, _KMTQAITYPE_ADAPTERADDRESS,
-                ctypes.cast(ctypes.byref(address), ctypes.c_void_p),
-                ctypes.sizeof(address))
-            located = (gdi32.D3DKMTQueryAdapterInfo(ctypes.byref(query)) == 0
-                       and address.BusNumber != _NO_PCI_ADDRESS)
-            luid = (info.AdapterLuid.HighPart & 0xFFFFFFFF) << 32 | info.AdapterLuid.LowPart
-            adapters.append((luid, (address.BusNumber, address.DeviceNumber,
-                                    address.FunctionNumber) if located else None))
+        yield query, [((info.AdapterLuid.HighPart & 0xFFFFFFFF) << 32
+                       | info.AdapterLuid.LowPart, info.hAdapter) for info in infos]
     finally:
         # The enumeration opened every handle; each must be closed.
-        for info in infos[:request.NumAdapters]:
+        for info in infos:
             gdi32.D3DKMTCloseAdapter(ctypes.byref(_CloseAdapter(info.hAdapter)))
+
+
+def wddm_adapters() -> list[tuple[int, Optional[Address]]]:
+    """Every WDDM adapter's LUID and PCI address; None where it has no address."""
+    adapters = []
+    with _open_adapters() as (query, handles):
+        for luid, handle in handles:
+            address = _AdapterAddress()
+            located = (query(handle, _KMTQAITYPE_ADAPTERADDRESS, address)
+                       and address.BusNumber != _NO_PCI_ADDRESS)
+            adapters.append((luid, (address.BusNumber, address.DeviceNumber,
+                                    address.FunctionNumber) if located else None))
     return adapters
+
+
+def hardware_scheduling(bus_id: str) -> bool:
+    """Whether hardware-accelerated GPU scheduling is on for the GPU at
+    ``bus_id``. Paging was measured with it on (#34), so acceptance reports
+    record it. OSError or LookupError when it cannot be told."""
+    luid = adapter_luid(*parse_bus_id(bus_id), wddm_adapters())
+    with _open_adapters() as (query, handles):
+        for found, handle in handles:
+            if found == luid:
+                caps = ctypes.c_uint32()
+                if not query(handle, _KMTQAITYPE_WDDM_2_7_CAPS, caps):
+                    raise OSError("D3DKMTQueryAdapterInfo(WDDM_2_7_CAPS) failed")
+                return bool(caps.value & _HW_SCH_ENABLED)
+    raise LookupError("the GPU's WDDM adapter disappeared")
 
 
 class CounterReader:

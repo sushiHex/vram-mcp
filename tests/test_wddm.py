@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import sys
 
@@ -188,6 +189,41 @@ def test_the_counter_item_layout_matches_the_sdk_for_this_python():
     assert wddm._FormattedItem.FmtValue.offset == 8
     assert wddm._CounterValue.largeValue.offset == 8
     assert ctypes.sizeof(wddm._FormattedItem) == 24
+
+
+def _adapters_with_caps(monkeypatch, caps: int, ok: bool = True):
+    """Two adapters; the GPU at 01:00.0 has LUID 7 and reports ``caps``."""
+    monkeypatch.setattr(wddm, "wddm_adapters", lambda: [(5, None), (7, (1, 0, 0))])
+
+    @contextlib.contextmanager
+    def open_adapters():
+        def query(handle, kind, value):
+            assert (handle, kind) == (70, wddm._KMTQAITYPE_WDDM_2_7_CAPS)
+            value.value = caps
+            return ok
+        yield query, [(5, 50), (7, 70)]
+    monkeypatch.setattr(wddm, "_open_adapters", open_adapters)
+
+
+@pytest.mark.parametrize("caps, enabled", [(0xB, True), (0x1, False), (0x0, False)])
+def test_hardware_scheduling_reads_the_enabled_bit_of_the_selected_adapter(
+        monkeypatch, caps, enabled):
+    _adapters_with_caps(monkeypatch, caps)
+    assert wddm.hardware_scheduling("00000000:01:00.0") is enabled
+
+
+def test_hardware_scheduling_raises_when_it_cannot_be_told(monkeypatch):
+    _adapters_with_caps(monkeypatch, 0xB, ok=False)
+    with pytest.raises(OSError):
+        wddm.hardware_scheduling("00000000:01:00.0")
+    with pytest.raises(LookupError):
+        wddm.hardware_scheduling("00000000:02:00.0")
+
+
+def test_hardware_scheduling_fails_cleanly_on_any_host():
+    """A runner without the GPU, or without Windows, raises rather than guesses."""
+    with pytest.raises((OSError, LookupError)):
+        wddm.hardware_scheduling("00000000:FF:1F.7")
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows bindings")
