@@ -4,6 +4,11 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Dependencies release on their own schedule: 0.3.0 broke when pydantic
+  # did, with no change here. A weekly run finds the next one before a user does.
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
 
 jobs:
   test:
