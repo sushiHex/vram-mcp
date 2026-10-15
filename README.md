@@ -24,20 +24,20 @@ server environment to select the same device; the default is GPU index `0`.
 
 ### Connect your client
 
-With [uv](https://docs.astral.sh/uv/getting-started/installation/) and Git
-installed, choose your client below. `uvx` fetches vram-mcp from GitHub into an
-isolated environment; no source checkout is needed.
+With [uv](https://docs.astral.sh/uv/getting-started/installation/) installed,
+choose your client below. `uvx` fetches vram-mcp from PyPI into an isolated
+environment; no source checkout is needed.
 
 **[Claude Code](https://code.claude.com/docs/en/mcp):**
 
 ```sh
-claude mcp add vram --scope user -- uvx --from git+https://github.com/sushiHex/vram-mcp@v0.3.1 vram-mcp
+claude mcp add vram --scope user -- uvx vram-mcp@0.4.0
 ```
 
 **[Codex](https://learn.chatgpt.com/docs/extend/mcp?surface=cli):**
 
 ```sh
-codex mcp add vram -- uvx --from git+https://github.com/sushiHex/vram-mcp@v0.3.1 vram-mcp
+codex mcp add vram -- uvx vram-mcp@0.4.0
 ```
 
 **[Hermes](https://hermes-agent.nousresearch.com/docs/user-guide/features/mcp)** — merge into `~/.hermes/config.yaml`:
@@ -46,7 +46,7 @@ codex mcp add vram -- uvx --from git+https://github.com/sushiHex/vram-mcp@v0.3.1
 mcp_servers:
   vram:
     command: uvx
-    args: ["--from", "git+https://github.com/sushiHex/vram-mcp@v0.3.1", "vram-mcp"]
+    args: ["vram-mcp@0.4.0"]
 ```
 
 <details>
@@ -59,7 +59,7 @@ Merge this entry into your client's MCP configuration:
   "mcpServers": {
     "vram": {
       "command": "uvx",
-      "args": ["--from", "git+https://github.com/sushiHex/vram-mcp@v0.3.1", "vram-mcp"]
+      "args": ["vram-mcp@0.4.0"]
     }
   }
 }
@@ -77,6 +77,10 @@ On Windows, the MCP SDK needs `pywin32`, which has no free-threaded build. If
 Reconnect your client after registration. It launches the server over stdio;
 running `vram-mcp` by hand waits for MCP input. Prefer a local installation?
 See [installing from source](docs/configuration.md#installing-from-source).
+
+**Upgrading from 0.3?** Restart every client using vram-mcp. `pressure.spilling`
+is now `pressure.paging`, and `VRAM_MCP_SPILL_MB` is gone; see the
+[0.4.0 notes](docs/releases/v0.4.0.md).
 
 **Upgrading from 0.2?** Stop every client using vram-mcp first; old and new
 servers must never share one ledger. See the [0.3.0 notes](docs/releases/v0.3.0.md)
