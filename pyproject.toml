@@ -1,12 +1,11 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "hatch-fancy-pypi-readme>=22.4.0"]
 build-backend = "hatchling.build"
 
 [project]
 name = "vram-mcp"
-dynamic = ["version"]
+dynamic = ["version", "readme"]
 description = "MCP server to inspect and free NVIDIA GPU VRAM via Ollama + nvidia-smi."
-readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
 authors = [{ name = "sushiHex" }]
@@ -38,6 +37,18 @@ Issues = "https://github.com/sushiHex/vram-mcp/issues"
 
 [tool.hatch.version]
 path = "vram_mcp/__init__.py"
+
+# PyPI renders the README away from the repository, so its relative links are
+# made absolute there; GitHub keeps rendering the file as written.
+[tool.hatch.metadata.hooks.fancy-pypi-readme]
+content-type = "text/markdown"
+
+[[tool.hatch.metadata.hooks.fancy-pypi-readme.fragments]]
+path = "README.md"
+
+[[tool.hatch.metadata.hooks.fancy-pypi-readme.substitutions]]
+pattern = '\]\((?![a-z][a-z0-9+.-]*:|#)([^)]+)\)'
+replacement = '](https://github.com/sushiHex/vram-mcp/blob/main/\1)'
 
 [tool.hatch.build.targets.sdist]
 # Exactly the tracked project: hatch reads only this .gitignore, so anything a
