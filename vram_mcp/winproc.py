@@ -118,6 +118,7 @@ def command_line(pid: int) -> Optional[str]:
         if (not text.Length or text.Length % 2 or header + text.Length > len(buffer)
                 or not base + header <= start <= base + len(buffer) - text.Length):
             return None
-        return ctypes.wstring_at(start, text.Length // 2)
+        # UTF-16 by definition, whatever width wchar_t has where tests run.
+        return ctypes.string_at(start, text.Length).decode("utf-16-le", "replace")
     finally:
         kernel32.CloseHandle(process)
