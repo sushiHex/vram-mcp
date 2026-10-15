@@ -1,5 +1,5 @@
 """Tests for vram_mcp.procinfo — pure, injected readers."""
-from vram_mcp import procinfo
+from vram_mcp import procinfo, wddm
 from vram_mcp.observations import Observation
 
 
@@ -234,8 +234,11 @@ class FakeNonLocal:
         return self._observation
 
 
-def _usage(data):
-    return FakeNonLocal(Observation(data, "wddm"))
+def _usage(data, total=None):
+    """A reader whose adapter total defaults to the sum of the readable PIDs."""
+    if total is None:
+        total = sum(value for value in data.values() if value is not None)
+    return FakeNonLocal(Observation(wddm.NonLocal(total, data), "wddm"))
 
 
 def _nvml_rows(*rows):
@@ -335,36 +338,62 @@ def test_observe_processes_carries_device_when_nvml_unavailable():
     assert result.metadata()["device"] == bus_id
 
 
-def test_observe_processes_unreadable_unknown_pid_joins_and_uncovers():
+def test_observe_processes_unreadable_unknown_pid_joins_and_stays_covered():
     result = procinfo.observe_processes(
         platform="linux",
         nvml_observer=_nvml_rows({"pid": 100, "size_mb": 1, "kind": "compute"}),
         posix_reader=lambda pids: {},
-        non_local=_usage({100: 5, 777: None}),
+        non_local=_usage({100: 5, 777: None}, total=4096),
     )
     by_pid = {row["pid"]: row for row in result.data}
     assert by_pid[777]["kind"] == "wddm"
     assert by_pid[777]["non_local_mb"] is None
-    assert result.coverage["non_local_memory"] is False
-    assert result.gaps == {
-        "non_local_memory": "no non-local reading for PID(s) 777"}
+    # The adapter total is the measurement; a PID without a reading only
+    # lacks attribution.
+    assert result.coverage["non_local_memory"] is True
+    assert result.gaps is None
+    assert result.totals == {"non_local_mb": 4096}
 
 
-def test_observe_processes_nvml_pid_missing_from_usage_names_it_in_gap():
+def test_observe_processes_nvml_pid_missing_from_usage_keeps_coverage_and_total():
     result = procinfo.observe_processes(
         platform="linux",
         nvml_observer=_nvml_rows({"pid": 9, "size_mb": 1, "kind": "compute"},
                                  {"pid": 5, "size_mb": 1, "kind": "compute"},
                                  {"pid": 7, "size_mb": 1, "kind": "compute"}),
         posix_reader=lambda pids: {},
-        non_local=_usage({7: 64}),
+        non_local=_usage({7: 64}, total=1000),
     )
     by_pid = {row["pid"]: row for row in result.data}
     assert by_pid[5]["non_local_mb"] is None
+    assert by_pid[9]["non_local_mb"] is None
     assert by_pid[7]["non_local_mb"] == 64
-    assert result.coverage["non_local_memory"] is False
-    assert result.gaps == {
-        "non_local_memory": "no non-local reading for PID(s) 5, 9"}
+    assert result.coverage["non_local_memory"] is True
+    assert result.gaps is None
+    assert result.totals == {"non_local_mb": 1000}
+    assert result.metadata()["totals"] == {"non_local_mb": 1000}
+
+
+def test_observe_processes_total_is_the_measured_adapter_total_not_the_row_sum():
+    result = procinfo.observe_processes(
+        platform="linux",
+        nvml_observer=_nvml_rows({"pid": 100, "size_mb": 1, "kind": "compute"}),
+        posix_reader=lambda pids: {},
+        non_local=_usage({100: 10}, total=2048),
+    )
+    assert result.data[0]["non_local_mb"] == 10
+    assert result.totals == {"non_local_mb": 2048}
+
+
+def test_observe_processes_measured_zero_total_is_carried():
+    result = procinfo.observe_processes(
+        platform="linux",
+        nvml_observer=_nvml_rows({"pid": 100, "size_mb": 1, "kind": "compute"}),
+        posix_reader=lambda pids: {},
+        non_local=_usage({}, total=0),
+    )
+    assert result.totals == {"non_local_mb": 0}
+    assert result.coverage["non_local_memory"] is True
 
 
 def test_observe_processes_unavailable_reader_gap_is_its_error():
@@ -379,6 +408,8 @@ def test_observe_processes_unavailable_reader_gap_is_its_error():
     assert result.data[0]["non_local_mb"] is None
     assert result.coverage["non_local_memory"] is False
     assert result.gaps == {"non_local_memory": "PDH query failed"}
+    assert result.totals is None
+    assert "totals" not in result.metadata()
 
 
 def test_observe_processes_without_reader_gap_names_missing_collector():
@@ -390,6 +421,8 @@ def test_observe_processes_without_reader_gap_names_missing_collector():
     assert result.data[0]["non_local_mb"] is None
     assert result.coverage["non_local_memory"] is False
     assert result.gaps == {"non_local_memory": procinfo._NO_NON_LOCAL_READER}
+    assert result.totals is None
+    assert "totals" not in result.metadata()
     assert result.metadata()["gaps"] == {
         "non_local_memory": procinfo._NO_NON_LOCAL_READER}
 

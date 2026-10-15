@@ -120,10 +120,12 @@ On Windows/WDDM, NVML often cannot report per-process memory sizes. The
 process observation starts from the selected GPU's NVML PID set and reads each
 process's non-local memory from the WDDM adapter at that GPU's PCI address,
 through the `GPU Process Memory` performance counters. Other adapters' readings
-are never counted, and the adapter's own memory counter must be readable, so
-missing permissions read as unavailable rather than as no processes. Every
-process WDDM reports on the adapter is in the table; one NVML did not list
-appears with `kind: "wddm"`. The counter query opens once per server, which
+are never counted. The adapter's own shared-memory total is the measurement,
+reported as `totals.non_local_mb`; per-process readings only attribute it, so
+memory no visible process accounts for still counts, and an adapter whose
+counter cannot be read is unavailable rather than idle. Every process WDDM
+reports on the adapter is in the table; one NVML did not list appears with
+`kind: "wddm"`. The counter query opens once per server, which
 takes about half a second on the first status call; later reads take well
 under a millisecond. The observation's `device` is the GPU's PCI address, from
 the same NVML session as its processes. One bounded `Win32_Process`

@@ -21,6 +21,8 @@ class Observation(Generic[T]):
     coverage: dict[str, bool] | None = None
     # Why each uncovered input is missing, keyed like ``coverage``.
     gaps: dict[str, str] | None = None
+    # Device-wide measurements that rows only attribute, such as non_local_mb.
+    totals: dict[str, int] | None = None
 
     @property
     def known(self) -> bool:
@@ -38,4 +40,6 @@ class Observation(Generic[T]):
             result["coverage"] = self.coverage
         if self.gaps:
             result["gaps"] = self.gaps
+        if self.totals:
+            result["totals"] = self.totals
         return result

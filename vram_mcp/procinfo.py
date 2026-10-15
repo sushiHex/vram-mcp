@@ -188,24 +188,24 @@ def observe_processes(
             scope=scope, device=device, coverage=coverage,
         )
     usage = non_local.observe(device) if non_local is not None else None
+    measured = usage.data if usage is not None and usage.known else None
     rows = _enrich_processes(
         nvml_observation.data or [], platform=platform,
         win_gpu_reader=win_gpu_reader, posix_reader=posix_reader,
-        non_local=usage.data if usage is not None and usage.known else None,
+        non_local=measured.by_pid if measured is not None else None,
     )
-    if usage is None:
+    if measured is not None:
+        gap = None
+    elif usage is None:
         gap = _NO_NON_LOCAL_READER
-    elif not usage.known:
-        gap = usage.error or "non-local memory reading failed"
     else:
-        unread = sorted(row["pid"] for row in rows if row["non_local_mb"] is None)
-        gap = (f"no non-local reading for PID(s) {', '.join(map(str, unread))}"
-               if unread else None)
+        gap = usage.error or "non-local memory reading failed"
     coverage["non_local_memory"] = gap is None
     return Observation(
         rows, source, observed_at=nvml_observation.observed_at, scope=scope,
         device=device, coverage=coverage,
         gaps={"non_local_memory": gap} if gap else None,
+        totals={"non_local_mb": measured.total_mb} if measured is not None else None,
     )
 
 

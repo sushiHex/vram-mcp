@@ -74,32 +74,43 @@ def test_only_the_selected_adapter_is_attributed():
     reading = reader.observe(_BUS_ID)
 
     assert reading.known
-    assert reading.data == {10: 300, 13: 2}
+    assert reading.data.by_pid == {10: 300, 13: 2}
     assert reading.source == "wddm:pdh"
     assert reading.scope == "gpu:index=0"
+
+
+def test_the_total_is_the_adapters_including_memory_no_process_accounts_for():
+    reader, _ = _reader(_counters(
+        [(_process(10, _SELECTED), 0, 300 * _MB)],
+        [(_luid(_SELECTED), 0, 2348 * _MB), (_luid(_OTHER), 0, 9000 * _MB)]))
+
+    reading = reader.observe(_BUS_ID).data
+
+    assert reading.total_mb == 2348
+    assert reading.by_pid == {10: 300}
 
 
 def test_lowercase_instance_names_match_too():
     reader, _ = _reader(_counters([(_process(10, _SELECTED).lower(), 0, 64 * _MB)],
                                   [(_luid(_SELECTED).lower(), 0, 0)]))
-    assert reader.observe(_BUS_ID).data == {10: 64}
+    assert reader.observe(_BUS_ID).data.by_pid == {10: 64}
 
 
 def test_an_unreadable_instance_is_unknown_not_zero():
     reader, _ = _reader(_counters([(_process(10, _SELECTED), 0xC0000BC6, 0)]))
-    assert reader.observe(_BUS_ID).data == {10: None}
+    assert reader.observe(_BUS_ID).data.by_pid == {10: None}
 
 
 def test_unrelated_instance_names_are_ignored():
     reader, _ = _reader(_counters([("_Total", 0, 7 * _MB), (_process(10, _SELECTED), 0, 0)]))
-    assert reader.observe(_BUS_ID).data == {10: 0}
+    assert reader.observe(_BUS_ID).data.by_pid == {10: 0}
 
 
 def test_an_adapter_with_no_processes_reads_as_empty():
     reader, _ = _reader(_counters([(_process(11, _OTHER), 0, _MB)]))
     reading = reader.observe(_BUS_ID)
     assert reading.known
-    assert reading.data == {}
+    assert reading.data.by_pid == {}
 
 
 @pytest.mark.parametrize("adapter_samples", [
@@ -125,8 +136,8 @@ def test_the_luid_is_resolved_on_every_read():
                         _visible(_SELECTED, updated))
     reader, calls = _reader(samples, adapters=lambda: next(tables))
 
-    assert reader.observe(_BUS_ID).data == {10: 1}
-    assert reader.observe(_BUS_ID).data == {10: 2}
+    assert reader.observe(_BUS_ID).data.by_pid == {10: 1}
+    assert reader.observe(_BUS_ID).data.by_pid == {10: 2}
     assert calls == ["adapters", "adapters"]
 
 

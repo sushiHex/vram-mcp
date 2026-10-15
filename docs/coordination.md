@@ -282,11 +282,12 @@ from a partial process inventory.
 On Windows/WDDM, a runner's non-local memory can include deliberately
 CPU-offloaded layers. vram-mcp attributes that memory before judging spill:
 
-- `non_local_mb`: raw total reported by the process table.
+- `non_local_mb`: the selected adapter's measured total.
 - `explained_offload_mb`: memory attributable to Ollama's deliberate CPU offload,
   capped per correlated runner at `total_size_mb - size_vram_mb`.
 - `unexplained_spill_mb`: the remainder, including other processes' non-local
-  memory and any excess above a runner's explained offload.
+  memory, any excess above a runner's explained offload, and memory no visible
+  process accounts for.
 
 Spill is flagged when scoped unexplained memory reaches `VRAM_MCP_SPILL_MB`
 (default 256 MB) **and exceeds selected-device free VRAM**. Treat this as a

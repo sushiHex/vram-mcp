@@ -5,10 +5,10 @@ do, per process AND per adapter: each ``\\GPU Process Memory(*)\\Non Local
 Usage`` instance is named ``pid_<pid>_luid_0x<high>_0x<low>_phys_<n>``. The
 NVML device is matched to its WDDM adapter by PCI address, which
 ``D3DKMTQueryAdapterInfo`` reports for every adapter, so only the selected
-GPU's instances are counted. The adapter's own ``\\GPU Adapter Memory`` instance
-must be readable too: it proves the counters are visible to this process and
-the LUID is current, so an empty process list means no processes, never no
-access.
+GPU's instances are counted. The measurement is the adapter's own ``\\GPU
+Adapter Memory(*)\\Shared Usage``; per-process readings only attribute it, so
+memory that no visible process accounts for still counts, and an adapter whose
+counter cannot be read is unavailable rather than idle.
 
 Costs measured on an RTX 3090 (#22) set the shape. Listing adapters takes
 ~0.03 ms, so the LUID is resolved on every read: it changed across a driver
@@ -29,6 +29,7 @@ from __future__ import annotations
 import ctypes
 import re
 import threading
+from dataclasses import dataclass
 from typing import Callable, Optional
 
 from ._util import bytes_to_mb
@@ -80,23 +81,37 @@ def _instances(pattern: re.Pattern, samples: list[Sample], luid: int):
             yield match, status, value
 
 
-def non_local_by_pid(counters: dict[str, list[Sample]],
-                     luid: int) -> dict[int, Optional[int]]:
-    """Non-local MB per process on adapter ``luid``; None where unreadable."""
+@dataclass(frozen=True)
+class NonLocal:
+    """The adapter's non-local memory, and the share each process accounts for.
+
+    ``total_mb`` is the measurement; ``by_pid`` only attributes it (None where a
+    process's reading was invalid). Memory no process accounts for, such as
+    the kernel's or that of a process this reader cannot see, is in the total.
+    """
+    total_mb: int
+    by_pid: dict[int, Optional[int]]
+
+
+def non_local(counters: dict[str, list[Sample]], luid: int) -> NonLocal:
+    """Adapter ``luid``'s non-local memory; LookupError when it cannot be read."""
     adapter = list(_instances(_ADAPTER_INSTANCE, counters[_ADAPTERS], luid))
     if any(int(match["phys"]) != 0 for match, _, _ in adapter):
         raise LookupError("the GPU belongs to a linked adapter, whose physical "
                           "GPUs these counters cannot tell apart")
-    if not any(status in _VALID_DATA for _, status, _ in adapter):
+    total = [value for _, status, value in adapter if status in _VALID_DATA]
+    if not total:
         raise LookupError("WDDM reports no readable memory counters for the "
                           "selected adapter")
-    return {int(match["pid"]): bytes_to_mb(value) if status in _VALID_DATA else None
-            for match, status, value in _instances(
-                _PROCESS_INSTANCE, counters[_PROCESSES], luid)}
+    return NonLocal(
+        bytes_to_mb(total[0]),
+        {int(match["pid"]): bytes_to_mb(value) if status in _VALID_DATA else None
+         for match, status, value in _instances(
+             _PROCESS_INSTANCE, counters[_PROCESSES], luid)})
 
 
 class NonLocalMemory:
-    """The selected GPU's non-local memory per process. One per server."""
+    """The selected GPU's non-local memory. One per server."""
 
     source = "wddm:pdh"
 
@@ -107,7 +122,7 @@ class NonLocalMemory:
         self._adapters_fn = adapters_fn or wddm_adapters
         self._counters = counters or CounterReader((_PROCESSES, _ADAPTERS))
 
-    def observe(self, bus_id: Optional[str]) -> Observation[dict[int, Optional[int]]]:
+    def observe(self, bus_id: Optional[str]) -> Observation[NonLocal]:
         """Read the adapter at ``bus_id``: NVML's PCI address for the GPU, from
         the same reading as its processes, so both describe one device."""
         scope = f"gpu:index={self.index}"
@@ -115,7 +130,7 @@ class NonLocalMemory:
             if bus_id is None:
                 raise LookupError("NVML did not report the GPU's PCI address")
             luid = adapter_luid(*parse_bus_id(bus_id), self._adapters_fn())
-            usage = non_local_by_pid(self._counters.read(), luid)
+            usage = non_local(self._counters.read(), luid)
         except (LookupError, OSError, ValueError) as exc:
             return Observation(None, self.source, error=str(exc), scope=scope)
         return Observation(usage, self.source, scope=scope)
