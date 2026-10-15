@@ -7,7 +7,9 @@ it PowerShell starting (#31). One Toolhelp snapshot names every process in
 Both need only ``PROCESS_QUERY_LIMITED_INFORMATION``, so a non-elevated server
 reads its own user's processes, Ollama's runners among them. Where Windows
 denies even that, such as for ``dwm.exe``, the name still comes from the
-snapshot and the command line is None; CIM returned none for those either.
+snapshot and the command line is None. On the validated machine (RTX 3090
+host, non-elevated) CIM named every GPU process this named, and the only one
+without a command line, ``dwm.exe``, had none from CIM either.
 
 Windows is reached on first use, so this module imports everywhere.
 """
@@ -22,6 +24,7 @@ _INVALID_HANDLE = ctypes.c_void_p(-1).value
 _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 _PROCESS_COMMAND_LINE_INFORMATION = 60   # PROCESSINFOCLASS, Windows 8.1+
 _STATUS_INFO_LENGTH_MISMATCH = 0xC0000004
+_ERROR_NO_MORE_FILES = 18
 
 
 class _ProcessEntry(ctypes.Structure):      # PROCESSENTRY32W
@@ -79,6 +82,9 @@ def process_names() -> dict[int, str]:
         while found:
             names[entry.th32ProcessID] = entry.szExeFile
             found = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+        error = ctypes.get_last_error()
+        if error != _ERROR_NO_MORE_FILES:
+            raise OSError(f"Process32NextW stopped early: error {error}")
         return names
     finally:
         kernel32.CloseHandle(snapshot)
@@ -96,12 +102,22 @@ def command_line(pid: int) -> Optional[str]:
             process, _PROCESS_COMMAND_LINE_INFORMATION, None, 0, ctypes.byref(size))
         if status != _STATUS_INFO_LENGTH_MISMATCH or not size.value:
             return None
-        buffer = ctypes.create_string_buffer(size.value)
-        if ntdll.NtQueryInformationProcess(
-                process, _PROCESS_COMMAND_LINE_INFORMATION, buffer, size,
-                ctypes.byref(size)):
+        for _ in range(3):      # the command line can grow between calls
+            buffer = ctypes.create_string_buffer(size.value)
+            status = ntdll.NtQueryInformationProcess(
+                process, _PROCESS_COMMAND_LINE_INFORMATION, buffer, len(buffer),
+                ctypes.byref(size))
+            if status != _STATUS_INFO_LENGTH_MISMATCH or not size.value:
+                break
+        if status:
             return None
         text = _UnicodeString.from_buffer(buffer)
-        return ctypes.wstring_at(text.Buffer, text.Length // 2) if text.Length else None
+        base = ctypes.addressof(buffer)
+        header = ctypes.sizeof(text)
+        start = text.Buffer or 0
+        if (not text.Length or text.Length % 2 or header + text.Length > len(buffer)
+                or not base + header <= start <= base + len(buffer) - text.Length):
+            return None
+        return ctypes.wstring_at(start, text.Length // 2)
     finally:
         kernel32.CloseHandle(process)
