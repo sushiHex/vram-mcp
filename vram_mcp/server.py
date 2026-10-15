@@ -21,10 +21,11 @@ import re
 import sys
 
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional, get_args, get_origin, get_type_hints
+from typing import Annotated, Any, Optional, get_args, get_origin, get_type_hints
 
 import anyio.to_thread
 from mcp.server.fastmcp import FastMCP
+from pydantic import Field
 
 from . import __version__
 from . import claims as _claims
@@ -72,6 +73,11 @@ _SAMPLE_SECONDS = _numeric_env("VRAM_MCP_SAMPLE_SECONDS", 60)
 # trend() output lands in an agent's context window, so the raw rows are capped
 # even though the SUMMARY is always computed over every row in the window.
 _TREND_SAMPLE_CAP = 200
+# vram_status() output lands there too, and a desktop's process table is mostly
+# command lines: 71% of a 46-row table on the validated machine, where a
+# Chromium GPU process alone carries over 1,000 characters of flags. The first
+# 160 still name the program and, for Chromium, its process type.
+_CMDLINE_CHARS = 160
 _GPU_INDEX = _numeric_env("VRAM_MCP_GPU_INDEX", 0, whole=True, allow_zero=True)
 
 
@@ -258,9 +264,37 @@ async def _in_thread(fn, *args, **kwargs):
 
 # ── status tools ─────────────────────────────────────────────────────────────
 
-def _vram_status_impl() -> dict:
+def _cap_cmdlines(rows: list[dict] | None, chars: int | None) -> list[dict] | None:
+    """Rows with each command line cut to its first ``chars`` characters plus "…".
+
+    ``None`` keeps them whole. ``0`` removes the field instead of nulling it,
+    because ``cmdline: null`` already means the command line could not be read.
+    """
+    if rows is None or chars is None:
+        return rows
+    capped = []
+    for row in rows:
+        row = dict(row)
+        cmdline = row.get("cmdline")
+        if chars == 0:
+            row.pop("cmdline", None)
+        elif isinstance(cmdline, str) and len(cmdline) > chars:
+            row["cmdline"] = cmdline[:chars] + "…"
+        capped.append(row)
+    return capped
+
+
+def _vram_status_impl(cmdline_chars: int | None = _CMDLINE_CHARS) -> dict:
+    if cmdline_chars is not None and (not isinstance(cmdline_chars, int)
+                                      or isinstance(cmdline_chars, bool) or cmdline_chars < 0):
+        return {"ok": False, "outcome": "refused",
+                "summary": "cmdline_chars must be a non-negative integer, or null for whole command lines"}
     status = _full_status()
+    # Detection and audit labels read the whole command lines; only the
+    # returned view is capped.
     _run_detection(status)
+    if "other_processes" in status:
+        status["other_processes"] = _cap_cmdlines(status["other_processes"], cmdline_chars)
     n_gpu = len(status["gpus"])
     n_loaded = len(status["loaded"]) if status["loaded"] is not None else "unknown"
     p = status.get("pressure") or {}
@@ -285,15 +319,23 @@ def _vram_status_impl() -> dict:
 
 
 @mcp.tool()
-async def vram_status() -> dict:
+async def vram_status(
+    # Strict, so the SDK refuses true/false and "160" instead of coercing them
+    # to 1, 0 and 160.
+    cmdline_chars: Annotated[int | None, Field(ge=0, strict=True)] = _CMDLINE_CHARS,
+) -> dict:
     """Report the selected GPU and server-wide Ollama model residency.
 
     Includes device identity, source health/timestamps/coverage, claims, recent
     GPU activity, and pressure (ok|tight|degraded|thrashing|unknown). Unavailable
     residency is null; unavailable telemetry never establishes an empty or
     healthy GPU. ``thrashing`` means the driver was measured paging VRAM.
+
+    Each ``other_processes`` command line is cut to its first ``cmdline_chars``
+    characters (default 160), ending in "…" when cut. ``0`` omits the field;
+    ``null`` returns command lines whole.
     """
-    return await _in_thread(_vram_status_impl)
+    return await _in_thread(_vram_status_impl, cmdline_chars)
 
 
 def _list_loaded_impl() -> dict:

@@ -8,6 +8,7 @@ the real ``~/.cache/vram-mcp`` files.
 import json
 
 import pytest
+from pydantic import ValidationError
 
 from vram_mcp import core, server, wddm
 from vram_mcp.observations import Observation
@@ -243,6 +244,98 @@ def test_summary_names_an_unreadable_ledger_with_nothing_loaded(monkeypatch, imp
     assert "Coordination unavailable: claim ledger" in status["summary"]
     assert f"protocol {server._claims._PROTOCOL + 1}" in status["summary"]
     assert ".." not in status["summary"]
+
+
+# ---- vram_status cmdline_chars ---------------------------------------------
+
+def _stub_full_status(monkeypatch, rows, detection_seen=None):
+    """Make _full_status return a fixed payload; record what detection sees."""
+    status = {"gpus": [], "loaded": [], "free_mb": 20000, "pressure": {},
+              "observations": {}, "other_processes": rows}
+    monkeypatch.setattr(server, "_full_status", lambda: status)
+    monkeypatch.setattr(
+        server, "_run_detection",
+        lambda s: detection_seen is not None and detection_seen.append(
+            [dict(r) for r in s["other_processes"]]))
+    return status
+
+
+def test_cmdline_default_cap_cuts_long_lines_and_keeps_short_and_null(monkeypatch):
+    n = server._CMDLINE_CHARS
+    rows = [{"pid": 1, "cmdline": "a" * (n + 1)},
+            {"pid": 2, "cmdline": "b" * n},
+            {"pid": 3, "cmdline": "short"},
+            {"pid": 4, "cmdline": None}]
+    _stub_full_status(monkeypatch, rows)
+    out = server._vram_status_impl()["other_processes"]
+    assert out[0]["cmdline"] == "a" * n + "…"
+    assert out[1]["cmdline"] == "b" * n
+    assert out[2]["cmdline"] == "short"
+    assert out[3]["cmdline"] is None
+
+
+def test_cmdline_chars_none_returns_lines_whole(monkeypatch):
+    long = "x" * 1000
+    _stub_full_status(monkeypatch, [{"pid": 1, "cmdline": long}])
+    out = server._vram_status_impl(cmdline_chars=None)["other_processes"]
+    assert out[0]["cmdline"] == long
+
+
+def test_cmdline_chars_zero_removes_the_key_rather_than_nulling_it(monkeypatch):
+    """`cmdline: null` already means "could not be read"."""
+    _stub_full_status(monkeypatch, [{"pid": 1, "cmdline": "abc"},
+                                    {"pid": 2, "cmdline": None}])
+    out = server._vram_status_impl(cmdline_chars=0)["other_processes"]
+    assert all("cmdline" not in row for row in out)
+    assert [row["pid"] for row in out] == [1, 2]
+
+
+def test_cmdline_cap_does_not_mutate_the_source_rows(monkeypatch):
+    rows = [{"pid": 1, "cmdline": "y" * 50}]
+    _stub_full_status(monkeypatch, rows)
+    server._vram_status_impl(cmdline_chars=5)
+    server._vram_status_impl(cmdline_chars=0)
+    assert rows == [{"pid": 1, "cmdline": "y" * 50}]
+
+
+@pytest.mark.parametrize("chars", [160, 0, None])
+def test_unavailable_process_reading_stays_none_not_empty(monkeypatch, chars):
+    _stub_full_status(monkeypatch, None)
+    assert server._vram_status_impl(cmdline_chars=chars)["other_processes"] is None
+
+
+def test_detection_sees_whole_command_lines_before_capping(monkeypatch):
+    seen = []
+    _stub_full_status(monkeypatch, [{"pid": 1, "cmdline": "z" * 500}], seen)
+    out = server._vram_status_impl(cmdline_chars=10)
+    assert seen == [[{"pid": 1, "cmdline": "z" * 500}]]
+    assert out["other_processes"][0]["cmdline"] == "z" * 10 + "…"
+
+
+@pytest.mark.parametrize("bad", [-1, True, False, 1.5, 160.0, "160"])
+def test_sdk_rejects_cmdline_chars_it_would_otherwise_coerce(bad):
+    """Lax validation turns true into 1 and "160" into 160 before the tool runs."""
+    metadata = server.mcp._tool_manager.get_tool("vram_status").fn_metadata
+    with pytest.raises(ValidationError):
+        metadata.arg_model.model_validate({"cmdline_chars": bad})
+
+
+@pytest.mark.parametrize("good", [0, 160, None])
+def test_sdk_accepts_cmdline_chars(good):
+    metadata = server.mcp._tool_manager.get_tool("vram_status").fn_metadata
+    args = metadata.arg_model.model_validate({"cmdline_chars": good})
+    assert args.model_dump_one_level() == {"cmdline_chars": good}
+
+
+@pytest.mark.parametrize("bad", [-1, True, False, 1.5, "160"])
+def test_invalid_cmdline_chars_is_refused_without_collecting_status(monkeypatch, bad):
+    def boom():
+        raise AssertionError("_full_status must not run")
+    monkeypatch.setattr(server, "_full_status", boom)
+    result = server._vram_status_impl(cmdline_chars=bad)
+    assert result["ok"] is False
+    assert result["outcome"] == "refused"
+    assert result["summary"]
 
 
 # ---- warm() admission ------------------------------------------------------
