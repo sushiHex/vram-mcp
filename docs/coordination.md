@@ -282,20 +282,28 @@ from a partial process inventory.
 On Windows/WDDM, a runner's non-local memory can include deliberately
 CPU-offloaded layers. vram-mcp attributes that memory before judging spill:
 
-- `non_local_mb`: raw total reported by the process table.
+- `non_local_mb`: the selected adapter's measured total.
 - `explained_offload_mb`: memory attributable to Ollama's deliberate CPU offload,
   capped per correlated runner at `total_size_mb - size_vram_mb`.
 - `unexplained_spill_mb`: the remainder, including other processes' non-local
-  memory and any excess above a runner's explained offload.
+  memory, any excess above a runner's explained offload, and memory no visible
+  process accounts for.
+
+Two limits follow from the counters. Non-local memory includes allocations an
+application deliberately places in system memory, such as upload buffers, not
+only demoted VRAM. And a runner's demoted VRAM, up to its offload allowance, is
+indistinguishable from the offload itself.
 
 Spill is flagged when scoped unexplained memory reaches `VRAM_MCP_SPILL_MB`
 (default 256 MB) **and exceeds selected-device free VRAM**. Treat this as a
-diagnostic heuristic. Current NVML process telemetry does not expose non-local
-memory, and Windows performance counters aggregate adapters; their totals are
-therefore not assigned to the selected GPU. When
+diagnostic heuristic. On Windows, non-local memory comes from the selected
+GPU's own WDDM adapter, so other GPUs' memory never counts. Linux has no such
+reading, so spill stays unknown there
+([#27](https://github.com/sushiHex/vram-mcp/issues/27)). When
 `pressure.coverage.non_local_memory=false`, driver spill is unknown rather than
-zero. A partially CPU-offloaded model can still read `degraded` without evidence
-of driver paging.
+zero, and the process observation's `gaps.non_local_memory` says why. A
+partially CPU-offloaded model can still read `degraded` without evidence of
+driver paging.
 
 ### History
 

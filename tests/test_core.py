@@ -492,6 +492,161 @@ def test_ok_survives_when_every_requirement_is_covered():
     assert status["pressure"]["coverage"]["non_local_memory"] is True
 
 
+def test_ok_withheld_detail_carries_the_process_gap():
+    status = core.combined_status(
+        lambda: GPUS_OK, FakeOllama([]),
+        procinfo_fn=lambda: Observation(
+            [], "procs", coverage={"non_local_memory": False},
+            gaps={"non_local_memory": "no non-local reading for PID(s) 5, 9"}),
+    )
+    assert status["pressure"]["state"] == "unknown"
+    assert status["pressure"]["detail"] == (
+        "Non-local memory is unavailable; driver spill cannot be ruled out "
+        "(no non-local reading for PID(s) 5, 9).")
+
+
+def test_ok_withheld_detail_without_gap_has_no_parentheses():
+    status = core.combined_status(
+        lambda: GPUS_OK, FakeOllama([]), procinfo_fn=_blind_to_non_local(),
+    )
+    assert status["pressure"]["detail"] == (
+        "Non-local memory is unavailable; driver spill cannot be ruled out.")
+
+
+def test_ok_with_full_coverage_and_integer_non_local_readings():
+    status = core.combined_status(
+        lambda: GPUS_OK, FakeOllama([]),
+        procinfo_fn=lambda: Observation(
+            [{"pid": 100, "size_mb": None, "non_local_mb": 40, "kind": "compute"},
+             {"pid": 900, "size_mb": None, "non_local_mb": 0, "kind": "wddm"}],
+            "procs", coverage={"non_local_memory": True}),
+    )
+    assert status["pressure"]["state"] == "ok"
+
+
+def test_thrashing_from_unexplained_wddm_row_exceeding_free_vram():
+    status = core.combined_status(
+        lambda: GPUS_TIGHT, FakeOllama([]),
+        procinfo_fn=lambda: Observation(
+            [{"pid": 900, "size_mb": None, "non_local_mb": 2048, "kind": "wddm"}],
+            "procs", coverage={"non_local_memory": True}),
+    )
+    pressure = status["pressure"]
+    assert pressure["state"] == "thrashing"
+    assert pressure["unexplained_spill_mb"] == 2048
+    assert pressure["spilling"] is True
+
+
+def test_wddm_row_below_free_vram_is_not_thrashing():
+    status = core.combined_status(
+        lambda: GPUS_OK, FakeOllama([]),
+        procinfo_fn=lambda: Observation(
+            [{"pid": 900, "size_mb": None, "non_local_mb": 2048, "kind": "wddm"}],
+            "procs", coverage={"non_local_memory": True}),
+    )
+    assert status["pressure"]["state"] == "ok"
+    assert status["pressure"]["spilling"] is False
+
+
+# ---- a measured adapter total: rows only attribute it ------------------------
+
+def _with_total(rows, total_mb, *, coverage=None):
+    return lambda: Observation(
+        list(rows), "procs", coverage=coverage or {"non_local_memory": True},
+        totals={"non_local_mb": total_mb})
+
+
+def test_memory_no_row_accounts_for_is_unexplained_spill():
+    status = core.combined_status(
+        gpu_fn_const(1000), FakeOllama([]),
+        procinfo_fn=_with_total(
+            [{"pid": 900, "size_mb": None, "non_local_mb": 10, "kind": "wddm"}],
+            2048),
+    )
+    p = status["pressure"]
+    assert p["unexplained_spill_mb"] == 2048      # the total, not the 10 MB rows
+    assert p["non_local_mb"] == 2048
+    assert p["spilling"] is True
+    assert p["state"] == "thrashing"
+
+
+def test_hidden_memory_with_room_to_spare_is_ok_and_covered():
+    status = core.combined_status(
+        gpu_fn_const(20000), FakeOllama([]),
+        procinfo_fn=_with_total(
+            [{"pid": 900, "size_mb": None, "non_local_mb": 10, "kind": "wddm"}],
+            2048),
+    )
+    p = status["pressure"]
+    assert p["state"] == "ok"
+    assert p["spilling"] is False
+    assert p["unexplained_spill_mb"] == 2048       # reported, just not alarming
+    assert p["coverage"]["non_local_memory"] is True
+
+
+def test_row_without_reading_is_covered_when_the_adapter_total_is_known():
+    status = core.combined_status(
+        gpu_fn_const(20000), FakeOllama([]),
+        procinfo_fn=_with_total(
+            [{"pid": 900, "size_mb": None, "non_local_mb": None, "kind": "wddm"}],
+            0),
+    )
+    assert status["pressure"]["coverage"]["non_local_memory"] is True
+    assert status["pressure"]["state"] == "ok"
+
+
+def test_row_without_reading_and_no_total_is_still_unknown():
+    status = core.combined_status(
+        gpu_fn_const(20000), FakeOllama([]),
+        procinfo_fn=lambda: Observation(
+            [{"pid": 900, "size_mb": None, "non_local_mb": None, "kind": "wddm"}],
+            "procs", coverage={"non_local_memory": True}),
+    )
+    assert status["pressure"]["coverage"]["non_local_memory"] is False
+    assert status["pressure"]["state"] == "unknown"
+
+
+def test_runner_offload_is_still_explained_under_a_total():
+    models = [{"name": "m", "size": 13000 * _MB, "size_vram": 10000 * _MB}]
+    status = core.combined_status(
+        gpu_fn_const(500), FakeOllama(models),
+        snapshot_fn=lambda correlate: _snap(pid_map={"m": 999}),
+        procinfo_fn=_with_total(
+            [{"pid": 999, "size_mb": 10000, "non_local_mb": 3000,
+              "kind": "compute"}], 3010),
+    )
+    p = status["pressure"]
+    assert p["explained_offload_mb"] == 3000
+    assert p["unexplained_spill_mb"] == 10
+    assert p["non_local_mb"] == 3010
+    assert p["spilling"] is False
+    assert p["state"] != "thrashing"
+
+
+def test_pressure_total_below_explained_never_goes_negative():
+    """Rows that double-count (or a stale total) must not yield negative spill."""
+    procs = [{"pid": RUNNER_PID, "size_mb": 22371, "non_local_mb": 3906}]
+    p = core.pressure(GPUS_TIGHT, [_offloaded_model()], procs,
+                      runner_offloads={RUNNER_PID: QWEN_OFFLOAD_MB},
+                      non_local_total_mb=1000)
+    assert p["explained_offload_mb"] == 3906
+    assert p["unexplained_spill_mb"] == 0
+    assert p["non_local_mb"] == 1000      # the measurement, not the attribution
+    assert p["spilling"] is False
+
+
+def test_double_counted_runner_memory_cannot_hide_another_process_spill():
+    """Two runners each report one shared 2 GiB allocation; a third process has
+    1 GiB of spill. The adapter measures 3 GiB, but the rows still see the spill."""
+    procs = [{"pid": 1, "non_local_mb": 2048}, {"pid": 2, "non_local_mb": 2048},
+             {"pid": 3, "non_local_mb": 1024}]
+    p = core.pressure([{"free_mb": 512}], [], procs,
+                      runner_offloads={1: 2048, 2: 2048}, non_local_total_mb=3072)
+    assert p["unexplained_spill_mb"] == 1024
+    assert p["non_local_mb"] == 3072
+    assert p["state"] == "thrashing"
+
+
 # ---- combined_status full wiring -------------------------------------------------
 
 def test_combined_status_full_wiring():

@@ -24,11 +24,11 @@ TIGHT_MB = 1024
 # the first unmet requirement is the one reported, so the reason names the
 # evidence nearest the reader rather than an arbitrary one. A new input that
 # `ok` relies on is a line here, not another branch.
-_OK_REQUIRES = (
-    ("models", "Ollama residency is unavailable."),
-    ("non_local_memory",
-     "Non-local memory is unavailable; driver spill cannot be ruled out."),
-)
+_OK_REQUIRES = {
+    "models": "Ollama residency is unavailable",
+    "non_local_memory":
+        "Non-local memory is unavailable; driver spill cannot be ruled out",
+}
 
 
 def observe_loaded(ollama) -> Observation[list[dict]]:
@@ -168,6 +168,7 @@ def runner_offloads(loaded: list[dict], snap: Snapshot) -> dict[int, int]:
 
 def pressure(gpus: list[dict], loaded: list[dict], process_table: list[dict],
              *, runner_offloads: Optional[dict] = None,
+             non_local_total_mb: Optional[int] = None,
              spill_threshold_mb: int = SPILL_THRESHOLD_MB,
              tight_mb: int = TIGHT_MB) -> dict:
     """Assess one selected GPU using the available capacity and residency data.
@@ -175,6 +176,11 @@ def pressure(gpus: list[dict], loaded: list[dict], process_table: list[dict],
     Non-local memory beyond known CPU offload, exceeding both the noise floor
     and free VRAM, suggests paging. This is a heuristic, not proof of driver
     activity. Missing capacity cannot produce a healthy verdict.
+
+    ``non_local_total_mb`` is the device's measured non-local memory, where a
+    collector reads one (WDDM does), and is reported as ``non_local_mb``. The
+    rows then attribute it: whatever no runner's offload explains is
+    unexplained, whether a row saw it or not.
     """
     free_mb = gpus[0].get("free_mb") if gpus else None
     entitlements = runner_offloads or {}
@@ -194,6 +200,11 @@ def pressure(gpus: list[dict], loaded: list[dict], process_table: list[dict],
         explained_mb += covered
         unexplained_mb += non_local - covered
     non_local_mb = explained_mb + unexplained_mb
+    if non_local_total_mb is not None:
+        # Rows can miss memory (an unseen process) or count it twice (shared
+        # allocations), so neither view alone bounds what is unexplained.
+        unexplained_mb = max(unexplained_mb, non_local_total_mb - explained_mb)
+        non_local_mb = non_local_total_mb
     # Non-local allocation alone does not establish memory pressure.
     spilling = unexplained_mb >= spill_threshold_mb and (
         free_mb is None or unexplained_mb > free_mb
@@ -294,9 +305,8 @@ def combined_status(
         "scope": gpu_reading.scope,
     }
     source = procinfo_fn if procinfo_fn is not None else nvml_processes_fn
-    # The source is sampled EXACTLY ONCE; on Windows it performs one bounded
-    # identity lookup for the selected NVML PIDs and never samples counters.
-    # the same rows feed both consumers, which need DIFFERENT views:
+    # The source is sampled EXACTLY ONCE, and the same rows feed both
+    # consumers, which need DIFFERENT views:
     #   * pressure  -> the FULL table plus the offload entitlements. The Ollama
     #     runner is normally the biggest VRAM holder and CAN genuinely be paged,
     #     so hiding it blinds spill detection; but its non-local memory is
@@ -305,6 +315,8 @@ def combined_status(
     #   * other_processes -> the runner-filtered view, since those PIDs are
     #     already reported as model entries.
     full_table: list[dict] = []
+    gaps: dict = {}
+    totals: dict = {}
     if source is not None:
         process_reading = source()
         if not isinstance(process_reading, Observation):
@@ -314,6 +326,8 @@ def combined_status(
                                           scope=process_reading.scope)
         observations["processes"] = process_reading.metadata()
         full_table = process_reading.data if process_reading.known else []
+        gaps = process_reading.gaps or {}
+        totals = process_reading.totals or {}
         result["other_processes"] = (other_processes(full_table, resolved_pids)
                                      if process_reading.known else None)
     pressure_models = loaded
@@ -321,12 +335,17 @@ def combined_status(
         selected_pids = {row["pid"] for row in full_table}
         pressure_models = [row for row in loaded if snap is not None
                            and snap.pid_for(row["name"]) in selected_pids]
+    non_local_total = totals.get("non_local_mb")
     result["pressure"] = pressure(gpus, pressure_models, full_table,
                                   runner_offloads=offloads,
+                                  non_local_total_mb=non_local_total,
                                   spill_threshold_mb=spill_threshold_mb)
+    # A measured device total covers rows without readings; without one, the
+    # rows are the measurement and each must have been read.
     non_local_known = (source is not None and process_reading.known
                        and (process_reading.coverage or {}).get("non_local_memory", True)
-                       and all(p.get("non_local_mb") is not None for p in full_table))
+                       and (non_local_total is not None
+                            or all(p.get("non_local_mb") is not None for p in full_table)))
     result["pressure"]["coverage"] = {
         "capacity": gpu_reading.known, "models": model_reading.known,
         "processes": source is not None and process_reading.known,
@@ -345,9 +364,11 @@ def combined_status(
     # never fire.
     coverage = result["pressure"]["coverage"]
     if result["pressure"]["state"] == "ok":
-        unmet = next((why for key, why in _OK_REQUIRES if not coverage[key]), None)
+        unmet = next((key for key in _OK_REQUIRES if not coverage[key]), None)
         if unmet is not None:
-            result["pressure"].update(state="unknown", detail=unmet)
+            why = _OK_REQUIRES[unmet]
+            detail = f"{why} ({gaps[unmet]})." if unmet in gaps else f"{why}."
+            result["pressure"].update(state="unknown", detail=detail)
     return result
 
 

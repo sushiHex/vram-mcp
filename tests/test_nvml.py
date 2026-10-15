@@ -71,6 +71,13 @@ class FakeNvml:
     def nvmlDeviceGetUUID(self, handle):
         return "GPU-fake-uuid"
 
+    def nvmlDeviceGetPciInfo(self, handle):
+        class _Pci:
+            busId = self.bus_id
+        return _Pci()
+
+    bus_id = "00000000:2D:00.0"
+
     def nvmlDeviceGetComputeRunningProcesses_v3(self, handle):
         if self.fail_compute:
             raise FakeNVMLError("not supported")
@@ -280,3 +287,21 @@ def test_b2mb_non_convertible_returns_none():
     assert nvml_mod._b2mb("garbage") is None
     assert nvml_mod._b2mb(None) is None
     assert nvml_mod._b2mb(300 * 1024**2) == 300
+
+
+def test_process_observation_names_its_device_in_either_binding_form():
+    fake = FakeNvml()
+    assert nvml_mod.observe_processes(0, nvml=fake).device == "00000000:2D:00.0"
+    fake.bus_id = b"00000000:41:00.0"   # older bindings return bytes
+    assert nvml_mod.observe_processes(0, nvml=fake).device == "00000000:41:00.0"
+
+
+def test_an_unreadable_bus_id_leaves_the_process_reading_intact():
+    fake = FakeNvml(compute_procs=[_Proc(7, None)])
+    fake.nvmlDeviceGetPciInfo = lambda handle: (_ for _ in ()).throw(FakeNVMLError("no"))
+
+    observation = nvml_mod.observe_processes(0, nvml=fake)
+
+    assert observation.known
+    assert observation.device is None
+    assert observation.data == [{"pid": 7, "size_mb": None, "kind": "compute"}]

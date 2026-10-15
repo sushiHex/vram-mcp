@@ -16,7 +16,13 @@ class Observation(Generic[T]):
     observed_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     error: str | None = None
     scope: str | None = None
+    # The physical device a scope resolved to (a PCI bus ID), where known.
+    device: str | None = None
     coverage: dict[str, bool] | None = None
+    # Why each uncovered input is missing, keyed like ``coverage``.
+    gaps: dict[str, str] | None = None
+    # Device-wide measurements that rows only attribute, such as non_local_mb.
+    totals: dict[str, int] | None = None
 
     @property
     def known(self) -> bool:
@@ -26,8 +32,14 @@ class Observation(Generic[T]):
         result = {"status": "available" if self.known else "unavailable",
                   "source": self.source, "observed_at": self.observed_at,
                   "scope": self.scope}
+        if self.device is not None:
+            result["device"] = self.device
         if self.error is not None:
             result["error"] = self.error
         if self.coverage is not None:
             result["coverage"] = self.coverage
+        if self.gaps:
+            result["gaps"] = self.gaps
+        if self.totals:
+            result["totals"] = self.totals
         return result
