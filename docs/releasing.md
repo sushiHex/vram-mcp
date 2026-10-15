@@ -13,6 +13,10 @@ which does the rest:
 3. **Publish.** It uploads the same files to [PyPI](https://pypi.org/project/vram-mcp/)
    through Trusted Publishing, with attestations. No token is stored anywhere.
 
+Every pull request and push to `main` runs the same build, `twine check`, and
+install smoke test, without the tag check, attaching, or publishing, so
+packaging breaks before a release rather than during one.
+
 Builds are reproducible: a local build of the same commit has the same
 checksums, so anyone can verify the published files against the tag.
 

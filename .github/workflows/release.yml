@@ -4,9 +4,16 @@ name: Release
 # checkout of its tag, attaches them to the release with SHA256SUMS, and
 # publishes the same files to PyPI through Trusted Publishing: no token is
 # stored anywhere. See docs/releasing.md.
+#
+# Every pull request and push to main runs the build too, so a change that
+# breaks packaging fails before a release instead of during one. Only a
+# release attaches or publishes.
 on:
   release:
     types: [published]
+  pull_request:
+  push:
+    branches: [main]
 
 permissions: {}
 
@@ -20,9 +27,12 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.13"
-      - run: python -m pip install build
+      - run: python -m pip install build twine
       - run: python -m build
+      # PyPI rejects a description it cannot render, after the release exists.
+      - run: python -m twine check --strict dist/*
       - name: The tag names the version that was built
+        if: github.event_name == 'release'
         env:
           TAG: ${{ github.event.release.tag_name }}
         run: |
@@ -48,6 +58,7 @@ jobs:
 
   attach:
     needs: build
+    if: github.event_name == 'release'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -63,6 +74,7 @@ jobs:
 
   pypi:
     needs: build
+    if: github.event_name == 'release'
     runs-on: ubuntu-latest
     environment:
       name: pypi
