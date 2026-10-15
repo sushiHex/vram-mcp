@@ -26,10 +26,21 @@ class OllamaClient:
         base_url: str = "http://127.0.0.1:11434",
         session: Optional[requests.Session] = None,
         timeout: int = 10,
+        residency_timeout: int = 110,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.session = session or requests.Session()
         self.timeout = timeout
+        # Ollama cancels a load when its client disconnects, so a request that
+        # changes residency must outwait a slow load rather than abort it. It
+        # still ends inside the 120 s operation lease, whose pending window
+        # then covers anything the server finishes afterwards. Connecting keeps
+        # the short timeout: an unreachable Ollama should fail fast.
+        self.residency_timeout = residency_timeout
+
+    def _post_generate(self, payload: dict):
+        return self.session.post(self._url("/api/generate"), json=payload,
+                                 timeout=(self.timeout, self.residency_timeout))
 
     def _url(self, path: str) -> str:
         return f"{self.base_url}{path}"
@@ -106,10 +117,10 @@ class OllamaClient:
         acknowledged = False
         error = None
         try:
-            response = self.session.post(self._url("/api/generate"), json={
+            response = self._post_generate({
                 "model": model, "prompt": "", "keep_alive": -1 if keep_alive == "-1" else keep_alive,
                 "stream": False,
-            }, timeout=self.timeout)
+            })
             acknowledged = 200 <= response.status_code < 300
             if 400 <= response.status_code < 500:
                 return {"ok": False, "outcome": "failed", "model": model,
@@ -176,11 +187,7 @@ class OllamaClient:
             "stream": False,
         }
         try:
-            resp = self.session.post(
-                self._url("/api/generate"),
-                json=payload,
-                timeout=self.timeout,
-            )
+            resp = self._post_generate(payload)
         except requests.RequestException:
             return False
         return 200 <= resp.status_code < 300
