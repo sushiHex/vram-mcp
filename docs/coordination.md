@@ -342,8 +342,10 @@ action to record.
 With auditing enabled, `list_loaded()` updates the Ollama-model baseline;
 `vram_status()` updates that baseline and the process baseline when both NVML
 process queries succeeded. All Ollama models and non-Ollama processes using at
-least `VRAM_MCP_MEANINGFUL_MB` dedicated VRAM qualify. The first successful
-snapshot establishes each baseline; changes between observations can be missed.
+least `VRAM_MCP_MEANINGFUL_MB` dedicated VRAM qualify. A process is recorded by
+name and PID, such as `python.exe (pid 4242)`, never by its command line, which
+can carry credentials. The first successful snapshot establishes each baseline;
+changes between observations can be missed.
 
 Disappearance causes are best-effort attribution:
 

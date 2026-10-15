@@ -1,6 +1,8 @@
 """Tests for vram_mcp.audit — event log + diff detector, real tmp_path files."""
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from vram_mcp import audit
 
 _T0 = datetime(2026, 7, 16, 18, 0, 0, tzinfo=timezone.utc)
@@ -94,6 +96,16 @@ def test_meaningful_holders_all_models_plus_big_processes():
     assert "ollama:qwen3:8b" in keys
     assert "process:100" in keys        # 14.5 GB -> meaningful
     assert "process:200" not in keys    # 40 MB -> noise, filtered
+
+
+@pytest.mark.parametrize("name, label", [("python.exe", "python.exe (pid 100)"),
+                                         (None, "pid 100")])
+def test_process_holder_label_never_carries_the_command_line(name, label):
+    """The label is persisted and returned by history(); arguments can be secrets."""
+    procs = [{"pid": 100, "size_mb": 14492, "name": name,
+              "cmdline": "python serve.py --api-key=SECRET", "kind": "compute"}]
+    [holder] = audit.meaningful_holders([], procs, threshold_mb=512)
+    assert holder["target"] == label
 
 
 def test_detect_first_run_sets_baseline_no_events(tmp_path):
