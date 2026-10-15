@@ -45,3 +45,15 @@ jobs:
       - run: |
           python -c "import importlib.metadata as m; print({p: m.version(p) for p in ('mcp', 'pydantic', 'requests', 'nvidia-ml-py', 'pytest')})"
       - run: python -m pytest -q
+
+  workflows:
+    # A malformed workflow fails only when it runs, which for the release
+    # workflow is mid-release. Lint every workflow on every change instead.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install actionlint-py==1.7.12.25
+      - run: actionlint
