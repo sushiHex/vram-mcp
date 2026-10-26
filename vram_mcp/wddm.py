@@ -506,6 +506,9 @@ class CounterReader:
         _check(pdh.PdhGetFormattedCounterArrayW(
             counter, _PDH_FMT_LARGE, ctypes.byref(size), ctypes.byref(count), buffer),
             "PdhGetFormattedCounterArrayW")
-        items = ctypes.cast(buffer, ctypes.POINTER(_FormattedItem))
-        return [(items[i].szName, items[i].FmtValue.CStatus, items[i].FmtValue.largeValue)
-                for i in range(count.value)]
+        # Not ctypes.cast: its result and the buffer form a reference cycle,
+        # so every read's buffer waited for a full collection, and a server
+        # sampling once a second grew past 1 GB in a day.
+        items = (_FormattedItem * count.value).from_buffer(buffer)
+        return [(item.szName, item.FmtValue.CStatus, item.FmtValue.largeValue)
+                for item in items]

@@ -191,6 +191,47 @@ def test_the_counter_item_layout_matches_the_sdk_for_this_python():
     assert ctypes.sizeof(wddm._FormattedItem) == 24
 
 
+class _FakePdh:
+    """PdhGetFormattedCounterArrayW: a size query, then a fill of two items."""
+
+    def __init__(self):
+        self.names = [ctypes.create_unicode_buffer(n) for n in ("pid_4_engtype_3D", "pid_8")]
+
+    def PdhGetFormattedCounterArrayW(self, counter, fmt, size, count, buffer):
+        count._obj.value = len(self.names)
+        size._obj.value = len(self.names) * ctypes.sizeof(wddm._FormattedItem)
+        if buffer is None:
+            return wddm._PDH_MORE_DATA
+        items = (wddm._FormattedItem * len(self.names)).from_buffer(buffer)
+        for value, (item, name) in enumerate(zip(items, self.names), start=10):
+            ctypes.c_void_p.from_buffer(item).value = ctypes.addressof(name)   # szName
+            item.FmtValue.largeValue = value
+        return 0
+
+
+def test_counter_array_buffers_are_freed_without_the_cycle_collector():
+    """Each buffer must die with its read: the sampler reads once a second,
+    and buffers waiting for a full collection grew servers past 1 GB a day.
+    (Each read's array *types* are cyclic, but small and short-lived.)"""
+    import gc
+
+    reader = wddm.CounterReader(("x",))
+    reader._pdh = _FakePdh()
+    gc.collect()
+    gc.set_debug(gc.DEBUG_SAVEALL)
+    gc.disable()
+    try:
+        rows = reader._array(None)
+        gc.collect()
+        buffers = [o for o in gc.garbage if isinstance(o, (ctypes.Array, ctypes._Pointer))]
+    finally:
+        gc.set_debug(0)
+        gc.garbage.clear()
+        gc.enable()
+    assert rows == [("pid_4_engtype_3D", 0, 10), ("pid_8", 0, 11)]
+    assert buffers == []
+
+
 def _adapters_with_caps(monkeypatch, caps: int, ok: bool = True):
     """Two adapters; the GPU at 01:00.0 has LUID 7 and reports ``caps``."""
     monkeypatch.setattr(wddm, "wddm_adapters", lambda: [(5, None), (7, (1, 0, 0))])
