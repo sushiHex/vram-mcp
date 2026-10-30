@@ -7,6 +7,7 @@ still use ``[]`` as their unknown sentinel.
 
 from __future__ import annotations
 
+import os
 import subprocess
 from typing import Callable, Optional
 
@@ -22,6 +23,42 @@ _NVIDIA_SMI_CMD = [
 ]
 
 
+def _program_files() -> Optional[str]:
+    """The Program Files directory from the registry, or ``None``."""
+    try:
+        import winreg
+
+        with winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SOFTWARE\Microsoft\Windows\CurrentVersion",
+        ) as key:
+            return winreg.QueryValueEx(key, "ProgramFilesDir")[0]
+    except (ImportError, OSError):
+        return None
+
+
+def _nvidia_smi_env(
+    environ=None, program_files: Callable[[], Optional[str]] = _program_files,
+    windows: Optional[bool] = None,
+) -> Optional[dict]:
+    """The environment for ``nvidia-smi``, or ``None`` to inherit ours.
+
+    On Windows, ``nvidia-smi`` prints "Failed to initialize NVML: Unknown
+    Error" and exits 255 when ``ProgramFiles`` and ``ProgramW6432`` are both
+    unset, and MCP clients start servers with a minimal environment that
+    lacks them. In-process NVML is unaffected.
+    """
+    environ = os.environ if environ is None else environ
+    windows = os.name == "nt" if windows is None else windows
+    names = {name.upper() for name in environ}
+    if not windows or names & {"PROGRAMFILES", "PROGRAMW6432"}:
+        return None
+    path = program_files()
+    if not path:
+        return None
+    return {**environ, "ProgramFiles": path}
+
+
 def _run(cmd: list[str], timeout: int = 5) -> str:
     """Run ``cmd`` and return stdout. Raises on non-zero exit / missing binary.
 
@@ -34,6 +71,7 @@ def _run(cmd: list[str], timeout: int = 5) -> str:
         text=True,
         timeout=timeout,
         check=True,
+        env=_nvidia_smi_env(),
     )
     return result.stdout
 
