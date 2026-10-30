@@ -79,6 +79,68 @@ def test_a_residency_request_ends_inside_its_operation_lease():
     assert OllamaClient().residency_timeout < claims._OPERATION_LEASE_SECONDS
 
 
+def test_a_per_request_timeout_replaces_the_read_timeout_only():
+    session = FakeSession(get_response=FakeResponse(200, {"models": [{"name": "llama3:latest"}]}),
+                          post_response=FakeResponse(200, {"done": True}))
+    result = OllamaClient(session=session).change_residency("llama3", "5m", resident=True, timeout=300)
+    assert session.post_calls[0]["timeout"] == (10, 300)
+    # The applied budget is reported, so a caller can see what it got.
+    assert result["timeout_seconds"] == 300
+
+
+def test_num_ctx_is_forwarded_as_an_ollama_option():
+    session = FakeSession(get_response=FakeResponse(200, {"models": [{"name": "llama3:latest"}]}),
+                          post_response=FakeResponse(200, {"done": True}))
+    client = OllamaClient(session=session)
+    client.change_residency("llama3", "5m", resident=True, num_ctx=65536)
+    client.change_residency("llama3", "5m", resident=True)
+    assert session.post_calls[0]["json"]["options"] == {"num_ctx": 65536}
+    assert "options" not in session.post_calls[1]["json"]
+
+
+def test_a_read_timeout_is_a_distinct_unknown_outcome():
+    """A slow load used to read as a generic interruption; the caller could not
+    tell "Ollama took longer than we waited" from a broken connection."""
+    session = FakeSession(get_response=FakeResponse(200, {"models": []}),
+                          raise_on="post", post_error=requests.ReadTimeout("read timed out"))
+    result = OllamaClient(session=session).change_residency(
+        "llama3", "5m", resident=True, timeout=110, sleep=lambda _: None)
+    assert result["outcome"] == "unknown"
+    assert result["reason"] == "load_timeout"
+    assert result["timeout_seconds"] == 110
+    assert "110 s" in result["detail"] and "ReadTimeout" in result["detail"]
+    assert len(session.post_calls) == 1
+
+
+def test_an_interrupted_request_names_its_exception():
+    session = FakeSession(get_response=FakeResponse(200, {"models": []}), raise_on="post")
+    result = OllamaClient(session=session).change_residency(
+        "llama3", "5m", resident=True, sleep=lambda _: None)
+    assert result["outcome"] == "unknown"
+    assert result["reason"] == "request_interrupted"
+    assert "ConnectionError" in result["detail"]
+
+
+def test_observe_show_returns_model_info():
+    info = {"general.architecture": "llama", "llama.block_count": 32}
+    session = FakeSession(post_response=FakeResponse(200, {"model_info": info}))
+    reading = OllamaClient(session=session).observe_show("llama3")
+    assert reading.known and reading.data == info
+    assert session.post_calls[0]["url"].endswith("/api/show")
+    assert session.post_calls[0]["json"] == {"model": "llama3:latest"}
+    assert session.post_calls[0]["timeout"] == 10
+
+
+@pytest.mark.parametrize("make_session", [
+    lambda: FakeSession(raise_on="post"),
+    lambda: FakeSession(post_response=FakeResponse(404, {})),
+    lambda: FakeSession(post_response=FakeResponse(200, {"model_info": None})),
+])
+def test_observe_show_failure_is_unknown_not_empty(make_session):
+    reading = OllamaClient(session=make_session()).observe_show("llama3")
+    assert not reading.known and reading.error
+
+
 def test_invalid_acknowledgement_cannot_verify_keep_alive():
     session = FakeSession(
         get_response=FakeResponse(200, {"models": [{"name": "llama3:latest"}]}),
@@ -103,10 +165,11 @@ class FakeResponse:
 class FakeSession:
     """Records GET/POST calls and returns queued responses."""
 
-    def __init__(self, get_response=None, post_response=None, raise_on=None):
+    def __init__(self, get_response=None, post_response=None, raise_on=None, post_error=None):
         self.get_response = get_response
         self.post_response = post_response
         self.raise_on = raise_on  # "get" | "post" | None
+        self.post_error = post_error
         self.get_calls = []
         self.post_calls = []
 
@@ -119,7 +182,7 @@ class FakeSession:
     def post(self, url, json=None, timeout=None):
         self.post_calls.append({"url": url, "json": json, "timeout": timeout})
         if self.raise_on == "post":
-            raise requests.ConnectionError("refused")
+            raise self.post_error or requests.ConnectionError("refused")
         return self.post_response
 
 

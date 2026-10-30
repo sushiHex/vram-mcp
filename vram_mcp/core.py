@@ -46,6 +46,7 @@ def _loaded_models(ollama=None, *, rows=None) -> list[dict]:
     for m in (ollama.ps() if rows is None else rows):
         size_mb = _shared_bytes_to_mb(m.get("size"))
         vram_mb = _shared_bytes_to_mb(m.get("size_vram"))
+        context = m.get("context_length")
         loaded.append(
             {
                 "name": m.get("name"),
@@ -53,6 +54,10 @@ def _loaded_models(ollama=None, *, rows=None) -> list[dict]:
                 "total_size_mb": size_mb,
                 "offloaded_to_cpu": (vram_mb < size_mb if vram_mb is not None and size_mb is not None else None),
                 "expires_at": m.get("expires_at"),
+                # The context the runner was loaded with; warm compares it
+                # with a requested num_ctx. Only a positive int counts: True
+                # == 1 and 4096.0 == 4096 would otherwise match a request.
+                "context_length": context if type(context) is int and context > 0 else None,
             }
         )
     return loaded
@@ -423,7 +428,8 @@ def reserved_mb(all_claims: list[dict]) -> int:
 
 
 def can_warm(model: str, *, free_mb, reserved_mb: int, model_size_mb,
-             resident: bool = False) -> tuple[bool, dict]:
+             resident: bool = False, strict: bool = False,
+             margin_mb: int = 0) -> tuple[bool, dict]:
     """May ``model`` be warmed without eating VRAM another session reserved?
 
     Cooperative, not enforced: vram-mcp cannot intercept an Ollama auto-load
@@ -432,14 +438,19 @@ def can_warm(model: str, *, free_mb, reserved_mb: int, model_size_mb,
     ``force=True``.
 
     Refuses when reservations leave no headroom at all, or when the model's
-    approximate size exceeds the headroom. Never refuses on a guess: unknown
-    free VRAM always allows.
+    approximate size exceeds the headroom. Fails closed on what it cannot
+    read: unknown free VRAM refuses a new load (nothing was verified), and an
+    unknown size refuses while a reservation needs the headroom checked.
+    ``force=True`` at the tool is the explicit override.
+
+    ``strict`` checks the device fit even with nothing reserved: the size must
+    fit within free VRAM minus reservations minus ``margin_mb``, and an unknown
+    size refuses. ``headroom_mb`` then reports that net room. Ollama's own idle
+    models are not counted as reclaimable; free them first (``ensure_free``).
 
     Returns ``(allowed, detail)`` where detail carries ``reason``,
     ``headroom_mb``, ``reserved_mb`` and ``model_size_mb``. ``reason`` never
-    over-claims: ``"fits"`` means the size WAS checked against the headroom,
-    ``"size_unknown"`` means it could not be, so a caller can tell a verified
-    fit from an unverified one.
+    over-claims: ``"fits"`` means the size WAS checked against the headroom.
     """
     base = {"reserved_mb": reserved_mb, "model_size_mb": model_size_mb,
             "free_mb": free_mb, "additional_mb": 0 if resident else model_size_mb}
@@ -447,9 +458,17 @@ def can_warm(model: str, *, free_mb, reserved_mb: int, model_size_mb,
         return True, {**base, "headroom_mb": None if free_mb is None else free_mb - reserved_mb,
                       "reason": "already_resident"}
     if free_mb is None:
-        return True, {**base, "headroom_mb": None, "reason": "free_unknown"}
+        return False, {**base, "headroom_mb": None, "reason": "free_unknown"}
 
     headroom = free_mb - reserved_mb
+    if strict:
+        headroom -= margin_mb
+        detail = {**base, "headroom_mb": headroom}
+        if model_size_mb is None:
+            return False, {**detail, "reason": "size_unknown"}
+        if model_size_mb > headroom:
+            return False, {**detail, "reason": "insufficient_headroom"}
+        return True, {**detail, "reason": "fits"}
     detail = {**base, "headroom_mb": headroom}
     # Nothing reserved -> nobody to protect, so this predicate stays out of the
     # way even when VRAM looks tight; making room is ensure_free's job.
@@ -458,10 +477,73 @@ def can_warm(model: str, *, free_mb, reserved_mb: int, model_size_mb,
     if headroom <= 0:
         return False, {**detail, "reason": "no_headroom"}
     if model_size_mb is None:
-        return True, {**detail, "reason": "size_unknown"}
+        return False, {**detail, "reason": "size_unknown"}
     if model_size_mb > headroom:
         return False, {**detail, "reason": "insufficient_headroom"}
     return True, {**detail, "reason": "fits"}
+
+
+# Ollama's default and widest KV cache type; q8_0 and q4_0 take half and a
+# quarter. The server's OLLAMA_KV_CACHE_TYPE is not visible to a client, so the
+# widest is assumed: an estimate may run high, never low, on cache type.
+KV_BYTES_PER_ELEMENT = 2
+
+
+def _positive_int(value) -> Optional[int]:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+
+
+def kv_cache_mb(model_info, num_ctx: int,
+                parallel: int = 1) -> tuple[Optional[int], Optional[str]]:
+    """Estimate a model's KV cache from GGUF architecture metadata.
+
+    ``num_ctx`` x ``parallel`` tokens x per-layer KV heads x (key + value head
+    dims) x an f16 element, rounded up to whole MB. Per-layer head counts (a
+    list, where hybrid models leave layers without a cache) are summed;
+    otherwise the count is multiplied by ``block_count``. Head dims fall back to
+    ``embedding_length / head_count``. Ollama multiplies the context by
+    ``OLLAMA_NUM_PARALLEL``, which a client cannot see, so the caller declares
+    it as ``parallel``.
+
+    Returns ``(mb, None)``, or ``(None, why)`` when the metadata does not
+    determine it: missing metadata is reported, never filled with a guess.
+    """
+    if not isinstance(model_info, dict):
+        return None, "architecture metadata unavailable"
+    arch = model_info.get("general.architecture")
+    if not isinstance(arch, str) or not arch:
+        return None, "general.architecture missing"
+
+    def field(name):
+        return model_info.get(f"{arch}.{name}")
+
+    blocks = _positive_int(field("block_count"))
+    if blocks is None:
+        return None, f"{arch}.block_count missing"
+    heads_kv = field("attention.head_count_kv")
+    if isinstance(heads_kv, list):
+        # One count per layer, or the uncovered layers would go uncounted.
+        if len(heads_kv) != blocks or not all(
+                isinstance(h, int) and not isinstance(h, bool) and h >= 0 for h in heads_kv):
+            return None, (f"{arch}.attention.head_count_kv is not one count per layer "
+                          f"({blocks} layers)")
+        layer_heads = sum(heads_kv)
+    else:
+        heads = _positive_int(heads_kv)
+        if heads is None:
+            return None, f"{arch}.attention.head_count_kv missing"
+        layer_heads = blocks * heads
+    key_dim = _positive_int(field("attention.key_length"))
+    value_dim = _positive_int(field("attention.value_length"))
+    if key_dim is None or value_dim is None:
+        embedding = _positive_int(field("embedding_length"))
+        head_count = _positive_int(field("attention.head_count"))
+        if embedding is None or head_count is None or embedding % head_count:
+            return None, f"{arch} attention head dimensions missing or not whole"
+        key_dim = key_dim or embedding // head_count
+        value_dim = value_dim or embedding // head_count
+    total = num_ctx * parallel * layer_heads * (key_dim + value_dim) * KV_BYTES_PER_ELEMENT
+    return -(-total // (1024 * 1024)), None
 
 
 def ensure_free(

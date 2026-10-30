@@ -14,8 +14,8 @@ protected from eviction by default.
 
 Use **Python 3.10+**, a running **Ollama** instance, and an **NVIDIA GPU with
 drivers** for memory readings. Windows and Linux are tested. Without
-`nvidia-smi` or NVML, model operations and claims still work, but some readings
-are unavailable.
+`nvidia-smi` or NVML, claims and unloads still work, but some readings are
+unavailable, and `warm` needs `force=True` because no fit can be verified.
 
 Run vram-mcp on the machine hosting Ollama and the GPU. Changing
 `OLLAMA_BASE_URL` redirects model requests; GPU and process inspection always
@@ -126,7 +126,15 @@ such as `codex:review`, so another agent can identify your work.
    was reconciled after the request; `refused` means no Ollama request was sent;
    `failed` means Ollama definitively rejected it; and `unknown` means the
    request may still be running and includes `pending_until`. Do not retry a
-   same-model mutation until that pending window ends. Warm admission is also
+   same-model mutation until that pending window ends. Unknown free VRAM
+   refuses a new load (`reason="free_unknown"`) rather than guessing. Pass
+   `num_ctx` to request a context length; admission then counts an estimated
+   KV cache (`kv_cache_mb`), times `num_parallel` if the server runs parallel
+   slots. Pass `strict_fit=True` (with `num_ctx`) to also refuse a load that
+   would not fit in free VRAM minus a 1 GiB margin, even when nothing is
+   reserved; `force` cannot override it. A load slower than `timeout_seconds` (default
+   `VRAM_MCP_LOAD_TIMEOUT`, 110 s) ends as `unknown` with
+   `reason="load_timeout"`. Warm admission is also
    serialized across models sharing the selected GPU. A model that was already
    resident has zero incremental residency cost (`reason="already_resident"`).
    Loading successfully does not guarantee full GPU residency. Run inference

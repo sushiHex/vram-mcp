@@ -602,6 +602,25 @@ def test_warm_operations_serialize_capacity_admission_by_scope(tmp_path):
         claims.finish_operation(first["operation_id"], path=path, now_fn=lambda: _T0)
 
 
+def test_an_operation_lease_can_cover_a_longer_request(tmp_path):
+    path = tmp_path / "claims.json"
+    started = claims.begin_operation("model", "warm", force=True, path=path,
+                                     now_fn=lambda: _T0, lease_seconds=610)
+    try:
+        assert started["expires_at"] == "2026-07-13T18:10:10Z"
+        view = claims.list_coordination(path=path, now_fn=lambda: _T0)["operations"][0]
+        assert view["pending_until"] == "2026-07-13T18:10:10Z"
+    finally:
+        claims.finish_operation(started["operation_id"], path=path, now_fn=lambda: _T0)
+
+
+@pytest.mark.parametrize("lease", [0, -1, 1.5, True, "60"])
+def test_an_invalid_operation_lease_is_rejected(tmp_path, lease):
+    with pytest.raises(ValueError):
+        claims.begin_operation("model", "warm", force=True, path=tmp_path / "claims.json",
+                               now_fn=lambda: _T0, lease_seconds=lease)
+
+
 def test_live_aged_warm_owner_still_blocks_same_scope_admission(tmp_path):
     path = tmp_path / "claims.json"
     clock = _clock(_T0)

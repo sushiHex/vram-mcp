@@ -1,5 +1,7 @@
 """Tests for vram_mcp.core — pure orchestration with injected fakes."""
 
+import pytest
+
 from vram_mcp import core, wddm
 from vram_mcp.observations import Observation
 
@@ -81,8 +83,28 @@ def test_combined_status():
     assert len(status["gpus"]) == 1
     assert status["loaded"] == [
         {"name": "big", "size_vram_mb": 8192, "total_size_mb": 8192,
-         "offloaded_to_cpu": False, "expires_at": "2026-07-11T10:00:00Z"},
+         "offloaded_to_cpu": False, "expires_at": "2026-07-11T10:00:00Z",
+         "context_length": None},
     ]
+
+
+def test_combined_status_keeps_each_models_context_length():
+    """warm compares it with a requested num_ctx; dropping it here made every
+    resident model look like it was loaded at an unknown context."""
+    models = [{"name": "m", "size": gb_bytes(8), "size_vram": gb_bytes(8),
+               "expires_at": None, "context_length": 65536}]
+    status = core.combined_status(gpu_fn_const(6000), FakeOllama(models))
+    assert status["loaded"][0]["context_length"] == 65536
+
+
+@pytest.mark.parametrize("raw", [True, False, 4096.0, 0, -1, "4096", None])
+def test_a_context_length_that_is_not_a_positive_int_is_unknown(raw):
+    """True == 1 and 4096.0 == 4096 in Python, so an unvalidated value could
+    match a requested num_ctx it never described."""
+    models = [{"name": "m", "size": gb_bytes(8), "size_vram": gb_bytes(8),
+               "expires_at": None, "context_length": raw}]
+    status = core.combined_status(gpu_fn_const(6000), FakeOllama(models))
+    assert status["loaded"][0]["context_length"] is None
 
 
 def test_combined_status_no_gpu():
@@ -1049,12 +1071,12 @@ def test_can_warm_refuses_when_headroom_exhausted_and_size_unknown():
     assert detail["reason"] == "no_headroom"
 
 
-def test_can_warm_allows_unknown_size_with_headroom():
-    # Allowed, but the reason must NOT claim a size check happened — a caller
-    # has to be able to tell a verified fit from an unverified one.
+def test_can_warm_refuses_unknown_size_while_reservations_need_headroom():
+    # With a reservation to protect, an unverifiable size cannot be shown to
+    # leave it room; admitting would be a guess in the caller's favour.
     ok, detail = core.can_warm("mystery", free_mb=20000, reserved_mb=1024,
                                model_size_mb=None)
-    assert ok is True
+    assert ok is False
     assert detail["reason"] == "size_unknown"
 
 
@@ -1064,17 +1086,126 @@ def test_can_warm_reason_fits_only_when_size_was_checked():
     assert detail["reason"] == "fits"
 
 
-def test_can_warm_allows_when_free_unknown():
-    # VRAM unreadable -> we cannot prove it will not fit; never block on a guess.
-    ok, detail = core.can_warm("m", free_mb=None, reserved_mb=8192,
+@pytest.mark.parametrize("reserved", [0, 8192])
+def test_can_warm_refuses_when_free_unknown(reserved):
+    # VRAM unreadable -> no fit was verified, so the load is not admitted.
+    # force=True is the explicit override, at the tool.
+    ok, detail = core.can_warm("m", free_mb=None, reserved_mb=reserved,
                                model_size_mb=4096)
-    assert ok is True
+    assert ok is False
     assert detail["reason"] == "free_unknown"
+    assert detail["headroom_mb"] is None
+
+
+def test_can_warm_resident_refresh_needs_no_capacity_reading():
+    ok, detail = core.can_warm("m", free_mb=None, reserved_mb=8192,
+                               model_size_mb=None, resident=True)
+    assert ok is True
+    assert detail["reason"] == "already_resident"
 
 
 def test_can_warm_allows_when_nothing_reserved():
     ok, _ = core.can_warm("m", free_mb=100, reserved_mb=0, model_size_mb=99999)
     assert ok is True
+
+
+# ---- kv_cache_mb -------------------------------------------------------------
+
+_LLAMA_INFO = {
+    "general.architecture": "llama",
+    "llama.block_count": 32,
+    "llama.attention.head_count": 32,
+    "llama.attention.head_count_kv": 8,
+    "llama.attention.key_length": 128,
+    "llama.attention.value_length": 128,
+    "llama.embedding_length": 4096,
+}
+
+
+def test_kv_cache_mb_sizes_an_f16_cache_from_architecture_metadata():
+    # 65536 tokens x 32 layers x 8 KV heads x (128 + 128) dims x 2 bytes = 8 GiB
+    mb, gap = core.kv_cache_mb(_LLAMA_INFO, 65536)
+    assert (mb, gap) == (8192, None)
+
+
+def test_kv_cache_mb_derives_head_dims_from_the_embedding_when_absent():
+    info = {k: v for k, v in _LLAMA_INFO.items() if not k.endswith(("key_length", "value_length"))}
+    assert core.kv_cache_mb(info, 65536) == (8192, None)
+
+
+def test_kv_cache_mb_sums_per_layer_head_counts():
+    # Hybrid models list KV heads per layer; a zero is a layer with no cache.
+    info = {**_LLAMA_INFO, "llama.attention.head_count_kv": [8, 0] * 16}
+    assert core.kv_cache_mb(info, 65536) == (4096, None)
+
+
+def test_kv_cache_mb_multiplies_by_the_servers_parallel_slots():
+    # Ollama allocates num_ctx x OLLAMA_NUM_PARALLEL tokens of cache.
+    assert core.kv_cache_mb(_LLAMA_INFO, 65536, parallel=4) == (32768, None)
+
+
+# ---- can_warm strict ---------------------------------------------------------
+
+def test_strict_can_warm_checks_device_fit_with_nothing_reserved():
+    # 10000 free - 0 reserved - 1024 margin = 8976 MB of room.
+    ok, detail = core.can_warm("m", free_mb=10000, reserved_mb=0, model_size_mb=9000,
+                               strict=True, margin_mb=1024)
+    assert ok is False
+    assert detail["reason"] == "insufficient_headroom"
+    assert detail["headroom_mb"] == 8976
+    ok, detail = core.can_warm("m", free_mb=10000, reserved_mb=0, model_size_mb=8976,
+                               strict=True, margin_mb=1024)
+    assert ok is True and detail["reason"] == "fits"
+
+
+def test_strict_can_warm_subtracts_reservations_and_the_margin():
+    ok, detail = core.can_warm("m", free_mb=20000, reserved_mb=8192, model_size_mb=11000,
+                               strict=True, margin_mb=1024)
+    assert ok is False and detail["headroom_mb"] == 20000 - 8192 - 1024
+
+
+def test_non_strict_can_warm_is_unchanged_with_nothing_reserved():
+    ok, detail = core.can_warm("m", free_mb=10000, reserved_mb=0, model_size_mb=9000,
+                               margin_mb=1024)
+    assert ok is True and detail["reason"] == "no_reservations"
+
+
+@pytest.mark.parametrize("free, size, reason", [
+    (None, 1000, "free_unknown"),
+    (20000, None, "size_unknown"),
+])
+def test_strict_can_warm_refuses_what_it_cannot_read(free, size, reason):
+    ok, detail = core.can_warm("m", free_mb=free, reserved_mb=0, model_size_mb=size,
+                               strict=True, margin_mb=1024)
+    assert ok is False and detail["reason"] == reason
+
+
+def test_kv_cache_mb_rounds_up_rather_than_under_reporting():
+    mb, _ = core.kv_cache_mb(_LLAMA_INFO, 1)
+    assert mb == 1
+
+
+@pytest.mark.parametrize("info", [
+    None, {}, {"general.architecture": "llama"},
+    {**_LLAMA_INFO, "llama.block_count": "32"},
+    {**_LLAMA_INFO, "llama.attention.head_count_kv": True},
+    {**_LLAMA_INFO, "llama.attention.head_count_kv": [8, None]},
+    # A per-layer list must cover every layer, or the rest go uncounted.
+    {**_LLAMA_INFO, "llama.attention.head_count_kv": [8] * 8},
+    {k: v for k, v in {**_LLAMA_INFO, "llama.attention.head_count_kv": [8] * 32}.items()
+     if k != "llama.block_count"},
+    # The head-dimension fallback must divide exactly.
+    {**{k: v for k, v in _LLAMA_INFO.items() if not k.endswith(("key_length", "value_length"))},
+     "llama.attention.head_count": 3},
+    {**{k: v for k, v in _LLAMA_INFO.items() if not k.endswith("value_length")},
+     "llama.attention.head_count": 5000},
+    {k: v for k, v in _LLAMA_INFO.items()
+     if k not in ("llama.attention.key_length", "llama.embedding_length")},
+])
+def test_kv_cache_mb_reports_missing_metadata_instead_of_guessing(info):
+    mb, gap = core.kv_cache_mb(info, 65536)
+    assert mb is None
+    assert gap
 
 
 def test_reservations_never_protect_a_model():
