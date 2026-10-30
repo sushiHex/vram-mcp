@@ -137,8 +137,14 @@ such as `codex:review`, so another agent can identify your work.
    `reason="load_timeout"`. Warm admission is also
    serialized across models sharing the selected GPU. A model that was already
    resident has zero incremental residency cost (`reason="already_resident"`).
-   Loading successfully does not guarantee full GPU residency. Run inference
-   through your usual Ollama client.
+   Loading successfully does not guarantee full GPU residency: when Ollama
+   places part of the model outside VRAM, the result reads `partial_fit: true`
+   with `offloaded_mb`, and the outcome stays `succeeded`. `partial_fit` is
+   `null` when residency couldn't be read. vram-mcp reports a spill but never
+   unloads or retries on its account. Every result also carries `elapsed_s`
+   and, when the request failed, the `exception` class. The audit event keeps
+   these, along with admission's inputs and the names of any unavailable
+   sources. Run inference through your usual Ollama client.
 5. **Renew and release.** Claims expire after one hour by default. Call
    `renew(claim_id="<returned claim_id>")` before expiry for longer work and
    `release(claim_id="<returned claim_id>")` when finished, including if loading
