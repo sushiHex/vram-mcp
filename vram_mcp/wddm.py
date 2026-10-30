@@ -50,7 +50,10 @@ Sample = tuple[str, int, int]    # PDH instance name, counter status, value
 
 _PROCESSES = r"\GPU Process Memory(*)\Non Local Usage"
 _ADAPTERS = r"\GPU Adapter Memory(*)\Shared Usage"
-_ENGINES = r"\GPU Engine(*)\Running Time"   # cumulative, in 100 ns ticks
+# Cumulative, in 100 ns ticks. Only the System process's engines: a desktop
+# has ~1,200 instances against its ~46, and every server reads them once a
+# second. PDH re-expands a partial wildcard on each collection, as it does "*".
+_ENGINES = r"\GPU Engine(pid_4_*)\Running Time"
 _BUS_ID = re.compile(r"([0-9a-f]{1,8}):([0-9a-f]{1,2}):([0-9a-f]{1,2})\.([0-7])", re.I)
 # The hex in instance names is uppercase; match it either way.
 _LUID = r"luid_0x(?P<high>[0-9a-f]{1,8})_0x(?P<low>[0-9a-f]{1,8})_phys_(?P<phys>\d+)"

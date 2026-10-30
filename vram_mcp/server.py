@@ -348,9 +348,18 @@ def _vram_status_impl(cmdline_chars: int | None = _CMDLINE_CHARS) -> dict:
         # a reader cannot infer it, since which evidence was missing is the
         # whole content of that answer.
         + (f" {detail}" if detail and state != "ok" else "")
+        + _runtime_note(status.get("unmonitored_runtimes"))
         + _coordination_note(status)
     )
     return status
+
+
+def _runtime_note(runtimes) -> str:
+    if not runtimes:
+        return ""
+    names = ", ".join(f"{r['name']} (pid {r['pid']})" for r in runtimes)
+    return (f" Model runtime(s) outside {_ollama.base_url} hold this GPU: {names};"
+            " their models are not in `loaded`, so list_claims before acting on them.")
 
 
 @mcp.tool()
