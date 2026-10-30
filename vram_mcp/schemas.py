@@ -111,6 +111,11 @@ class ResidencyResult(CoordinationBase):
     strict_fit: bool | None
     fit_margin_mb: int | None
     timeout_seconds: float | None
+    started_at: str | None
+    elapsed_s: float | None
+    exception: str | None
+    offloaded_mb: int | None
+    partial_fit: bool | None
     scope: str | None
     free_mb: int | None
     coordination_warning: str | None

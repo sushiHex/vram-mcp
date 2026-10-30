@@ -348,9 +348,18 @@ def _vram_status_impl(cmdline_chars: int | None = _CMDLINE_CHARS) -> dict:
         # a reader cannot infer it, since which evidence was missing is the
         # whole content of that answer.
         + (f" {detail}" if detail and state != "ok" else "")
+        + _runtime_note(status.get("unmonitored_runtimes"))
         + _coordination_note(status)
     )
     return status
+
+
+def _runtime_note(runtimes) -> str:
+    if not runtimes:
+        return ""
+    names = ", ".join(f"{r['name']} (pid {r['pid']})" for r in runtimes)
+    return (f" Model runtime(s) outside {_ollama.base_url} hold this GPU: {names};"
+            " their models are not in `loaded`, so list_claims before acting on them.")
 
 
 @mcp.tool()
@@ -412,8 +421,28 @@ def _action_result(
         _audit.log_action(action=action, target=model, kind="ollama", actor=by,
                           force=force, outcome=result["outcome"],
                           detail=result.get("detail") or result.get("reason") or "",
-                          scope=_ollama.base_url, cap=_EVENT_CAP)
+                          scope=_ollama.base_url, cap=_EVENT_CAP,
+                          fields=_audit_fields(result))
     return result
+
+
+# Numbers, flags and categories only: an audit event outlives the call, so it
+# carries nothing a producer could fill with a path, a prompt or a command line.
+_AUDIT_FIELDS = ("reason", "started_at", "elapsed_s", "exception", "timeout_seconds",
+                 "free_mb", "reserved_mb", "headroom_mb", "additional_mb", "model_size_mb",
+                 "kv_cache_mb", "num_ctx", "num_parallel", "strict_fit", "fit_margin_mb",
+                 "resident", "offloaded_mb", "partial_fit")
+
+
+def _audit_fields(result: dict) -> dict:
+    """The decision's inputs and the final reading, for an audit to explain it."""
+    fields = {key: result[key] for key in _AUDIT_FIELDS if result.get(key) is not None}
+    observations = result.get("observations") or {}
+    unavailable = sorted(name for name, meta in observations.items()
+                         if isinstance(meta, dict) and meta.get("status") != "available")
+    if unavailable:
+        fields["unavailable"] = unavailable    # which source, never its error text
+    return fields
 
 
 def _mutate(model: str, kind: str, force: bool, by: str, perform,
@@ -700,6 +729,12 @@ def _warm_impl(model: str, keep_alive: str, by: str, force: bool,
                                      f"(f16, {num_parallel} slot(s)) is not verified")
             elif num_ctx is not None and size_gap is not None:
                 result["detail"] += f"; size not estimated ({size_gap})"
+        if result.get("partial_fit"):
+            # Still "succeeded": the model is resident. A caller that treats
+            # CPU spill as failure reads partial_fit and unloads.
+            offloaded = result["offloaded_mb"] or "under 1"
+            result["detail"] += (f"; partial fit: {offloaded} MB of the model "
+                                 "is outside VRAM (Ollama size_vram < size)")
         return result
     return _mutate(model, "warm", force, by, perform, timeout=timeout)
 
