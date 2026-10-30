@@ -600,8 +600,7 @@ def _warm_impl(model: str, keep_alive: str, by: str, force: bool,
         return _warm_refused(
             "invalid_keep_alive",
             "keep_alive must be a positive duration (e.g. 5m) or -1; use unload() to evict", model)
-    if num_ctx is not None and (isinstance(num_ctx, bool) or not isinstance(num_ctx, int)
-                                or not 1 <= num_ctx <= _MAX_NUM_CTX):
+    if num_ctx is not None and (type(num_ctx) is not int or not 1 <= num_ctx <= _MAX_NUM_CTX):
         return _warm_refused(
             "invalid_num_ctx", f"num_ctx must be a whole number from 1 to {_MAX_NUM_CTX}", model)
     if timeout_seconds is not None and (

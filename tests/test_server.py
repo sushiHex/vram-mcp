@@ -591,22 +591,56 @@ def test_strict_fit_needs_num_ctx_even_for_a_resident_model(strict_env, loaded):
     assert calls == []
 
 
+class _OllamaHTTP:
+    """A stand-in HTTP session, so the real OllamaClient parses every reply."""
+
+    class _Reply:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self._payload
+
+    def __init__(self, routes):
+        self.routes = routes
+
+    def get(self, url, timeout=None):
+        return self._Reply(self.routes[url.rsplit("/api", 1)[1]])
+
+    def post(self, url, json=None, timeout=None):
+        return self._Reply(self.routes[url.rsplit("/api", 1)[1]])
+
+
 @pytest.mark.parametrize("ps_context, requested, reason", [
     (65536, 65536, "already_resident"),
     (4096, 65536, "insufficient_headroom"),
+    # A malformed context is unknown, so the model is a new load and the
+    # capacity check runs: True == 1 and 65536.0 == 65536 must not match.
+    (True, 1, "insufficient_headroom"),
+    (65536.0, 65536, "insufficient_headroom"),
+    (0, 65536, "insufficient_headroom"),
+    (-1, 65536, "insufficient_headroom"),
+    ("65536", 65536, "insufficient_headroom"),
 ])
 def test_the_resident_context_reaches_warm_admission_from_ollama(
         warm_env, monkeypatch, ps_context, requested, reason):
-    """End to end through the real combined_status: /api/ps context_length
-    decides whether a resident model needs a new load."""
+    """End to end through the real observe_loaded, combined_status and warm:
+    /api/ps context_length decides whether a resident model needs a new load.
+    8 GB is reserved and 12000 MB free, so 3808 MB of headroom cannot hold the
+    4000 MB model plus any cache; only a genuine context match is admitted."""
     _record_residency(warm_env)
     monkeypatch.setattr(core, "combined_status", _REAL_COMBINED_STATUS)
     monkeypatch.setattr(server, "_gpu_reading", lambda: Observation([{"free_mb": 12000}], "gpu"))
-    monkeypatch.setattr(server._ollama, "observe_loaded", lambda: Observation([{
-        "name": "m:latest", "size": 4000 * 1024 ** 2, "size_vram": 4000 * 1024 ** 2,
-        "expires_at": None, "context_length": ps_context}], "ollama:/api/ps"))
-    monkeypatch.setattr(server._ollama, "observe_tags", lambda: Observation({"m:latest": 4000}, "sizes"))
-    monkeypatch.setattr(server._ollama, "observe_show", _show(_KV_INFO), raising=False)
+    monkeypatch.setattr(server._ollama, "session", _OllamaHTTP({
+        "/ps": {"models": [{"name": "m:latest", "size": 4000 * 1024 ** 2,
+                            "size_vram": 4000 * 1024 ** 2, "expires_at": None,
+                            "context_length": ps_context}]},
+        "/tags": {"models": [{"name": "m:latest", "size": 4000 * 1024 ** 2}]},
+        "/show": {"model_info": _KV_INFO},
+    }))
     result = server._warm_impl("m", "5m", "tester", False, num_ctx=requested)
     assert result["reason"] == reason
 

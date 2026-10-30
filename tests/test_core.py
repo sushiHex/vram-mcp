@@ -97,6 +97,16 @@ def test_combined_status_keeps_each_models_context_length():
     assert status["loaded"][0]["context_length"] == 65536
 
 
+@pytest.mark.parametrize("raw", [True, False, 4096.0, 0, -1, "4096", None])
+def test_a_context_length_that_is_not_a_positive_int_is_unknown(raw):
+    """True == 1 and 4096.0 == 4096 in Python, so an unvalidated value could
+    match a requested num_ctx it never described."""
+    models = [{"name": "m", "size": gb_bytes(8), "size_vram": gb_bytes(8),
+               "expires_at": None, "context_length": raw}]
+    status = core.combined_status(gpu_fn_const(6000), FakeOllama(models))
+    assert status["loaded"][0]["context_length"] is None
+
+
 def test_combined_status_no_gpu():
     status = core.combined_status(gpu_fn_const(None), FakeOllama([]))
     assert status["gpus"] == []

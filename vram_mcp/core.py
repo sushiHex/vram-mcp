@@ -46,6 +46,7 @@ def _loaded_models(ollama=None, *, rows=None) -> list[dict]:
     for m in (ollama.ps() if rows is None else rows):
         size_mb = _shared_bytes_to_mb(m.get("size"))
         vram_mb = _shared_bytes_to_mb(m.get("size_vram"))
+        context = m.get("context_length")
         loaded.append(
             {
                 "name": m.get("name"),
@@ -54,8 +55,9 @@ def _loaded_models(ollama=None, *, rows=None) -> list[dict]:
                 "offloaded_to_cpu": (vram_mb < size_mb if vram_mb is not None and size_mb is not None else None),
                 "expires_at": m.get("expires_at"),
                 # The context the runner was loaded with; warm compares it
-                # with a requested num_ctx. None where Ollama reports none.
-                "context_length": m.get("context_length"),
+                # with a requested num_ctx. Only a positive int counts: True
+                # == 1 and 4096.0 == 4096 would otherwise match a request.
+                "context_length": context if type(context) is int and context > 0 else None,
             }
         )
     return loaded
