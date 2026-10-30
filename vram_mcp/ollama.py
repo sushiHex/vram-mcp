@@ -3,13 +3,27 @@
 from __future__ import annotations
 
 import time
+from datetime import datetime, timezone
 from typing import Optional
 
 import requests
 
-from ._util import bytes_to_mb
+from ._util import bytes_to_mb, iso
 from .observations import Observation
 from .models import canonical_model
+
+
+def _offload(row: Optional[dict]) -> dict:
+    """How much of a loaded model ``/api/ps`` places outside VRAM.
+
+    Both fields are ``None`` unless the row reports ``size`` and ``size_vram``
+    as byte counts with ``0 <= size_vram <= size`` and ``size > 0``: a loaded
+    model reporting no size proves nothing about where it lives.
+    """
+    size, vram = (row or {}).get("size"), (row or {}).get("size_vram")
+    if not all(type(v) is int and v >= 0 for v in (size, vram)) or vram > size or size == 0:
+        return {"offloaded_mb": None, "partial_fit": None}
+    return {"offloaded_mb": bytes_to_mb(size - vram), "partial_fit": vram < size}
 
 
 class OllamaClient:
@@ -128,7 +142,8 @@ class OllamaClient:
 
     def change_residency(self, model: str, keep_alive, *, resident: bool,
                          num_ctx: Optional[int] = None, timeout=None,
-                         attempts: int = 3, sleep=time.sleep, clock=time.monotonic) -> dict:
+                         attempts: int = 3, sleep=time.sleep, clock=time.monotonic,
+                         wall=lambda: datetime.now(timezone.utc)) -> dict:
         """Send once; reconcile with bounded reads, never blindly retry a POST.
 
         A timeout may have changed the server. For warm, residency alone cannot
@@ -148,50 +163,60 @@ class OllamaClient:
                    "keep_alive": -1 if keep_alive == "-1" else keep_alive, "stream": False}
         if num_ctx is not None:
             payload["options"] = {"num_ctx": num_ctx}
-        started = clock()
+        started_at, started = iso(wall()), clock()
+        response = exception = None
         try:
             response = self._post_generate(payload, read_timeout)
-            acknowledged = 200 <= response.status_code < 300
-            if 400 <= response.status_code < 500:
-                return {"ok": False, "outcome": "failed", "model": model,
-                        "detail": f"Ollama rejected the request (HTTP {response.status_code})"}
-            if not acknowledged:
-                error = f"Ollama returned HTTP {response.status_code}"
-            else:
-                try:
-                    payload = response.json()
-                except ValueError:
-                    payload = None
-                acknowledged = isinstance(payload, dict) and payload.get("done") is True and not payload.get("error")
-                if not acknowledged:
-                    error = "Ollama did not return a valid completion acknowledgement"
-        except requests.ReadTimeout as exc:
+        except requests.RequestException as exc:
+            exception = type(exc).__name__
+        # The request alone: not parsing, not the reconciliation reads below.
+        elapsed = round(clock() - started, 3)
+        timing = {"timeout_seconds": read_timeout, "started_at": started_at,
+                  "elapsed_s": elapsed, "exception": exception}
+        if response is None and exception == "ReadTimeout":
             # Ollama cancels a load whose client disconnects, so the load may
             # have stopped; it may also have finished just as we gave up.
             reason = "load_timeout"
             error = (f"Ollama did not answer within {read_timeout:g} s "
-                     f"({type(exc).__name__} after {clock() - started:.1f} s); the load may "
+                     f"({exception} after {elapsed:.1f} s); the load may "
                      "have been cancelled or may still finish. Raise timeout_seconds or "
                      "VRAM_MCP_LOAD_TIMEOUT for slow loads")
-        except requests.RequestException as exc:
+        elif response is None:
             reason = "request_interrupted"
-            error = (f"Ollama request was interrupted ({type(exc).__name__} after "
-                     f"{clock() - started:.1f} s); it may still be running")
+            error = (f"Ollama request was interrupted ({exception} after "
+                     f"{elapsed:.1f} s); it may still be running")
+        elif 400 <= response.status_code < 500:
+            return {"ok": False, "outcome": "failed", "model": model, **timing,
+                    "detail": f"Ollama rejected the request (HTTP {response.status_code})"}
+        elif not 200 <= response.status_code < 300:
+            error = f"Ollama returned HTTP {response.status_code}"
+        else:
+            try:
+                payload = response.json()
+            except ValueError:
+                payload = None
+            acknowledged = isinstance(payload, dict) and payload.get("done") is True and not payload.get("error")
+            if not acknowledged:
+                error = "Ollama did not return a valid completion acknowledgement"
         reading = None
         observed_resident = None
+        row = None
         for attempt in range(attempts):
             if attempt:
                 sleep(0.2)
             reading = self.observe_loaded()
+            # Only the final reading may describe residency and the offload.
+            row = observed_resident = None
             if reading.known:
-                observed_resident = any(canonical_model(row["name"]) == model for row in reading.data)
+                row = next((r for r in reading.data if canonical_model(r["name"]) == model), None)
+                observed_resident = row is not None
                 if observed_resident == resident and (acknowledged or not resident):
                     return {"ok": True, "outcome": "succeeded", "model": model,
                             "resident": observed_resident, "observations": {"ollama": reading.metadata()},
-                            "timeout_seconds": read_timeout,
+                            **timing, **_offload(row),
                             "detail": "Residency verified after request"}
         return {"ok": False, "outcome": "unknown", "model": model, "reason": reason,
-                "resident": observed_resident, "timeout_seconds": read_timeout,
+                "resident": observed_resident, **timing, **_offload(row),
                 "observations": {"ollama": reading.metadata()} if reading else {},
                 "detail": error or "Ollama acknowledged the request, but residency could not be verified"}
 

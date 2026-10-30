@@ -9,6 +9,8 @@ tests).
 from __future__ import annotations
 
 import json
+import math
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -45,20 +47,42 @@ def _normalized_outcome(outcome: str) -> str:
     return outcome if outcome in _ACTION_OUTCOMES else "unknown"
 
 
+_CORE_KEYS = frozenset({"ts", "type", "kind", "target", "action", "actor", "force",
+                        "outcome", "detail", "scope"})
+_TOKEN = re.compile(r"[A-Za-z0-9_.:+-]{1,64}")
+
+
+def _is_audit_value(value) -> bool:
+    if value is None or isinstance(value, bool):
+        return True
+    if isinstance(value, (int, float)):
+        return math.isfinite(value)
+    if isinstance(value, str):
+        return _TOKEN.fullmatch(value) is not None
+    if isinstance(value, list):
+        return all(isinstance(v, str) and _TOKEN.fullmatch(v) for v in value)
+    return False
+
+
 def log_action(*, action: str, target: str, kind: str, actor: str = "unknown",
                force: bool = False, outcome: str = "succeeded", detail: str = "",
-               scope: str | None = None,
+               scope: str | None = None, fields: dict | None = None,
                now_fn=_default_now, path: Path = DEFAULT_EVENTS_PATH,
                cap: int = 5000) -> None:
-    """Append one ``type="action"`` event. Best-effort — never raises."""
+    """Append one ``type="action"`` event. Best-effort — never raises.
+
+    ``fields`` adds structured readings: numbers, flags, and short tokens
+    (categories, class names, timestamps) or lists of them. Anything else is
+    dropped, as is any field named like a core key, so a producer cannot write
+    free text, a path or a prompt into the log through them.
+    """
     try:
-        event = {
-            "ts": iso(now_fn()), "type": "action", "kind": kind,
-            "target": _canonical_target(target, kind),
-            "action": action, "actor": actor, "force": force, "outcome": outcome,
-            "detail": detail,
-        }
-        event["outcome"] = _normalized_outcome(outcome)
+        event = {key: value for key, value in (fields or {}).items()
+                 if key not in _CORE_KEYS and _is_audit_value(value)}
+        event.update({"ts": iso(now_fn()), "type": "action", "kind": kind,
+                      "target": _canonical_target(target, kind),
+                      "action": action, "actor": actor, "force": force,
+                      "outcome": _normalized_outcome(outcome), "detail": detail})
         if scope is not None:
             event["scope"] = scope
         with locked(path):
