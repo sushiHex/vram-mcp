@@ -423,7 +423,8 @@ def reserved_mb(all_claims: list[dict]) -> int:
 
 
 def can_warm(model: str, *, free_mb, reserved_mb: int, model_size_mb,
-             resident: bool = False) -> tuple[bool, dict]:
+             resident: bool = False, strict: bool = False,
+             margin_mb: int = 0) -> tuple[bool, dict]:
     """May ``model`` be warmed without eating VRAM another session reserved?
 
     Cooperative, not enforced: vram-mcp cannot intercept an Ollama auto-load
@@ -436,6 +437,11 @@ def can_warm(model: str, *, free_mb, reserved_mb: int, model_size_mb,
     read: unknown free VRAM refuses a new load (nothing was verified), and an
     unknown size refuses while a reservation needs the headroom checked.
     ``force=True`` at the tool is the explicit override.
+
+    ``strict`` checks the device fit even with nothing reserved: the size must
+    fit within free VRAM minus reservations minus ``margin_mb``, and an unknown
+    size refuses. ``headroom_mb`` then reports that net room. Ollama's own idle
+    models are not counted as reclaimable; free them first (``ensure_free``).
 
     Returns ``(allowed, detail)`` where detail carries ``reason``,
     ``headroom_mb``, ``reserved_mb`` and ``model_size_mb``. ``reason`` never
@@ -450,6 +456,14 @@ def can_warm(model: str, *, free_mb, reserved_mb: int, model_size_mb,
         return False, {**base, "headroom_mb": None, "reason": "free_unknown"}
 
     headroom = free_mb - reserved_mb
+    if strict:
+        headroom -= margin_mb
+        detail = {**base, "headroom_mb": headroom}
+        if model_size_mb is None:
+            return False, {**detail, "reason": "size_unknown"}
+        if model_size_mb > headroom:
+            return False, {**detail, "reason": "insufficient_headroom"}
+        return True, {**detail, "reason": "fits"}
     detail = {**base, "headroom_mb": headroom}
     # Nothing reserved -> nobody to protect, so this predicate stays out of the
     # way even when VRAM looks tight; making room is ensure_free's job.
@@ -474,15 +488,17 @@ def _positive_int(value) -> Optional[int]:
     return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
 
 
-def kv_cache_mb(model_info, num_ctx: int) -> tuple[Optional[int], Optional[str]]:
-    """Estimate one context slot's KV cache from GGUF architecture metadata.
+def kv_cache_mb(model_info, num_ctx: int,
+                parallel: int = 1) -> tuple[Optional[int], Optional[str]]:
+    """Estimate a model's KV cache from GGUF architecture metadata.
 
-    ``num_ctx`` tokens x per-layer KV heads x (key + value head dims) x an f16
-    element, rounded up to whole MB. Per-layer head counts (a list, where hybrid
-    models leave layers without a cache) are summed; otherwise the count is
-    multiplied by ``block_count``. Head dims fall back to ``embedding_length /
-    head_count``. Ollama multiplies the context by ``OLLAMA_NUM_PARALLEL``,
-    which a client cannot see, so this is one slot.
+    ``num_ctx`` x ``parallel`` tokens x per-layer KV heads x (key + value head
+    dims) x an f16 element, rounded up to whole MB. Per-layer head counts (a
+    list, where hybrid models leave layers without a cache) are summed;
+    otherwise the count is multiplied by ``block_count``. Head dims fall back to
+    ``embedding_length / head_count``. Ollama multiplies the context by
+    ``OLLAMA_NUM_PARALLEL``, which a client cannot see, so the caller declares
+    it as ``parallel``.
 
     Returns ``(mb, None)``, or ``(None, why)`` when the metadata does not
     determine it: missing metadata is reported, never filled with a guess.
@@ -517,7 +533,7 @@ def kv_cache_mb(model_info, num_ctx: int) -> tuple[Optional[int], Optional[str]]
             return None, f"{arch} attention head dimensions missing"
         key_dim = key_dim or embedding // head_count
         value_dim = value_dim or embedding // head_count
-    total = num_ctx * layer_heads * (key_dim + value_dim) * KV_BYTES_PER_ELEMENT
+    total = num_ctx * parallel * layer_heads * (key_dim + value_dim) * KV_BYTES_PER_ELEMENT
     return -(-total // (1024 * 1024)), None
 
 

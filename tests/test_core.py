@@ -1119,6 +1119,47 @@ def test_kv_cache_mb_sums_per_layer_head_counts():
     assert core.kv_cache_mb(info, 65536) == (4096, None)
 
 
+def test_kv_cache_mb_multiplies_by_the_servers_parallel_slots():
+    # Ollama allocates num_ctx x OLLAMA_NUM_PARALLEL tokens of cache.
+    assert core.kv_cache_mb(_LLAMA_INFO, 65536, parallel=4) == (32768, None)
+
+
+# ---- can_warm strict ---------------------------------------------------------
+
+def test_strict_can_warm_checks_device_fit_with_nothing_reserved():
+    # 10000 free - 0 reserved - 1024 margin = 8976 MB of room.
+    ok, detail = core.can_warm("m", free_mb=10000, reserved_mb=0, model_size_mb=9000,
+                               strict=True, margin_mb=1024)
+    assert ok is False
+    assert detail["reason"] == "insufficient_headroom"
+    assert detail["headroom_mb"] == 8976
+    ok, detail = core.can_warm("m", free_mb=10000, reserved_mb=0, model_size_mb=8976,
+                               strict=True, margin_mb=1024)
+    assert ok is True and detail["reason"] == "fits"
+
+
+def test_strict_can_warm_subtracts_reservations_and_the_margin():
+    ok, detail = core.can_warm("m", free_mb=20000, reserved_mb=8192, model_size_mb=11000,
+                               strict=True, margin_mb=1024)
+    assert ok is False and detail["headroom_mb"] == 20000 - 8192 - 1024
+
+
+def test_non_strict_can_warm_is_unchanged_with_nothing_reserved():
+    ok, detail = core.can_warm("m", free_mb=10000, reserved_mb=0, model_size_mb=9000,
+                               margin_mb=1024)
+    assert ok is True and detail["reason"] == "no_reservations"
+
+
+@pytest.mark.parametrize("free, size, reason", [
+    (None, 1000, "free_unknown"),
+    (20000, None, "size_unknown"),
+])
+def test_strict_can_warm_refuses_what_it_cannot_read(free, size, reason):
+    ok, detail = core.can_warm("m", free_mb=free, reserved_mb=0, model_size_mb=size,
+                               strict=True, margin_mb=1024)
+    assert ok is False and detail["reason"] == reason
+
+
 def test_kv_cache_mb_rounds_up_rather_than_under_reporting():
     mb, _ = core.kv_cache_mb(_LLAMA_INFO, 1)
     assert mb == 1

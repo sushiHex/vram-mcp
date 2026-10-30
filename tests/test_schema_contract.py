@@ -147,6 +147,9 @@ CASES = [
     ("warm", schemas.ResidencyResult, "refused_free_unknown",
      lambda mp: (_use(mp, free_mb=None),
                  server._warm_impl("big:32b", "5m", "t", False))[-1]),
+    ("warm", schemas.ResidencyResult, "refused_strict_fit_forced",
+     lambda mp: (_use(mp), server._warm_impl(
+         "big:32b", "5m", "t", True, num_ctx=4096, strict_fit=True))[-1]),
     ("warm", schemas.ResidencyResult, "refused_invalid_num_ctx",
      lambda mp: (_use(mp), server._warm_impl("big:32b", "5m", "t", False, num_ctx=0))[-1]),
     ("warm", schemas.ResidencyResult, "refused_invalid_timeout",

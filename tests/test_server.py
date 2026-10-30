@@ -535,6 +535,112 @@ def test_a_warm_timeout_is_not_masked_by_the_admission_reason(warm_env):
     assert again["outcome"] == "refused" and again["reason"] == "operation_pending"
 
 
+@pytest.fixture
+def strict_env(warm_env):
+    """10 GB free, nothing reserved, a 4 GB model whose 64K cache is 8 GB."""
+    warm_env.setattr(core, "combined_status", lambda *a, **k: {
+        "gpus": [], "loaded": [], "free_mb": 10000, "pressure": {},
+        "observations": {"gpu": {"status": "available"}}})
+    warm_env.setattr(server, "_active_claims", lambda: ([], True))
+    warm_env.setattr(server._ollama, "observe_tags", lambda: Observation({"m:latest": 4000}, "sizes"))
+    warm_env.setattr(server._ollama, "observe_show", _show(_KV_INFO), raising=False)
+    warm_env.setattr(server, "_FIT_MARGIN_MB", 1024)
+    return warm_env
+
+
+def test_strict_fit_checks_the_device_even_with_nothing_reserved(strict_env):
+    calls = _record_residency(strict_env)
+    loose = server._warm_impl("m", "5m", "tester", False, num_ctx=65536)
+    strict = server._warm_impl("m", "5m", "tester", False, num_ctx=65536, strict_fit=True)
+    _validate_tool_output("warm", strict)
+    assert loose["ok"] is True and loose["reason"] == "no_reservations"
+    assert strict["outcome"] == "refused"
+    assert strict["reason"] == "insufficient_headroom"
+    assert strict["strict_fit"] is True
+    assert strict["fit_margin_mb"] == 1024
+    assert strict["headroom_mb"] == 10000 - 1024
+    assert "force=True" not in strict["detail"]
+    assert len(calls) == 1
+
+
+def test_strict_fit_admits_a_load_that_fits_with_its_margin(strict_env):
+    calls = _record_residency(strict_env)
+    result = server._warm_impl("m", "5m", "tester", False, num_ctx=8192, strict_fit=True)
+    assert result["ok"] is True
+    assert result["reason"] == "fits" and result["size_verified"] is True
+    assert result["model_size_mb"] == 4000 + 1024
+    assert calls[0]["num_ctx"] == 8192
+
+
+def test_strict_fit_needs_num_ctx_to_know_the_cache(strict_env):
+    calls = _record_residency(strict_env)
+    result = server._warm_impl("m", "5m", "tester", False, strict_fit=True)
+    assert result["outcome"] == "refused"
+    assert result["reason"] == "size_unknown"
+    assert "num_ctx" in result["detail"] and "force=True" not in result["detail"]
+    assert calls == []
+
+
+def test_strict_fit_refuses_unknown_free_memory_without_offering_force(strict_env):
+    calls = _record_residency(strict_env)
+    strict_env.setattr(core, "combined_status", lambda *a, **k: {
+        "gpus": [], "loaded": [], "free_mb": None, "pressure": {},
+        "observations": {"gpu": {"status": "unavailable", "error": "nvidia-smi found no GPU"}}})
+    result = server._warm_impl("m", "5m", "tester", False, num_ctx=8192, strict_fit=True)
+    assert result["reason"] == "free_unknown"
+    assert "nvidia-smi found no GPU" in result["detail"]
+    assert "force=True" not in result["detail"]
+    assert calls == []
+
+
+def test_strict_fit_cannot_be_forced(strict_env):
+    calls = _record_residency(strict_env)
+    result = server._warm_impl("m", "5m", "tester", True, num_ctx=8192, strict_fit=True)
+    _validate_tool_output("warm", result)
+    assert result["outcome"] == "refused"
+    assert result["reason"] == "strict_fit_forced"
+    assert calls == []
+
+
+@pytest.mark.parametrize("strict_fit", [1, "true", None])
+def test_warm_refuses_a_non_boolean_strict_fit(strict_fit):
+    result = server._warm_impl("m", "5m", "tester", False, strict_fit=strict_fit)
+    assert result["outcome"] == "refused"
+    assert result["reason"] == "invalid_strict_fit"
+
+
+def test_num_parallel_multiplies_the_kv_estimate_and_is_reported(strict_env):
+    _record_residency(strict_env)
+    result = server._warm_impl("m", "5m", "tester", False, num_ctx=8192, num_parallel=4)
+    assert result["kv_cache_mb"] == 4 * 1024
+    assert result["num_parallel"] == 4
+    assert "4 slot" in result["detail"]
+
+
+def test_num_parallel_defaults_to_one_slot(strict_env):
+    _record_residency(strict_env)
+    result = server._warm_impl("m", "5m", "tester", False, num_ctx=8192)
+    assert result["kv_cache_mb"] == 1024
+    assert result["num_parallel"] == 1
+
+
+@pytest.mark.parametrize("num_parallel", [0, -1, True, 1.5, "2", server._MAX_NUM_PARALLEL + 1])
+def test_warm_refuses_an_invalid_num_parallel(num_parallel):
+    result = server._warm_impl("m", "5m", "tester", True, num_parallel=num_parallel)
+    assert result["outcome"] == "refused"
+    assert result["reason"] == "invalid_num_parallel"
+
+
+def test_the_fit_margin_setting_defaults_to_the_tight_threshold(monkeypatch):
+    monkeypatch.delenv("VRAM_MCP_FIT_MARGIN_MB", raising=False)
+    assert server._fit_margin_setting() == core.TIGHT_MB
+    monkeypatch.setenv("VRAM_MCP_FIT_MARGIN_MB", "0")
+    assert server._fit_margin_setting() == 0
+    monkeypatch.setenv("VRAM_MCP_FIT_MARGIN_MB", "-1")
+    with pytest.raises(ValueError, match="VRAM_MCP_FIT_MARGIN_MB"):
+        server._fit_margin_setting()
+
+
 def test_overriding_unknown_free_memory_is_explicit_and_audited(warm_env):
     """force=True is the only way past free_unknown, and the audit says so."""
     audit = []

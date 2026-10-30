@@ -50,6 +50,7 @@ clients sharing one GPU and ledger.
 | `VRAM_MCP_MEANINGFUL_MB` | `512` | Minimum dedicated VRAM in MB for tracking a non-Ollama process in appearance/disappearance events. |
 | `VRAM_MCP_EVENT_CAP` | `5000` | Maximum retained events, including samples; oldest entries are pruned. |
 | `VRAM_MCP_SAMPLE_SECONDS` | `60` | Minimum interval between trend samples, shared across sessions. |
+| `VRAM_MCP_FIT_MARGIN_MB` | `1024` | VRAM a `warm(strict_fit=True)` load must leave free. The default is the `tight` pressure threshold, so a strict load never itself makes pressure read `tight`. `0` disables the margin. |
 | `VRAM_MCP_LOAD_TIMEOUT` | `110` | Seconds a `warm` or `unload` waits for Ollama to answer, at most `1800`. Ollama cancels a load when its client disconnects, so raise this on hosts with slow loads. `warm(timeout_seconds=...)` overrides it per call. |
 
 For clients using `mcpServers` JSON, add an `env` object to the server entry:

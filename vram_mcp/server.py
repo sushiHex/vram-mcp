@@ -84,6 +84,8 @@ _GPU_INDEX = _numeric_env("VRAM_MCP_GPU_INDEX", 0, whole=True, allow_zero=True)
 _MAX_LOAD_TIMEOUT = 1800
 # options.num_ctx is unbounded in Ollama; this only rejects absurd requests.
 _MAX_NUM_CTX = 1 << 24
+# OLLAMA_NUM_PARALLEL slots a caller may declare for the KV estimate.
+_MAX_NUM_PARALLEL = 256
 
 
 def _load_timeout_setting():
@@ -93,7 +95,14 @@ def _load_timeout_setting():
     return value
 
 
+def _fit_margin_setting():
+    """VRAM a strict-fit load must leave free: by default the `tight` threshold,
+    so a strict load never itself makes pressure read `tight`."""
+    return _numeric_env("VRAM_MCP_FIT_MARGIN_MB", core.TIGHT_MB, whole=True, allow_zero=True)
+
+
 _LOAD_TIMEOUT = _load_timeout_setting()
+_FIT_MARGIN_MB = _fit_margin_setting()
 _ollama = OllamaClient(base_url=_OLLAMA_BASE_URL, residency_timeout=_LOAD_TIMEOUT)
 
 
@@ -558,14 +567,25 @@ def _warm_refused(reason: str, detail: str, model) -> dict:
     }, model=model)
 
 
-def _admission_refusal_detail(admission: dict, observations: dict, size_gap) -> str:
-    """Say which reading the refusal rests on, so the audit keeps the cause."""
+def _admission_refusal_detail(admission: dict, observations: dict, size_gap,
+                              strict: bool = False) -> str:
+    """Say which reading the refusal rests on, so the audit keeps the cause.
+
+    A strict-fit refusal never suggests force, which strict mode rejects.
+    """
     reason = admission["reason"]
+    reserved = admission["reserved_mb"]
     if reason == "free_unknown":
         why = (observations.get("gpu") or {}).get("error") or "no GPU capacity reading"
         return (f"Free VRAM is unknown ({why}), so the fit was not verified. "
-                "force=True loads without admission checks")
-    reserved = admission["reserved_mb"]
+                + ("strict_fit refuses an unverified fit" if strict
+                   else "force=True loads without admission checks"))
+    if strict:
+        if reason == "size_unknown":
+            return f"strict_fit needs a known size, and the load's size is unknown ({size_gap})"
+        return (f"strict_fit: the estimated {admission['model_size_mb']} MB exceeds "
+                f"{admission['headroom_mb']} MB ({admission['free_mb']} MB free - {reserved} MB "
+                f"reserved - {_FIT_MARGIN_MB} MB margin). Free VRAM first, e.g. ensure_free")
     if reason == "size_unknown":
         return (f"{reserved} MB is reserved and the load's size is unknown ({size_gap}), "
                 "so its headroom was not verified. force=True overrides reservations")
@@ -573,7 +593,8 @@ def _admission_refusal_detail(admission: dict, observations: dict, size_gap) -> 
 
 
 def _warm_impl(model: str, keep_alive: str, by: str, force: bool,
-               num_ctx: int | None = None, timeout_seconds: float | None = None) -> dict:
+               num_ctx: int | None = None, timeout_seconds: float | None = None,
+               strict_fit: bool = False, num_parallel: int = 1) -> dict:
     # A zero duration is an eviction and must go through unload protection.
     if not isinstance(keep_alive, str) or not re.fullmatch(r"(?:-1|(?:[0-9]+(?:\.[0-9]+)?(?:ns|us|ms|s|m|h))+)", keep_alive) or not any(c in "123456789" for c in keep_alive):
         return _warm_refused(
@@ -589,7 +610,20 @@ def _warm_impl(model: str, keep_alive: str, by: str, force: bool,
         return _warm_refused(
             "invalid_timeout",
             f"timeout_seconds must be positive and at most {_MAX_LOAD_TIMEOUT}", model)
+    if type(num_parallel) is not int or not 1 <= num_parallel <= _MAX_NUM_PARALLEL:
+        return _warm_refused(
+            "invalid_num_parallel",
+            f"num_parallel must be a whole number from 1 to {_MAX_NUM_PARALLEL}", model)
+    if type(strict_fit) is not bool:
+        return _warm_refused("invalid_strict_fit", "strict_fit must be true or false", model)
+    if strict_fit and force:
+        # Strict mode exists so a scoped caller's fit check cannot be skipped.
+        return _warm_refused(
+            "strict_fit_forced",
+            "strict_fit cannot be combined with force=True; strict mode never skips its fit check",
+            model)
     timeout = _LOAD_TIMEOUT if timeout_seconds is None else timeout_seconds
+    margin = _FIT_MARGIN_MB
 
     def perform(name):
         admission = None
@@ -619,28 +653,38 @@ def _warm_impl(model: str, keep_alive: str, by: str, force: bool,
                 if num_ctx is not None:
                     show = _ollama.observe_show(name)
                     observations["architecture"] = show.metadata()
-                    kv_mb, kv_gap = (core.kv_cache_mb(show.data, num_ctx) if show.known
-                                     else (None, show.error))
+                    kv_mb, kv_gap = (core.kv_cache_mb(show.data, num_ctx, num_parallel)
+                                     if show.known else (None, show.error))
                     if kv_mb is None:
                         size_gap = f"KV cache for num_ctx={num_ctx} not estimated: {kv_gap}"
                         size = None
                     elif size is not None:
                         size += kv_mb
+                elif strict_fit:
+                    # The server's default context is invisible, so its cache is too.
+                    size_gap = "strict_fit needs num_ctx to estimate the KV cache"
+                    size = None
             reserved = core.reserved_mb(active)
             allowed, admission = core.can_warm(
                 name, free_mb=status["free_mb"], reserved_mb=reserved,
-                model_size_mb=size, resident=resident,
+                model_size_mb=size, resident=resident, strict=strict_fit, margin_mb=margin,
             )
             if not allowed:
                 return {"ok": False, "outcome": "refused", "refused": True, **admission,
                         "observations": observations, "num_ctx": num_ctx, "kv_cache_mb": kv_mb,
+                        "num_parallel": num_parallel if num_ctx is not None else None,
+                        "strict_fit": strict_fit, "fit_margin_mb": margin if strict_fit else None,
                         "reservations": [r for r in active if r.get("kind") == "reservation"],
-                        "detail": _admission_refusal_detail(admission, observations, size_gap)}
+                        "detail": _admission_refusal_detail(admission, observations, size_gap,
+                                                            strict_fit)}
         result = _ollama.change_residency(name, keep_alive, resident=True,
                                           num_ctx=num_ctx, timeout=timeout)
         result["keep_alive"] = keep_alive
         result["num_ctx"] = num_ctx
+        result["num_parallel"] = num_parallel if num_ctx is not None else None
         result["kv_cache_mb"] = kv_mb
+        result["strict_fit"] = strict_fit
+        result["fit_margin_mb"] = margin if strict_fit else None
         result["observations"] = {**observations, **result.get("observations", {})}
         if admission is not None:
             # The transport's reason (load_timeout, ...) describes the outcome;
@@ -651,7 +695,7 @@ def _warm_impl(model: str, keep_alive: str, by: str, force: bool,
             result["size_verified"] = admission["reason"] == "fits"
             if kv_mb is not None:
                 result["detail"] += (f"; KV cache estimate {kv_mb} MB for num_ctx={num_ctx} "
-                                     "(f16, one slot) is not verified")
+                                     f"(f16, {num_parallel} slot(s)) is not verified")
             elif num_ctx is not None and size_gap is not None:
                 result["detail"] += f"; size not estimated ({size_gap})"
         return result
@@ -663,6 +707,8 @@ async def warm(
     model: str, keep_alive: str = "5m", by: str = "unknown", force: bool = False,
     num_ctx: Annotated[int | None, Field(ge=1, le=_MAX_NUM_CTX, strict=True)] = None,
     timeout_seconds: Annotated[float | None, Field(gt=0, le=_MAX_LOAD_TIMEOUT, strict=True)] = None,
+    strict_fit: bool = False,
+    num_parallel: Annotated[int, Field(ge=1, le=_MAX_NUM_PARALLEL, strict=True)] = 1,
 ) -> ResidencyResult:
     """Load a model or refresh its keep-alive (e.g. "5m"; "-1" pins indefinitely).
 
@@ -674,15 +720,23 @@ async def warm(
 
     ``num_ctx`` requests that context (Ollama ``options.num_ctx``) and adds an
     estimated f16 KV cache (``kv_cache_mb``) to the admitted size; a model
-    resident at another context counts as a new load. ``timeout_seconds``
-    (default VRAM_MCP_LOAD_TIMEOUT, 110 s) bounds the wait for the load; a
-    timeout returns unknown with reason "load_timeout".
+    resident at another context counts as a new load. ``num_parallel``
+    declares the server's OLLAMA_NUM_PARALLEL (default 1) and multiplies the
+    KV estimate. ``timeout_seconds`` (default VRAM_MCP_LOAD_TIMEOUT, 110 s)
+    bounds the wait for the load; a timeout returns unknown with reason
+    "load_timeout".
+
+    ``strict_fit=True`` checks the device fit even with nothing reserved: model
+    size + KV must fit in free VRAM minus reservations minus
+    VRAM_MCP_FIT_MARGIN_MB (default 1024). It requires ``num_ctx``, refuses an
+    unknown free memory or size, and cannot be combined with force=True.
 
     Returns succeeded|refused|failed|unknown. On unknown, inspect residency and
     pending_until before retrying. force=True bypasses admission checks but
     cannot override a pending operation. Zero durations must use unload().
     """
-    return await _in_thread(_warm_impl, model, keep_alive, by, force, num_ctx, timeout_seconds)
+    return await _in_thread(_warm_impl, model, keep_alive, by, force, num_ctx, timeout_seconds,
+                            strict_fit, num_parallel)
 
 
 # ── claim tools ──────────────────────────────────────────────────────────────

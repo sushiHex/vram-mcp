@@ -189,15 +189,16 @@ the admission decision:
 | `fits` | The estimated size fits the remaining headroom; `size_verified=true`. |
 | `no_reservations` | No reserved capacity was found; no model-fit check is required. |
 | `free_unknown` | Free memory could not be read, so no fit was verified; the load is refused. `detail` names the GPU observation error. |
-| `size_unknown` | Reservations exist and headroom is positive, but the load's size is unavailable; the load is refused. `detail` says which reading was missing. |
+| `size_unknown` | Reservations exist (or `strict_fit` is set) and the load's size is unavailable; the load is refused. `detail` says which reading was missing. |
 | `no_headroom` | Reservations leave no free headroom; the load is refused. |
 | `insufficient_headroom` | The estimated model size exceeds remaining headroom; the load is refused. |
+| `strict_fit_forced` | `strict_fit=True` was combined with `force=True`; the call is refused. |
 
 `size_verified=false` means the `fits` check did not pass or run; read `reason`
 to distinguish cases. Even `fits` uses on-disk size as an estimate, not a
 guarantee of runtime VRAM needs. Admission fails closed: `free_unknown` and
 `size_unknown` refuse rather than admit a load nobody checked, and
-`force=True` is the explicit override. A host without a working `nvidia-smi`
+`force=True` is the explicit override, except under `strict_fit`. A host without a working `nvidia-smi`
 or NVML therefore needs `force=True` for every new load. A resident model
 needs no second copy of its full on-disk size, so reservations do not reject a
 keep-alive refresh.
@@ -208,12 +209,35 @@ keep-alive refresh.
 architecture metadata (`/api/show`): `num_ctx` x per-layer KV heads x (key +
 value head dimensions) x 2 bytes. It assumes Ollama's default f16 cache, which
 is the widest type: a `q8_0` or `q4_0` cache needs a half or a quarter of that.
-It also covers one slot, while Ollama multiplies the context by
-`OLLAMA_NUM_PARALLEL`, which a client cannot see. The figure is therefore
-reported as unverified. When the metadata does not determine it, the size is
+Ollama also multiplies the context by `OLLAMA_NUM_PARALLEL`, which a client
+cannot see. Declare it with `num_parallel` (default `1`); the result reports
+the value used. The figure is reported as unverified. When the metadata does not determine it, the size is
 unknown rather than guessed, and `detail` says why. Ollama reloads a model
 whose context changes, so a model resident at a different context, or whose
 `/api/ps` row reports no `context_length`, counts as a new load.
+
+#### Strict fit
+
+By default, admission protects reservations only. With nothing reserved it
+does not compare a load with free VRAM, because Ollama evicts its own idle
+models to make room. A caller that must not over-commit the device passes
+`strict_fit=True`, which changes four things:
+
+- The fit check runs even with nothing reserved. The estimated size, including
+  KV, must fit within free VRAM minus reservations minus
+  `VRAM_MCP_FIT_MARGIN_MB` (1024 by default, the `tight` threshold).
+  `headroom_mb` reports that net room, and `fit_margin_mb` reports the margin.
+- `num_ctx` is required. Without it the server's default context, and so its
+  KV cache, is unknown, and the load is refused as `size_unknown`.
+- Unknown free memory or an unknown size refuses.
+- `force=True` cannot bypass the check. The combination is refused as
+  `strict_fit_forced`.
+
+Ollama's idle models are not counted as reclaimable. Free them first with
+`ensure_free`. A model already resident at the requested context still needs
+no capacity. Callers without `strict_fit` see no change.
+
+#### Load timeout
 
 A warm waits `timeout_seconds` for Ollama to answer, or `VRAM_MCP_LOAD_TIMEOUT`
 (110 s by default, at most 1800) when the call does not set it. Ollama cancels a

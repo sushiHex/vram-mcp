@@ -129,7 +129,10 @@ such as `codex:review`, so another agent can identify your work.
    same-model mutation until that pending window ends. Unknown free VRAM
    refuses a new load (`reason="free_unknown"`) rather than guessing. Pass
    `num_ctx` to request a context length; admission then counts an estimated
-   KV cache (`kv_cache_mb`). A load slower than `timeout_seconds` (default
+   KV cache (`kv_cache_mb`), times `num_parallel` if the server runs parallel
+   slots. Pass `strict_fit=True` (with `num_ctx`) to also refuse a load that
+   would not fit in free VRAM minus a 1 GiB margin, even when nothing is
+   reserved; `force` cannot override it. A load slower than `timeout_seconds` (default
    `VRAM_MCP_LOAD_TIMEOUT`, 110 s) ends as `unknown` with
    `reason="load_timeout"`. Warm admission is also
    serialized across models sharing the selected GPU. A model that was already
