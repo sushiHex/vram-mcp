@@ -205,7 +205,8 @@ class OllamaClient:
             if attempt:
                 sleep(0.2)
             reading = self.observe_loaded()
-            row = None          # only the final reading may describe the offload
+            # Only the final reading may describe residency and the offload.
+            row = observed_resident = None
             if reading.known:
                 row = next((r for r in reading.data if canonical_model(r["name"]) == model), None)
                 observed_resident = row is not None

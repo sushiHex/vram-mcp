@@ -147,6 +147,8 @@ def test_a_failed_final_read_does_not_inherit_an_earlier_rows_offload():
     assert len(session.get_calls) == 3
     assert result["outcome"] == "unknown"
     assert result["offloaded_mb"] is None and result["partial_fit"] is None
+    assert result["resident"] is None               # read 1's "resident" is stale too
+    assert "resident" not in server._audit_fields(result)
 
 
 def test_a_row_without_size_vram_leaves_the_offload_unknown():
