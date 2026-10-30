@@ -364,6 +364,14 @@ def test_system_engine_ticks_keeps_only_the_system_process_on_the_adapter():
     assert ticks == {kept[0]: 100, new_data[0]: 50}
 
 
+def test_the_engine_query_asks_pdh_for_the_system_process_alone():
+    """PDH applies the query's instance wildcard; system_engine_ticks still filters."""
+    import fnmatch
+    wildcard = wddm._ENGINES.split("(")[1].split(")")[0].lower()
+    names = [_engine(pid, _SELECTED, 0, 7)[0].lower() for pid in (4, 40, 44, 14)]
+    assert [n for n in names if fnmatch.fnmatchcase(n, wildcard)] == names[:1]
+
+
 def test_system_engine_ticks_matches_lowercase_instances():
     row = _system(0, 8)
     assert wddm.system_engine_ticks(
