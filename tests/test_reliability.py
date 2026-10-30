@@ -91,7 +91,7 @@ class _ResidencyBackend:
     def observe_loaded(self):
         return Observation(list(self.rows), "ollama:/api/ps", scope=self.base_url)
 
-    def change_residency(self, model, keep_alive, *, resident):
+    def change_residency(self, model, keep_alive, *, resident, **_request):
         self.calls.append((model, keep_alive, resident))
         if self._change is not None:
             return self._change(model, keep_alive, resident)

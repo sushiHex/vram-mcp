@@ -577,16 +577,21 @@ def list_coordination(
 def begin_operation(
     model: str, kind: str, force: bool = False, *, path: Optional[Path] = None,
     now_fn: Callable[[], datetime] = _default_now, scope: str = _DEFAULT_SCOPE,
+    lease_seconds: int = _OPERATION_LEASE_SECONDS,
 ) -> dict:
     """Atomically reserve a same-model operation lease before backend work.
 
     A 120-second lease is conservative but bounded: a crashed caller can delay
     a same-model request until expiry, rather than permanently block the ledger.
+    A caller whose request may run longer passes a ``lease_seconds`` that
+    outlasts it, so the advertised ``pending_until`` stays truthful.
     """
     path = path or _DEFAULT_PATH
     model = canonical_model(model)
     kind = nonblank_text(kind, "kind")
     scope = nonblank_text(scope, "scope")
+    if isinstance(lease_seconds, bool) or not isinstance(lease_seconds, int) or lease_seconds <= 0:
+        raise ValueError("lease_seconds must be a positive whole number of seconds")
     now = now_fn()
     fd = None
     try:
@@ -613,7 +618,7 @@ def begin_operation(
                 return {"ok": False, "outcome": "refused", "reason": "operation_pending",
                         "model": model, "operations": []}
             operation_id = uuid.uuid4().hex
-            expires_at = _expires_at(now, _OPERATION_LEASE_SECONDS)
+            expires_at = _expires_at(now, lease_seconds)
             record = {"operation_id": operation_id, "model": model, "kind": kind,
                       "scope": scope, "started_at": _iso(now), "expires_at": _iso(expires_at),
                       "pending_until": _iso(expires_at), "lifecycle": "in_flight",

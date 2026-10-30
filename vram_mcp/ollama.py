@@ -32,15 +32,16 @@ class OllamaClient:
         self.session = session or requests.Session()
         self.timeout = timeout
         # Ollama cancels a load when its client disconnects, so a request that
-        # changes residency must outwait a slow load rather than abort it. It
-        # still ends inside the 120 s operation lease, whose pending window
-        # then covers anything the server finishes afterwards. Connecting keeps
-        # the short timeout: an unreachable Ollama should fail fast.
+        # changes residency must outwait a slow load rather than abort it. The
+        # default ends inside the 120 s operation lease; a longer per-request
+        # timeout gets a lease that outlasts it (server._lease_for). Connecting
+        # keeps the short timeout: an unreachable Ollama should fail fast.
         self.residency_timeout = residency_timeout
 
-    def _post_generate(self, payload: dict):
+    def _post_generate(self, payload: dict, timeout=None):
+        read_timeout = self.residency_timeout if timeout is None else timeout
         return self.session.post(self._url("/api/generate"), json=payload,
-                                 timeout=(self.timeout, self.residency_timeout))
+                                 timeout=(self.timeout, read_timeout))
 
     def _url(self, path: str) -> str:
         return f"{self.base_url}{path}"
@@ -105,22 +106,51 @@ class OllamaClient:
                     return Observation(None, "ollama:/api/tags", error="Invalid model name", scope=self.base_url)
         return Observation(sizes, "ollama:/api/tags", scope=self.base_url)
 
+    def observe_show(self, model: str) -> Observation[dict]:
+        """``model_info`` from ``/api/show``: the GGUF architecture metadata.
+
+        A read, so it keeps the short timeout. Any failure is unknown, never an
+        empty mapping a caller could mistake for a model without metadata.
+        """
+        model = canonical_model(model)
+        try:
+            resp = self.session.post(self._url("/api/show"), json={"model": model},
+                                     timeout=self.timeout)
+            resp.raise_for_status()
+            payload = resp.json()
+        except (requests.RequestException, ValueError):
+            payload = None
+        info = payload.get("model_info") if isinstance(payload, dict) else None
+        if not isinstance(info, dict):
+            return Observation(None, "ollama:/api/show", error="Ollama unavailable or invalid response",
+                               scope=self.base_url)
+        return Observation(info, "ollama:/api/show", scope=self.base_url)
+
     def change_residency(self, model: str, keep_alive, *, resident: bool,
-                         attempts: int = 3, sleep=time.sleep) -> dict:
+                         num_ctx: Optional[int] = None, timeout=None,
+                         attempts: int = 3, sleep=time.sleep, clock=time.monotonic) -> dict:
         """Send once; reconcile with bounded reads, never blindly retry a POST.
 
         A timeout may have changed the server. For warm, residency alone cannot
         prove that the requested keep-alive was applied, so no acknowledgement
         remains an unknown outcome even if the model is now resident.
+
+        ``num_ctx`` is forwarded as ``options.num_ctx``; ``timeout`` replaces
+        the read timeout for this request. A read timeout is reported as
+        ``reason="load_timeout"``, distinct from any other interruption.
         """
         model = canonical_model(model)
+        read_timeout = self.residency_timeout if timeout is None else timeout
         acknowledged = False
         error = None
+        reason = None
+        payload = {"model": model, "prompt": "",
+                   "keep_alive": -1 if keep_alive == "-1" else keep_alive, "stream": False}
+        if num_ctx is not None:
+            payload["options"] = {"num_ctx": num_ctx}
+        started = clock()
         try:
-            response = self._post_generate({
-                "model": model, "prompt": "", "keep_alive": -1 if keep_alive == "-1" else keep_alive,
-                "stream": False,
-            })
+            response = self._post_generate(payload, read_timeout)
             acknowledged = 200 <= response.status_code < 300
             if 400 <= response.status_code < 500:
                 return {"ok": False, "outcome": "failed", "model": model,
@@ -135,8 +165,18 @@ class OllamaClient:
                 acknowledged = isinstance(payload, dict) and payload.get("done") is True and not payload.get("error")
                 if not acknowledged:
                     error = "Ollama did not return a valid completion acknowledgement"
-        except requests.RequestException:
-            error = "Ollama request was interrupted; it may still be running"
+        except requests.ReadTimeout as exc:
+            # Ollama cancels a load whose client disconnects, so the load may
+            # have stopped; it may also have finished just as we gave up.
+            reason = "load_timeout"
+            error = (f"Ollama did not answer within {read_timeout:g} s "
+                     f"({type(exc).__name__} after {clock() - started:.1f} s); the load may "
+                     "have been cancelled or may still finish. Raise timeout_seconds or "
+                     "VRAM_MCP_LOAD_TIMEOUT for slow loads")
+        except requests.RequestException as exc:
+            reason = "request_interrupted"
+            error = (f"Ollama request was interrupted ({type(exc).__name__} after "
+                     f"{clock() - started:.1f} s); it may still be running")
         reading = None
         observed_resident = None
         for attempt in range(attempts):
@@ -148,9 +188,10 @@ class OllamaClient:
                 if observed_resident == resident and (acknowledged or not resident):
                     return {"ok": True, "outcome": "succeeded", "model": model,
                             "resident": observed_resident, "observations": {"ollama": reading.metadata()},
+                            "timeout_seconds": read_timeout,
                             "detail": "Residency verified after request"}
-        return {"ok": False, "outcome": "unknown", "model": model,
-                "resident": observed_resident,
+        return {"ok": False, "outcome": "unknown", "model": model, "reason": reason,
+                "resident": observed_resident, "timeout_seconds": read_timeout,
                 "observations": {"ollama": reading.metadata()} if reading else {},
                 "detail": error or "Ollama acknowledged the request, but residency could not be verified"}
 
