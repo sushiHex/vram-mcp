@@ -223,6 +223,25 @@ def test_status_summary_stays_terse_when_pressure_is_ok(monkeypatch):
     assert status["summary"].endswith("pressure: ok.")
 
 
+def test_status_summary_names_runtimes_outside_the_configured_ollama(monkeypatch):
+    """The 2026-10-27 case: another Ollama's runner held 18.7 GB under a claim,
+    `loaded` was empty, and an agent proposed killing it."""
+    monkeypatch.setattr(server, "_gpu_reading",
+                        lambda: [{"index": 0, "total_mb": 24576,
+                                  "used_mb": 21374, "free_mb": 2953}])
+    monkeypatch.setattr(server, "_procinfo_table", lambda: Observation(
+        [{"pid": 86776, "size_mb": None, "name": "llama-server.exe", "kind": "compute"}],
+        "procs", coverage={"non_local_memory": True}))
+    monkeypatch.setattr(server, "_paging", _StubPaging())
+    monkeypatch.setattr(server, "_ollama", _StubResidency([]))
+    monkeypatch.setattr(server, "_run_detection", lambda status: None)
+
+    status = server._vram_status_impl()
+    assert status["unmonitored_runtimes"] == [{"pid": 86776, "name": "llama-server.exe"}]
+    assert "llama-server.exe (pid 86776)" in status["summary"]
+    assert "list_claims" in status["summary"]
+
+
 def _idle_status_sources(monkeypatch):
     monkeypatch.setattr(server, "_gpu_reading",
                         lambda: [{"index": 0, "total_mb": 24576,
