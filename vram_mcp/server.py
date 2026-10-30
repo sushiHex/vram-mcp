@@ -49,7 +49,6 @@ mcp = FastMCP("vram-mcp")
 mcp._mcp_server.version = __version__
 
 _OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
-_ollama = OllamaClient(base_url=_OLLAMA_BASE_URL)
 
 from . import audit as _audit
 from . import procinfo as _procinfo
@@ -79,6 +78,33 @@ _TREND_SAMPLE_CAP = 200
 # 160 still name the program and, for Chromium, its process type.
 _CMDLINE_CHARS = 160
 _GPU_INDEX = _numeric_env("VRAM_MCP_GPU_INDEX", 0, whole=True, allow_zero=True)
+# A residency request's read timeout. Ollama cancels a load whose client
+# disconnects, and a Windows CUDA load with mmap disabled has been measured at
+# 37-272 s (#46), so slow hosts raise it; the cap keeps a lease bounded.
+_MAX_LOAD_TIMEOUT = 1800
+# options.num_ctx is unbounded in Ollama; this only rejects absurd requests.
+_MAX_NUM_CTX = 1 << 24
+
+
+def _load_timeout_setting():
+    value = _numeric_env("VRAM_MCP_LOAD_TIMEOUT", 110)
+    if value > _MAX_LOAD_TIMEOUT:
+        raise ValueError(f"VRAM_MCP_LOAD_TIMEOUT must be at most {_MAX_LOAD_TIMEOUT} seconds")
+    return value
+
+
+_LOAD_TIMEOUT = _load_timeout_setting()
+_ollama = OllamaClient(base_url=_OLLAMA_BASE_URL, residency_timeout=_LOAD_TIMEOUT)
+
+
+def _lease_for(timeout) -> int:
+    """An operation lease that outlasts a request with this read timeout.
+
+    A live owner keeps its operation pending past the lease anyway; the lease
+    is what other sessions are told (``pending_until``) and how long a crashed
+    owner can block. The 10 s margin is the default's: 110 s inside 120 s.
+    """
+    return max(_claims._OPERATION_LEASE_SECONDS, math.ceil(timeout) + 10)
 
 
 def _gpu_reading():
@@ -381,12 +407,18 @@ def _action_result(
     return result
 
 
-def _mutate(model: str, kind: str, force: bool, by: str, perform) -> dict:
-    """Hold an operation intent through decision, request and reconciliation."""
+def _mutate(model: str, kind: str, force: bool, by: str, perform,
+            timeout=None) -> dict:
+    """Hold an operation intent through decision, request and reconciliation.
+
+    ``timeout`` is the request's read timeout; the lease outlasts it.
+    """
     try:
         model = canonical_model(model)
         by = nonblank_text(by, "by")
-        slot = _claims.begin_operation(model, kind, force, scope=f"gpu:index={_GPU_INDEX}")
+        slot = _claims.begin_operation(
+            model, kind, force, scope=f"gpu:index={_GPU_INDEX}",
+            lease_seconds=_lease_for(_LOAD_TIMEOUT if timeout is None else timeout))
         if not slot["ok"]:
             # Lift the blocking lease's boundary to the top level; the caller
             # asked when it may retry, not which record happens to hold it.
@@ -519,18 +551,51 @@ async def ensure_free(gb: float, force: bool = False, by: str = "unknown") -> En
     return await _in_thread(_ensure_free_impl, gb, force, by)
 
 
-def _warm_impl(model: str, keep_alive: str, by: str, force: bool) -> dict:
+def _warm_refused(reason: str, detail: str, model) -> dict:
+    return _coordination_result(ResidencyResult, {
+        "ok": False, "outcome": "refused", "reason": reason,
+        "detail": detail, "summary": detail,
+    }, model=model)
+
+
+def _admission_refusal_detail(admission: dict, observations: dict, size_gap) -> str:
+    """Say which reading the refusal rests on, so the audit keeps the cause."""
+    reason = admission["reason"]
+    if reason == "free_unknown":
+        why = (observations.get("gpu") or {}).get("error") or "no GPU capacity reading"
+        return (f"Free VRAM is unknown ({why}), so the fit was not verified. "
+                "force=True loads without admission checks")
+    reserved = admission["reserved_mb"]
+    if reason == "size_unknown":
+        return (f"{reserved} MB is reserved and the load's size is unknown ({size_gap}), "
+                "so its headroom was not verified. force=True overrides reservations")
+    return f"{reserved} MB is reserved; insufficient headroom. force=True overrides reservations"
+
+
+def _warm_impl(model: str, keep_alive: str, by: str, force: bool,
+               num_ctx: int | None = None, timeout_seconds: float | None = None) -> dict:
     # A zero duration is an eviction and must go through unload protection.
     if not isinstance(keep_alive, str) or not re.fullmatch(r"(?:-1|(?:[0-9]+(?:\.[0-9]+)?(?:ns|us|ms|s|m|h))+)", keep_alive) or not any(c in "123456789" for c in keep_alive):
-        return _coordination_result(ResidencyResult, {
-            "ok": False, "outcome": "refused", "reason": "invalid_keep_alive",
-            "detail": "keep_alive must be a positive duration (e.g. 5m) or -1; use unload() to evict",
-            "summary": "keep_alive must be a positive duration (e.g. 5m) or -1; use unload() to evict",
-        }, model=model)
+        return _warm_refused(
+            "invalid_keep_alive",
+            "keep_alive must be a positive duration (e.g. 5m) or -1; use unload() to evict", model)
+    if num_ctx is not None and (isinstance(num_ctx, bool) or not isinstance(num_ctx, int)
+                                or not 1 <= num_ctx <= _MAX_NUM_CTX):
+        return _warm_refused(
+            "invalid_num_ctx", f"num_ctx must be a whole number from 1 to {_MAX_NUM_CTX}", model)
+    if timeout_seconds is not None and (
+            isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float))
+            or not math.isfinite(timeout_seconds) or not 0 < timeout_seconds <= _MAX_LOAD_TIMEOUT):
+        return _warm_refused(
+            "invalid_timeout",
+            f"timeout_seconds must be positive and at most {_MAX_LOAD_TIMEOUT}", model)
+    timeout = _LOAD_TIMEOUT if timeout_seconds is None else timeout_seconds
 
     def perform(name):
         admission = None
         observations = {}
+        kv_mb = None
+        size_gap = None
         if not force:
             status = core.combined_status(_gpu_reading, _ollama)
             observations.update(status["observations"])
@@ -539,47 +604,85 @@ def _warm_impl(model: str, keep_alive: str, by: str, force: bool) -> dict:
                 return {"ok": False, "outcome": "refused", "reason": "observation_unavailable",
                         "observations": observations,
                         "detail": "Cannot check residency or reservations; retry after the source recovers"}
-            resident = any(canonical_model(row["name"]) == name for row in status["loaded"])
-            sizes = None
+            # Ollama reloads a model whose num_ctx changes, so residency at
+            # another (or an unreported) context costs a whole new load.
+            resident = any(canonical_model(row["name"]) == name
+                           and (num_ctx is None or row.get("context_length") == num_ctx)
+                           for row in status["loaded"])
+            size = None
             if not resident:
                 sizes = _ollama.observe_tags()
                 observations["sizes"] = sizes.metadata()
+                size = sizes.data.get(name) if sizes.known else None
+                if size is None:
+                    size_gap = sizes.error or "model not listed by /api/tags"
+                if num_ctx is not None:
+                    show = _ollama.observe_show(name)
+                    observations["architecture"] = show.metadata()
+                    kv_mb, kv_gap = (core.kv_cache_mb(show.data, num_ctx) if show.known
+                                     else (None, show.error))
+                    if kv_mb is None:
+                        size_gap = f"KV cache for num_ctx={num_ctx} not estimated: {kv_gap}"
+                        size = None
+                    elif size is not None:
+                        size += kv_mb
             reserved = core.reserved_mb(active)
             allowed, admission = core.can_warm(
                 name, free_mb=status["free_mb"], reserved_mb=reserved,
-                model_size_mb=sizes.data.get(name) if sizes is not None and sizes.known else None,
-                resident=resident,
+                model_size_mb=size, resident=resident,
             )
             if not allowed:
                 return {"ok": False, "outcome": "refused", "refused": True, **admission,
-                        "observations": observations,
+                        "observations": observations, "num_ctx": num_ctx, "kv_cache_mb": kv_mb,
                         "reservations": [r for r in active if r.get("kind") == "reservation"],
-                        "detail": f"{reserved} MB is reserved; insufficient headroom. force=True overrides reservations"}
-        result = _ollama.change_residency(name, keep_alive, resident=True)
+                        "detail": _admission_refusal_detail(admission, observations, size_gap)}
+        result = _ollama.change_residency(name, keep_alive, resident=True,
+                                          num_ctx=num_ctx, timeout=timeout)
         result["keep_alive"] = keep_alive
+        result["num_ctx"] = num_ctx
+        result["kv_cache_mb"] = kv_mb
         result["observations"] = {**observations, **result.get("observations", {})}
         if admission is not None:
+            # The transport's reason (load_timeout, ...) describes the outcome;
+            # admission's describes the decision, and must not hide it.
+            transport_reason = result.get("reason")
             result.update(admission)
+            result["reason"] = transport_reason or admission["reason"]
             result["size_verified"] = admission["reason"] == "fits"
-            if admission["reason"] in ("size_unknown", "free_unknown"):
-                result["detail"] += f"; estimated fit not verified ({admission['reason']}, {admission['reserved_mb']} MB reserved)"
+            if kv_mb is not None:
+                result["detail"] += (f"; KV cache estimate {kv_mb} MB for num_ctx={num_ctx} "
+                                     "(f16, one slot) is not verified")
+            elif num_ctx is not None and size_gap is not None:
+                result["detail"] += f"; size not estimated ({size_gap})"
         return result
-    return _mutate(model, "warm", force, by, perform)
+    return _mutate(model, "warm", force, by, perform, timeout=timeout)
 
 
 @mcp.tool()
-async def warm(model: str, keep_alive: str = "5m", by: str = "unknown",
-               force: bool = False) -> ResidencyResult:
+async def warm(
+    model: str, keep_alive: str = "5m", by: str = "unknown", force: bool = False,
+    num_ctx: Annotated[int | None, Field(ge=1, le=_MAX_NUM_CTX, strict=True)] = None,
+    timeout_seconds: Annotated[float | None, Field(gt=0, le=_MAX_LOAD_TIMEOUT, strict=True)] = None,
+) -> ResidencyResult:
     """Load a model or refresh its keep-alive (e.g. "5m"; "-1" pins indefinitely).
 
     An already resident model requires zero additional capacity. New loads
     account for reservations using an approximate model size; size_verified
     describes that estimate, while outcome describes verified residency.
+    Unknown free VRAM refuses a new load, as does an unknown size while a
+    reservation needs headroom; force=True is the override.
+
+    ``num_ctx`` requests that context (Ollama ``options.num_ctx``) and adds an
+    estimated f16 KV cache (``kv_cache_mb``) to the admitted size; a model
+    resident at another context counts as a new load. ``timeout_seconds``
+    (default VRAM_MCP_LOAD_TIMEOUT, 110 s) bounds the wait for the load; a
+    timeout returns unknown with reason "load_timeout".
+
     Returns succeeded|refused|failed|unknown. On unknown, inspect residency and
     pending_until before retrying. force=True bypasses admission checks but
     cannot override a pending operation. Zero durations must use unload().
     """
-    return await _in_thread(_warm_impl, model, keep_alive, by, force)
+    return await _in_thread(_warm_impl, model, keep_alive, by, force, num_ctx, timeout_seconds)
 
 
 # ── claim tools ──────────────────────────────────────────────────────────────

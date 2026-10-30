@@ -105,6 +105,9 @@ class ResidencyResult(CoordinationBase):
     headroom_mb: int | None
     reserved_mb: int | None
     additional_mb: int | None
+    num_ctx: int | None
+    kv_cache_mb: int | None
+    timeout_seconds: float | None
     scope: str | None
     free_mb: int | None
     coordination_warning: str | None

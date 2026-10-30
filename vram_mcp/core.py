@@ -432,14 +432,14 @@ def can_warm(model: str, *, free_mb, reserved_mb: int, model_size_mb,
     ``force=True``.
 
     Refuses when reservations leave no headroom at all, or when the model's
-    approximate size exceeds the headroom. Never refuses on a guess: unknown
-    free VRAM always allows.
+    approximate size exceeds the headroom. Fails closed on what it cannot
+    read: unknown free VRAM refuses a new load (nothing was verified), and an
+    unknown size refuses while a reservation needs the headroom checked.
+    ``force=True`` at the tool is the explicit override.
 
     Returns ``(allowed, detail)`` where detail carries ``reason``,
     ``headroom_mb``, ``reserved_mb`` and ``model_size_mb``. ``reason`` never
-    over-claims: ``"fits"`` means the size WAS checked against the headroom,
-    ``"size_unknown"`` means it could not be, so a caller can tell a verified
-    fit from an unverified one.
+    over-claims: ``"fits"`` means the size WAS checked against the headroom.
     """
     base = {"reserved_mb": reserved_mb, "model_size_mb": model_size_mb,
             "free_mb": free_mb, "additional_mb": 0 if resident else model_size_mb}
@@ -447,7 +447,7 @@ def can_warm(model: str, *, free_mb, reserved_mb: int, model_size_mb,
         return True, {**base, "headroom_mb": None if free_mb is None else free_mb - reserved_mb,
                       "reason": "already_resident"}
     if free_mb is None:
-        return True, {**base, "headroom_mb": None, "reason": "free_unknown"}
+        return False, {**base, "headroom_mb": None, "reason": "free_unknown"}
 
     headroom = free_mb - reserved_mb
     detail = {**base, "headroom_mb": headroom}
@@ -458,10 +458,67 @@ def can_warm(model: str, *, free_mb, reserved_mb: int, model_size_mb,
     if headroom <= 0:
         return False, {**detail, "reason": "no_headroom"}
     if model_size_mb is None:
-        return True, {**detail, "reason": "size_unknown"}
+        return False, {**detail, "reason": "size_unknown"}
     if model_size_mb > headroom:
         return False, {**detail, "reason": "insufficient_headroom"}
     return True, {**detail, "reason": "fits"}
+
+
+# Ollama's default and widest KV cache type; q8_0 and q4_0 take half and a
+# quarter. The server's OLLAMA_KV_CACHE_TYPE is not visible to a client, so the
+# widest is assumed: an estimate may run high, never low, on cache type.
+KV_BYTES_PER_ELEMENT = 2
+
+
+def _positive_int(value) -> Optional[int]:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+
+
+def kv_cache_mb(model_info, num_ctx: int) -> tuple[Optional[int], Optional[str]]:
+    """Estimate one context slot's KV cache from GGUF architecture metadata.
+
+    ``num_ctx`` tokens x per-layer KV heads x (key + value head dims) x an f16
+    element, rounded up to whole MB. Per-layer head counts (a list, where hybrid
+    models leave layers without a cache) are summed; otherwise the count is
+    multiplied by ``block_count``. Head dims fall back to ``embedding_length /
+    head_count``. Ollama multiplies the context by ``OLLAMA_NUM_PARALLEL``,
+    which a client cannot see, so this is one slot.
+
+    Returns ``(mb, None)``, or ``(None, why)`` when the metadata does not
+    determine it: missing metadata is reported, never filled with a guess.
+    """
+    if not isinstance(model_info, dict):
+        return None, "architecture metadata unavailable"
+    arch = model_info.get("general.architecture")
+    if not isinstance(arch, str) or not arch:
+        return None, "general.architecture missing"
+
+    def field(name):
+        return model_info.get(f"{arch}.{name}")
+
+    heads_kv = field("attention.head_count_kv")
+    if isinstance(heads_kv, list):
+        if not heads_kv or not all(isinstance(h, int) and not isinstance(h, bool) and h >= 0
+                                   for h in heads_kv):
+            return None, f"{arch}.attention.head_count_kv is not a list of counts"
+        layer_heads = sum(heads_kv)
+    else:
+        blocks = _positive_int(field("block_count"))
+        heads = _positive_int(heads_kv)
+        if blocks is None or heads is None:
+            return None, f"{arch}.block_count or {arch}.attention.head_count_kv missing"
+        layer_heads = blocks * heads
+    key_dim = _positive_int(field("attention.key_length"))
+    value_dim = _positive_int(field("attention.value_length"))
+    if key_dim is None or value_dim is None:
+        embedding = _positive_int(field("embedding_length"))
+        head_count = _positive_int(field("attention.head_count"))
+        if embedding is None or head_count is None:
+            return None, f"{arch} attention head dimensions missing"
+        key_dim = key_dim or embedding // head_count
+        value_dim = value_dim or embedding // head_count
+    total = num_ctx * layer_heads * (key_dim + value_dim) * KV_BYTES_PER_ELEMENT
+    return -(-total // (1024 * 1024)), None
 
 
 def ensure_free(

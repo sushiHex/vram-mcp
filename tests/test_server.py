@@ -353,17 +353,222 @@ def warm_env(monkeypatch):
     return monkeypatch
 
 
-def test_warm_allowed_with_unverifiable_size_says_the_check_was_unverified(warm_env):
+def _record_residency(monkeypatch):
+    calls = []
+
+    def change_residency(model, keep_alive, **kwargs):
+        calls.append({"model": model, "keep_alive": keep_alive, **kwargs})
+        return {"ok": True, "outcome": "succeeded", "detail": "Residency verified"}
+
+    monkeypatch.setattr(server._ollama, "change_residency", change_residency)
+    return calls
+
+
+def test_warm_with_unverifiable_size_is_refused_while_a_reservation_needs_headroom(warm_env):
     """tags() returns {} on ANY failure, so a timed-out /api/tags makes EVERY
-    model 'size unknown' and admission control degrades wholesale to allow. That
-    is the deliberate fail-open policy — but a 20 GB model must not sail through
-    an 8 GB reservation reporting a plain success."""
+    model 'size unknown'. A 20 GB model must not sail through an 8 GB
+    reservation on a size nobody read."""
+    calls = _record_residency(warm_env)
     warm_env.setattr(server._ollama, "observe_tags", lambda: Observation({}, "sizes"))
     result = server._warm_impl("qwen3:32b", "5m", "tester", False)
-    assert result["ok"] is True
+    assert result["outcome"] == "refused"
     assert result["reason"] == "size_unknown"
-    assert result["size_verified"] is False
-    assert "size_unknown" in result["summary"] and "8192 MB" in result["summary"]
+    assert "8192 MB" in result["summary"] and "force=True" in result["summary"]
+    assert calls == []
+
+
+def test_warm_with_unknown_free_memory_is_refused_without_a_request(warm_env):
+    """#46: nvidia-smi returned no GPU, so the fit was never checked, yet the
+    load was sent. The refusal carries the observation error behind it."""
+    calls = _record_residency(warm_env)
+    warm_env.setattr(core, "combined_status", lambda *a, **k: {
+        "gpus": [], "loaded": [], "free_mb": None, "pressure": {},
+        "observations": {"gpu": {"status": "unavailable", "error": "nvidia-smi found no GPU"}}})
+    warm_env.setattr(server, "_active_claims", lambda: ([], True))
+    warm_env.setattr(server._ollama, "observe_tags", lambda: Observation({"phi4-mini:latest": 2500}, "sizes"))
+    result = server._warm_impl("phi4-mini", "5m", "tester", False)
+    _validate_tool_output("warm", result)
+    assert result["outcome"] == "refused"
+    assert result["reason"] == "free_unknown"
+    assert "nvidia-smi found no GPU" in result["detail"]
+    assert "force=True" in result["detail"]
+    assert calls == []
+
+
+def _show(info):
+    return lambda model: Observation(info, "ollama:/api/show")
+
+
+_KV_INFO = {
+    "general.architecture": "llama", "llama.block_count": 32,
+    "llama.attention.head_count_kv": 8, "llama.attention.key_length": 128,
+    "llama.attention.value_length": 128,
+}
+
+
+def test_warm_counts_the_requested_context_in_admission(warm_env):
+    """#44: a 4 GB model fits the 11.8 GB headroom left by an 8 GB
+    reservation, but not with the 8 GB KV cache a 64K context adds."""
+    calls = _record_residency(warm_env)
+    warm_env.setattr(server._ollama, "observe_tags", lambda: Observation({"m:latest": 4000}, "sizes"))
+    warm_env.setattr(server._ollama, "observe_show", _show(_KV_INFO), raising=False)
+
+    small = server._warm_impl("m", "5m", "tester", False)
+    assert small["reason"] == "fits" and small["kv_cache_mb"] is None
+    assert calls[-1]["num_ctx"] is None
+
+    long = server._warm_impl("m", "5m", "tester", False, num_ctx=65536)
+    _validate_tool_output("warm", long)
+    assert long["outcome"] == "refused"
+    assert long["reason"] == "insufficient_headroom"
+    assert long["kv_cache_mb"] == 8192
+    assert long["model_size_mb"] == 4000 + 8192
+    assert long["num_ctx"] == 65536
+    assert len(calls) == 1
+
+
+def test_warm_forwards_num_ctx_and_reports_the_estimate_as_unverified(warm_env):
+    calls = _record_residency(warm_env)
+    warm_env.setattr(server, "_active_claims", lambda: ([], True))
+    warm_env.setattr(server._ollama, "observe_tags", lambda: Observation({"m:latest": 4000}, "sizes"))
+    warm_env.setattr(server._ollama, "observe_show", _show(_KV_INFO), raising=False)
+    result = server._warm_impl("m", "5m", "tester", False, num_ctx=8192)
+    assert result["ok"] is True
+    assert calls[0]["num_ctx"] == 8192
+    assert result["kv_cache_mb"] == 1024
+    assert result["additional_mb"] == 4000 + 1024
+    assert "f16" in result["detail"] and "not verified" in result["detail"]
+
+
+def test_warm_with_num_ctx_and_no_metadata_says_so_instead_of_guessing(warm_env):
+    calls = _record_residency(warm_env)
+    warm_env.setattr(server._ollama, "observe_tags", lambda: Observation({"m:latest": 4000}, "sizes"))
+    warm_env.setattr(server._ollama, "observe_show", lambda model: Observation(
+        None, "ollama:/api/show", error="Ollama unavailable or invalid response"), raising=False)
+    result = server._warm_impl("m", "5m", "tester", False, num_ctx=65536)
+    assert result["outcome"] == "refused"
+    assert result["reason"] == "size_unknown"
+    assert result["kv_cache_mb"] is None
+    assert result["model_size_mb"] is None
+    assert "KV cache" in result["detail"] and "Ollama unavailable" in result["detail"]
+    assert result["observations"]["architecture"]["status"] == "unavailable"
+    assert calls == []
+
+
+@pytest.mark.parametrize("context_length", [4096, None])
+def test_warm_resident_at_another_context_is_a_new_load(warm_env, context_length):
+    """Ollama reloads a model whose num_ctx changes, so its residency at
+    another (or an unreported) context is no evidence of zero cost."""
+    _record_residency(warm_env)
+    row = {"name": "m:latest", "size_vram_mb": 4000}
+    if context_length is not None:
+        row["context_length"] = context_length
+    warm_env.setattr(core, "combined_status", lambda *a, **k: {
+        "loaded": [row], "free_mb": 20000, "observations": {}})
+    warm_env.setattr(server._ollama, "observe_tags", lambda: Observation({"m:latest": 4000}, "sizes"))
+    warm_env.setattr(server._ollama, "observe_show", _show(_KV_INFO), raising=False)
+    result = server._warm_impl("m", "5m", "tester", False, num_ctx=65536)
+    assert result["reason"] == "insufficient_headroom"
+
+
+def test_warm_resident_at_the_requested_context_needs_no_capacity(warm_env):
+    _record_residency(warm_env)
+    warm_env.setattr(core, "combined_status", lambda *a, **k: {
+        "loaded": [{"name": "m:latest", "size_vram_mb": 12000, "context_length": 65536}],
+        "free_mb": 100, "observations": {}})
+    result = server._warm_impl("m", "5m", "tester", False, num_ctx=65536)
+    assert result["ok"] is True
+    assert result["reason"] == "already_resident"
+
+
+@pytest.mark.parametrize("num_ctx", [0, -1, True, 1.5, "4096", server._MAX_NUM_CTX + 1])
+def test_warm_refuses_an_invalid_num_ctx(num_ctx):
+    result = server._warm_impl("m", "5m", "tester", True, num_ctx=num_ctx)
+    assert result["outcome"] == "refused"
+    assert result["reason"] == "invalid_num_ctx"
+
+
+@pytest.mark.parametrize("timeout", [0, -1, True, "300", float("nan"), float("inf"),
+                                     server._MAX_LOAD_TIMEOUT + 1])
+def test_warm_refuses_an_invalid_timeout(timeout):
+    result = server._warm_impl("m", "5m", "tester", True, timeout_seconds=timeout)
+    assert result["outcome"] == "refused"
+    assert result["reason"] == "invalid_timeout"
+
+
+def test_warm_timeout_reaches_the_request_and_its_lease_outlasts_it(warm_env):
+    calls = _record_residency(warm_env)
+    leases = []
+    begin = server._claims.begin_operation
+
+    def spy(*args, **kwargs):
+        leases.append(kwargs.get("lease_seconds"))
+        return begin(*args, **kwargs)
+
+    warm_env.setattr(server._claims, "begin_operation", spy)
+    server._warm_impl("m", "5m", "tester", True, timeout_seconds=600)
+    server._warm_impl("m", "5m", "tester", True)
+    assert [call["timeout"] for call in calls] == [600, server._LOAD_TIMEOUT]
+    assert leases[0] > 600
+    assert leases[1] >= server._claims._OPERATION_LEASE_SECONDS
+
+
+def test_a_warm_timeout_is_not_masked_by_the_admission_reason(warm_env):
+    """The admission verdict ("fits") used to overwrite the result's reason, so
+    a slow load read as a fit and its operation recorded no cause."""
+    warm_env.setattr(server._ollama, "observe_tags", lambda: Observation({"m:latest": 1000}, "sizes"))
+    warm_env.setattr(server._ollama, "change_residency", lambda model, keep_alive, **kwargs: {
+        "ok": False, "outcome": "unknown", "reason": "load_timeout", "resident": None,
+        "detail": "Ollama did not answer within 110 s"})
+    result = server._warm_impl("m", "5m", "tester", False)
+    _validate_tool_output("warm", result)
+    assert result["outcome"] == "unknown"
+    assert result["reason"] == "load_timeout"
+    assert result["size_verified"] is True
+    # Allocation is unknown, so the lease is retained, not released: the
+    # same model cannot be mutated again until the pending window ends.
+    assert result["pending_until"] is not None
+    operation = server._claims.list_coordination()["operations"][0]
+    assert operation["reason"] == "load_timeout"
+    assert operation["lifecycle"] == "unknown"
+    again = server._warm_impl("m", "5m", "tester", True)
+    assert again["outcome"] == "refused" and again["reason"] == "operation_pending"
+
+
+def test_overriding_unknown_free_memory_is_explicit_and_audited(warm_env):
+    """force=True is the only way past free_unknown, and the audit says so."""
+    audit = []
+    warm_env.setattr(server._audit, "log_action", lambda **kwargs: audit.append(kwargs))
+    calls = _record_residency(warm_env)
+    warm_env.setattr(core, "combined_status", lambda *a, **k: {
+        "gpus": [], "loaded": [], "free_mb": None, "pressure": {}, "observations": {}})
+    warm_env.setattr(server._ollama, "observe_tags", lambda: Observation({"m:latest": 1000}, "sizes"))
+    refused = server._warm_impl("m", "5m", "tester", False)
+    forced = server._warm_impl("m", "5m", "tester", True)
+    assert refused["reason"] == "free_unknown" and calls[0]["model"] == "m:latest"
+    assert len(calls) == 1 and forced["ok"] is True
+    assert [(e["outcome"], e["force"]) for e in audit] == [("refused", False), ("succeeded", True)]
+    assert "free_unknown" in audit[0]["detail"] or "Free VRAM is unknown" in audit[0]["detail"]
+
+
+@pytest.mark.parametrize("timeout", [server._LOAD_TIMEOUT, server._MAX_LOAD_TIMEOUT, 0.5])
+def test_an_operation_lease_outlasts_its_request(timeout):
+    assert server._lease_for(timeout) > timeout
+    assert server._lease_for(timeout) >= server._claims._OPERATION_LEASE_SECONDS
+
+
+@pytest.mark.parametrize("value", ["0", "-5", "nan", "abc", str(10 ** 6)])
+def test_an_invalid_load_timeout_setting_is_rejected(monkeypatch, value):
+    monkeypatch.setenv("VRAM_MCP_LOAD_TIMEOUT", value)
+    with pytest.raises(ValueError, match="VRAM_MCP_LOAD_TIMEOUT"):
+        server._load_timeout_setting()
+
+
+def test_the_load_timeout_setting_defaults_to_110_seconds(monkeypatch):
+    monkeypatch.delenv("VRAM_MCP_LOAD_TIMEOUT", raising=False)
+    assert server._load_timeout_setting() == 110
+    monkeypatch.setenv("VRAM_MCP_LOAD_TIMEOUT", "300")
+    assert server._load_timeout_setting() == 300
 
 
 def test_warm_allowed_with_a_verified_size_is_distinguishable(warm_env):
@@ -391,7 +596,7 @@ class _SchemaBackend:
     def __init__(self, outcome):
         self.outcome = outcome
 
-    def change_residency(self, model, _keep_alive, *, resident):
+    def change_residency(self, model, _keep_alive, *, resident, **_request):
         return {
             "ok": self.outcome == "succeeded",
             "outcome": self.outcome,

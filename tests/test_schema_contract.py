@@ -46,7 +46,7 @@ class _Backend:
     def observe_tags(self):
         return Observation({"big:32b": 20000}, "sizes")
 
-    def change_residency(self, model, _keep_alive, *, resident):
+    def change_residency(self, model, _keep_alive, *, resident, **_request):
         return {"ok": self.outcome == "succeeded", "outcome": self.outcome,
                 "model": model, "detail": f"stub {self.outcome}",
                 "resident": resident if self.outcome == "succeeded" else None}
@@ -144,6 +144,14 @@ CASES = [
      lambda mp: (_use(mp, free_mb=8000),
                  server._reserve_impl(7.0, "trainer", "sdxl", 600, None),
                  server._warm_impl("big:32b", "5m", "t", False))[-1]),
+    ("warm", schemas.ResidencyResult, "refused_free_unknown",
+     lambda mp: (_use(mp, free_mb=None),
+                 server._warm_impl("big:32b", "5m", "t", False))[-1]),
+    ("warm", schemas.ResidencyResult, "refused_invalid_num_ctx",
+     lambda mp: (_use(mp), server._warm_impl("big:32b", "5m", "t", False, num_ctx=0))[-1]),
+    ("warm", schemas.ResidencyResult, "refused_invalid_timeout",
+     lambda mp: (_use(mp), server._warm_impl(
+         "big:32b", "5m", "t", False, timeout_seconds=0))[-1]),
     # A warm blocked by another warm is the only producer of `scope`.
     ("warm", schemas.ResidencyResult, "refused_capacity_pending",
      lambda mp: (_use(mp), _pending_warm(), server._warm_impl(
