@@ -188,17 +188,46 @@ the admission decision:
 | `already_resident` | The model is already resident, so refreshing its keep-alive has zero incremental residency cost. |
 | `fits` | The estimated size fits the remaining headroom; `size_verified=true`. |
 | `no_reservations` | No reserved capacity was found; no model-fit check is required. |
-| `free_unknown` | Free memory could not be read; the load is allowed without verifying fit. |
-| `size_unknown` | Reservations exist and headroom is positive, but model size is unavailable; the load is allowed without verifying fit. |
+| `free_unknown` | Free memory could not be read, so no fit was verified; the load is refused. `detail` names the GPU observation error. |
+| `size_unknown` | Reservations exist and headroom is positive, but the load's size is unavailable; the load is refused. `detail` says which reading was missing. |
 | `no_headroom` | Reservations leave no free headroom; the load is refused. |
 | `insufficient_headroom` | The estimated model size exceeds remaining headroom; the load is refused. |
 
 `size_verified=false` means the `fits` check did not pass or run; read `reason`
 to distinguish cases. Even `fits` uses on-disk size as an estimate, not a
-guarantee of runtime VRAM needs. `free_unknown` and `size_unknown` remain
-explicitly fail-open admission results when residency and the coordination
-ledger were successfully read. A resident model needs no second copy of its
-full on-disk size, so reservations do not reject a keep-alive refresh.
+guarantee of runtime VRAM needs. Admission fails closed: `free_unknown` and
+`size_unknown` refuse rather than admit a load nobody checked, and
+`force=True` is the explicit override. A host without a working `nvidia-smi`
+or NVML therefore needs `force=True` for every new load. A resident model
+needs no second copy of its full on-disk size, so reservations do not reject a
+keep-alive refresh.
+
+`num_ctx` requests a context length, forwarded to Ollama as
+`options.num_ctx`. Admission then adds an estimated KV cache, reported as
+`kv_cache_mb`, to the on-disk size. The estimate comes from the model's
+architecture metadata (`/api/show`): `num_ctx` x per-layer KV heads x (key +
+value head dimensions) x 2 bytes. It assumes Ollama's default f16 cache, which
+is the widest type: a `q8_0` or `q4_0` cache needs a half or a quarter of that.
+It also covers one slot, while Ollama multiplies the context by
+`OLLAMA_NUM_PARALLEL`, which a client cannot see. The figure is therefore
+reported as unverified. When the metadata does not determine it, the size is
+unknown rather than guessed, and `detail` says why. Ollama reloads a model
+whose context changes, so a model resident at a different context, or whose
+`/api/ps` row reports no `context_length`, counts as a new load.
+
+A warm waits `timeout_seconds` for Ollama to answer, or `VRAM_MCP_LOAD_TIMEOUT`
+(110 s by default, at most 1800) when the call does not set it. Ollama cancels a
+load when its client disconnects, so on a slow host raise the limit rather than
+retry. A timeout returns `outcome="unknown"` with `reason="load_timeout"`;
+another interruption returns `reason="request_interrupted"`. Either `detail`
+names the exception and the elapsed time. An unknown outcome means the
+allocation is unknown, so the operation's lease is retained exactly as for any
+other unknown result. The lease always outlasts the request's timeout, and the
+applied timeout is reported as `timeout_seconds`. That timeout bounds the wait
+for Ollama's answer, not the whole call: admission reads before it and
+residency reads after it each keep the 10 s read timeout. Keep the budget below
+your MCP client's own tool-call timeout. If the client gives up first, the
+server still finishes the request and records its outcome.
 
 If Ollama residency or the ledger is unreadable, a normal warm is refused before
 admission because existing work cannot be checked. `force=True` skips

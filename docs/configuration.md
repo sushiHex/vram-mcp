@@ -50,6 +50,7 @@ clients sharing one GPU and ledger.
 | `VRAM_MCP_MEANINGFUL_MB` | `512` | Minimum dedicated VRAM in MB for tracking a non-Ollama process in appearance/disappearance events. |
 | `VRAM_MCP_EVENT_CAP` | `5000` | Maximum retained events, including samples; oldest entries are pruned. |
 | `VRAM_MCP_SAMPLE_SECONDS` | `60` | Minimum interval between trend samples, shared across sessions. |
+| `VRAM_MCP_LOAD_TIMEOUT` | `110` | Seconds a `warm` or `unload` waits for Ollama to answer, at most `1800`. Ollama cancels a load when its client disconnects, so raise this on hosts with slow loads. `warm(timeout_seconds=...)` overrides it per call. |
 
 For clients using `mcpServers` JSON, add an `env` object to the server entry:
 
@@ -191,7 +192,8 @@ out of the bounded log.
 | `loaded` is `null` | Read `observations.ollama.error`, then check `ollama ps` and `OLLAMA_BASE_URL`. A known empty list means Ollama was reached and reported no resident models. |
 | `busy` is `null` | NVML activity or model-to-process correlation is unavailable. Check access to runner processes and the model directory; keep explicit claims for work in use. |
 | A mutation returns `outcome="unknown"` | Read its observation metadata. If `pending_until` is present, the Ollama request may still finish; do not retry that model before then. For `ensure_free`, inspect `attempts` for a pending eviction. |
-| `warm` is refused | Read `summary`, `reason`, and `observations`. Fix unavailable residency/ledger health, or resolve a reservation. `force=true` overrides admission policy, but still requires a healthy coordination ledger. |
+| `warm` is refused | Read `summary`, `reason`, and `observations`. Fix unavailable residency/ledger health or GPU capacity readings (`free_unknown`), or resolve a reservation. `force=true` overrides admission policy, but still requires a healthy coordination ledger. |
+| `warm` returns `reason="load_timeout"` | Ollama did not answer within the timeout and may have cancelled the load. Wait for `pending_until`, then retry with a larger `timeout_seconds` or raise `VRAM_MCP_LOAD_TIMEOUT`. |
 | `trend()` has no samples | Call `vram_status()` with working GPU telemetry and auditing enabled. `list_loaded()` never samples GPU memory; historical data is not collected in the background. |
 | A model is protected after inference ends | Check active claims. Busy detection uses a recent activity window and can lag by a few seconds; recheck before considering an override. |
 
