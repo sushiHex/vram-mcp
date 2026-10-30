@@ -622,6 +622,13 @@ def _warm_impl(model: str, keep_alive: str, by: str, force: bool,
             "strict_fit_forced",
             "strict_fit cannot be combined with force=True; strict mode never skips its fit check",
             model)
+    if strict_fit and num_ctx is None:
+        # Without num_ctx Ollama uses its default context, which a client cannot
+        # see and which can reload even a resident model, so nothing is sized.
+        return _warm_refused(
+            "num_ctx_required",
+            "strict_fit needs num_ctx: the server's default context, and so its KV cache, "
+            "is unknown", model)
     timeout = _LOAD_TIMEOUT if timeout_seconds is None else timeout_seconds
     margin = _FIT_MARGIN_MB
 
@@ -660,10 +667,6 @@ def _warm_impl(model: str, keep_alive: str, by: str, force: bool,
                         size = None
                     elif size is not None:
                         size += kv_mb
-                elif strict_fit:
-                    # The server's default context is invisible, so its cache is too.
-                    size_gap = "strict_fit needs num_ctx to estimate the KV cache"
-                    size = None
             reserved = core.reserved_mb(active)
             allowed, admission = core.can_warm(
                 name, free_mb=status["free_mb"], reserved_mb=reserved,

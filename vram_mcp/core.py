@@ -53,6 +53,9 @@ def _loaded_models(ollama=None, *, rows=None) -> list[dict]:
                 "total_size_mb": size_mb,
                 "offloaded_to_cpu": (vram_mb < size_mb if vram_mb is not None and size_mb is not None else None),
                 "expires_at": m.get("expires_at"),
+                # The context the runner was loaded with; warm compares it
+                # with a requested num_ctx. None where Ollama reports none.
+                "context_length": m.get("context_length"),
             }
         )
     return loaded
@@ -512,25 +515,29 @@ def kv_cache_mb(model_info, num_ctx: int,
     def field(name):
         return model_info.get(f"{arch}.{name}")
 
+    blocks = _positive_int(field("block_count"))
+    if blocks is None:
+        return None, f"{arch}.block_count missing"
     heads_kv = field("attention.head_count_kv")
     if isinstance(heads_kv, list):
-        if not heads_kv or not all(isinstance(h, int) and not isinstance(h, bool) and h >= 0
-                                   for h in heads_kv):
-            return None, f"{arch}.attention.head_count_kv is not a list of counts"
+        # One count per layer, or the uncovered layers would go uncounted.
+        if len(heads_kv) != blocks or not all(
+                isinstance(h, int) and not isinstance(h, bool) and h >= 0 for h in heads_kv):
+            return None, (f"{arch}.attention.head_count_kv is not one count per layer "
+                          f"({blocks} layers)")
         layer_heads = sum(heads_kv)
     else:
-        blocks = _positive_int(field("block_count"))
         heads = _positive_int(heads_kv)
-        if blocks is None or heads is None:
-            return None, f"{arch}.block_count or {arch}.attention.head_count_kv missing"
+        if heads is None:
+            return None, f"{arch}.attention.head_count_kv missing"
         layer_heads = blocks * heads
     key_dim = _positive_int(field("attention.key_length"))
     value_dim = _positive_int(field("attention.value_length"))
     if key_dim is None or value_dim is None:
         embedding = _positive_int(field("embedding_length"))
         head_count = _positive_int(field("attention.head_count"))
-        if embedding is None or head_count is None:
-            return None, f"{arch} attention head dimensions missing"
+        if embedding is None or head_count is None or embedding % head_count:
+            return None, f"{arch} attention head dimensions missing or not whole"
         key_dim = key_dim or embedding // head_count
         value_dim = value_dim or embedding // head_count
     total = num_ctx * parallel * layer_heads * (key_dim + value_dim) * KV_BYTES_PER_ELEMENT

@@ -13,6 +13,9 @@ from pydantic import ValidationError
 from vram_mcp import core, server, wddm
 from vram_mcp.observations import Observation
 
+# Captured before any fixture replaces it, for tests that need the real one.
+_REAL_COMBINED_STATUS = core.combined_status
+
 
 @pytest.fixture(autouse=True)
 def isolated_runtime(monkeypatch, tmp_path):
@@ -572,13 +575,40 @@ def test_strict_fit_admits_a_load_that_fits_with_its_margin(strict_env):
     assert calls[0]["num_ctx"] == 8192
 
 
-def test_strict_fit_needs_num_ctx_to_know_the_cache(strict_env):
+@pytest.mark.parametrize("loaded", [[], [{"name": "m:latest", "size_vram_mb": 4000}],
+                                    [{"name": "m:latest", "context_length": 4096}]])
+def test_strict_fit_needs_num_ctx_even_for_a_resident_model(strict_env, loaded):
+    """A refresh without num_ctx asks for the server's default context, which
+    can reload a resident model; residency is no exemption."""
     calls = _record_residency(strict_env)
+    strict_env.setattr(core, "combined_status", lambda *a, **k: {
+        "gpus": [], "loaded": loaded, "free_mb": 10000, "pressure": {}, "observations": {}})
     result = server._warm_impl("m", "5m", "tester", False, strict_fit=True)
+    _validate_tool_output("warm", result)
     assert result["outcome"] == "refused"
-    assert result["reason"] == "size_unknown"
+    assert result["reason"] == "num_ctx_required"
     assert "num_ctx" in result["detail"] and "force=True" not in result["detail"]
     assert calls == []
+
+
+@pytest.mark.parametrize("ps_context, requested, reason", [
+    (65536, 65536, "already_resident"),
+    (4096, 65536, "insufficient_headroom"),
+])
+def test_the_resident_context_reaches_warm_admission_from_ollama(
+        warm_env, monkeypatch, ps_context, requested, reason):
+    """End to end through the real combined_status: /api/ps context_length
+    decides whether a resident model needs a new load."""
+    _record_residency(warm_env)
+    monkeypatch.setattr(core, "combined_status", _REAL_COMBINED_STATUS)
+    monkeypatch.setattr(server, "_gpu_reading", lambda: Observation([{"free_mb": 12000}], "gpu"))
+    monkeypatch.setattr(server._ollama, "observe_loaded", lambda: Observation([{
+        "name": "m:latest", "size": 4000 * 1024 ** 2, "size_vram": 4000 * 1024 ** 2,
+        "expires_at": None, "context_length": ps_context}], "ollama:/api/ps"))
+    monkeypatch.setattr(server._ollama, "observe_tags", lambda: Observation({"m:latest": 4000}, "sizes"))
+    monkeypatch.setattr(server._ollama, "observe_show", _show(_KV_INFO), raising=False)
+    result = server._warm_impl("m", "5m", "tester", False, num_ctx=requested)
+    assert result["reason"] == reason
 
 
 def test_strict_fit_refuses_unknown_free_memory_without_offering_force(strict_env):

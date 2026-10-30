@@ -83,8 +83,18 @@ def test_combined_status():
     assert len(status["gpus"]) == 1
     assert status["loaded"] == [
         {"name": "big", "size_vram_mb": 8192, "total_size_mb": 8192,
-         "offloaded_to_cpu": False, "expires_at": "2026-07-11T10:00:00Z"},
+         "offloaded_to_cpu": False, "expires_at": "2026-07-11T10:00:00Z",
+         "context_length": None},
     ]
+
+
+def test_combined_status_keeps_each_models_context_length():
+    """warm compares it with a requested num_ctx; dropping it here made every
+    resident model look like it was loaded at an unknown context."""
+    models = [{"name": "m", "size": gb_bytes(8), "size_vram": gb_bytes(8),
+               "expires_at": None, "context_length": 65536}]
+    status = core.combined_status(gpu_fn_const(6000), FakeOllama(models))
+    assert status["loaded"][0]["context_length"] == 65536
 
 
 def test_combined_status_no_gpu():
@@ -1170,6 +1180,15 @@ def test_kv_cache_mb_rounds_up_rather_than_under_reporting():
     {**_LLAMA_INFO, "llama.block_count": "32"},
     {**_LLAMA_INFO, "llama.attention.head_count_kv": True},
     {**_LLAMA_INFO, "llama.attention.head_count_kv": [8, None]},
+    # A per-layer list must cover every layer, or the rest go uncounted.
+    {**_LLAMA_INFO, "llama.attention.head_count_kv": [8] * 8},
+    {k: v for k, v in {**_LLAMA_INFO, "llama.attention.head_count_kv": [8] * 32}.items()
+     if k != "llama.block_count"},
+    # The head-dimension fallback must divide exactly.
+    {**{k: v for k, v in _LLAMA_INFO.items() if not k.endswith(("key_length", "value_length"))},
+     "llama.attention.head_count": 3},
+    {**{k: v for k, v in _LLAMA_INFO.items() if not k.endswith("value_length")},
+     "llama.attention.head_count": 5000},
     {k: v for k, v in _LLAMA_INFO.items()
      if k not in ("llama.attention.key_length", "llama.embedding_length")},
 ])

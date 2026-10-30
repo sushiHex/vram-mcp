@@ -193,6 +193,7 @@ the admission decision:
 | `no_headroom` | Reservations leave no free headroom; the load is refused. |
 | `insufficient_headroom` | The estimated model size exceeds remaining headroom; the load is refused. |
 | `strict_fit_forced` | `strict_fit=True` was combined with `force=True`; the call is refused. |
+| `num_ctx_required` | `strict_fit=True` was passed without `num_ctx`; the call is refused. |
 
 `size_verified=false` means the `fits` check did not pass or run; read `reason`
 to distinguish cases. Even `fits` uses on-disk size as an estimate, not a
@@ -207,7 +208,9 @@ keep-alive refresh.
 `options.num_ctx`. Admission then adds an estimated KV cache, reported as
 `kv_cache_mb`, to the on-disk size. The estimate comes from the model's
 architecture metadata (`/api/show`): `num_ctx` x per-layer KV heads x (key +
-value head dimensions) x 2 bytes. It assumes Ollama's default f16 cache, which
+value head dimensions) x 2 bytes. A per-layer head list must have one entry
+per layer (`block_count`). Head dimensions derived from `embedding_length /
+head_count` must divide exactly. It assumes Ollama's default f16 cache, which
 is the widest type: a `q8_0` or `q4_0` cache needs a half or a quarter of that.
 Ollama also multiplies the context by `OLLAMA_NUM_PARALLEL`, which a client
 cannot see. Declare it with `num_parallel` (default `1`); the result reports
@@ -227,8 +230,9 @@ models to make room. A caller that must not over-commit the device passes
   KV, must fit within free VRAM minus reservations minus
   `VRAM_MCP_FIT_MARGIN_MB` (1024 by default, the `tight` threshold).
   `headroom_mb` reports that net room, and `fit_margin_mb` reports the margin.
-- `num_ctx` is required. Without it the server's default context, and so its
-  KV cache, is unknown, and the load is refused as `size_unknown`.
+- `num_ctx` is required, even for a model that is already resident. Without it
+  Ollama uses its default context, which a client cannot see and which can
+  reload a resident model, so the call is refused as `num_ctx_required`.
 - Unknown free memory or an unknown size refuses.
 - `force=True` cannot bypass the check. The combination is refused as
   `strict_fit_forced`.
