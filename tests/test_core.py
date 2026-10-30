@@ -808,6 +808,32 @@ def test_combined_status_other_processes_from_procinfo():
     ]
 
 
+def test_combined_status_flags_runners_the_configured_ollama_does_not_serve():
+    """A runner that no loaded model correlates to belongs to another server
+    (or failed correlation): its VRAM is in use but nothing in `loaded` says so."""
+    models = [{"name": "m1", "size": gb_bytes(4), "size_vram": gb_bytes(4), "expires_at": None}]
+    status = core.combined_status(
+        gpu_fn_const(8000), FakeOllama(models),
+        snapshot_fn=lambda correlate: _snap(pid_map={"m1": 555}),
+        procinfo_fn=lambda: [
+            {"pid": 555, "size_mb": None, "name": "llama-server.exe", "kind": "compute"},
+            {"pid": 777, "size_mb": None, "name": "LLAMA-SERVER.EXE", "kind": "compute"},
+            {"pid": 778, "size_mb": None, "name": "ollama_llama_server", "kind": "compute"},
+            {"pid": 999, "size_mb": None, "name": "python.exe", "kind": "compute"},
+            {"pid": 1000, "size_mb": None, "name": None, "kind": "wddm"},
+        ],
+    )
+    assert status["unmonitored_runtimes"] == [
+        {"pid": 777, "name": "LLAMA-SERVER.EXE"}, {"pid": 778, "name": "ollama_llama_server"}]
+
+
+def test_combined_status_leaves_unmonitored_runtimes_unknown_without_a_process_table():
+    status = core.combined_status(
+        gpu_fn_const(8000), FakeOllama([]),
+        procinfo_fn=lambda: Observation(None, "procs", error="unavailable"))
+    assert status["unmonitored_runtimes"] is None
+
+
 def test_pressure_sees_ollama_runner_spill():
     """The runner is filtered out of other_processes but MUST still count
     toward the non-local figures: it is the biggest holder.

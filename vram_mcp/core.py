@@ -133,6 +133,19 @@ def attach_coordination(loaded: list[dict], snap: Snapshot) -> tuple[list[dict],
     return out, resolved
 
 
+# Process names of llama.cpp runners, as Ollama ships them (current, older).
+_RUNTIME_NAMES = frozenset({"llama-server", "ollama_llama_server"})
+
+
+def unmonitored_runtimes(others: list[dict]) -> list[dict]:
+    """Model runners holding the GPU that serve no model the configured Ollama
+    reports: another Ollama's, a bare llama-server, or one whose correlation
+    failed. Their VRAM is in use but no ``loaded`` entry explains it."""
+    return [{"pid": p["pid"], "name": p["name"]} for p in others
+            if isinstance(p.get("name"), str)
+            and p["name"].lower().removesuffix(".exe") in _RUNTIME_NAMES]
+
+
 def other_processes(process_table: list[dict], exclude_pids: set) -> list[dict]:
     """Every VRAM holder in ``process_table`` that isn't an already-listed
     Ollama model.
@@ -334,6 +347,8 @@ def combined_status(
         totals = process_reading.totals or {}
         result["other_processes"] = (other_processes(full_table, resolved_pids)
                                      if process_reading.known else None)
+        result["unmonitored_runtimes"] = (unmonitored_runtimes(result["other_processes"])
+                                          if process_reading.known else None)
     pressure_models = loaded
     if source is not None and gpu_reading.scope:
         selected_pids = {row["pid"] for row in full_table}
