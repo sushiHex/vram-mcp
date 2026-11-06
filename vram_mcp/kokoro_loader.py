@@ -276,10 +276,10 @@ class KokoroLoader:
 
     def status(self, owner, handle):
         with self._lock:
-            self._refresh_locked()
             record = self._records.get(handle) if type(handle) is str else None
             if record is None or record['owner'] != owner:
                 return _result('refused', 'refused', 'operation_not_owned')
+            self._refresh_locked((record,))
             return self._view(handle, record)
 
     def stop(self, owner, handle):
@@ -327,8 +327,8 @@ class KokoroLoader:
                 raise RuntimeError('admission_release_unproven')
             record['admission'] = None
 
-    def _refresh_locked(self):
-        for record in self._records.values():
+    def _refresh_locked(self, records=None):
+        for record in self._records.values() if records is None else records:
             if record['state'] == 'stopped':
                 continue
             process = record['process']

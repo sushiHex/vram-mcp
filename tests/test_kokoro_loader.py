@@ -541,3 +541,20 @@ def test_retained_admission_result_cannot_be_reported_as_released(rig, monkeypat
     assert result['outcome'] == 'unknown' and result['state'] == 'cleanup_unknown'
     assert process.poll() is not None
     assert claims.list_coordination(path=manager.ledger_path)['operations']
+
+
+def test_status_without_matching_live_operation_cannot_trigger_its_cleanup(rig, monkeypatch):
+    manager, _, _, process, _, _ = rig
+    first = load(manager)
+    renew = claims.renew
+    monkeypatch.setattr(claims, 'renew', lambda *args, **kwargs: {'ok': False})
+    assert manager.status('other-owner', first['operation_id'])['outcome'] == 'refused'
+    assert process.poll() is None
+    manager.stop('hermes-preview', first['operation_id'])
+    second = Process()
+    manager.spawn = lambda *args, **kwargs: second
+    monkeypatch.setattr(claims, 'renew', renew)
+    assert load(manager, 'request-two')['state'] == 'launch_accepted'
+    monkeypatch.setattr(claims, 'renew', lambda *args, **kwargs: {'ok': False})
+    assert manager.status('hermes-preview', first['operation_id'])['state'] == 'stopped'
+    assert second.poll() is None
