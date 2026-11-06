@@ -191,7 +191,8 @@ class KokoroLoader:
                 handle = secrets.token_urlsafe(32)
                 record = {'owner': owner, 'request': request_id, 'binding': binding,
                           'reservation': reservation, 'process': None, 'state': 'launching',
-                          'failure': None, 'spawn_unknown': False, 'admission': None}
+                          'failure': None, 'spawn_unknown': False,
+                          'admission': operation['operation_id']}
                 self._records[handle] = record
                 if self._monitor and self._thread is None:
                     thread = threading.Thread(target=self._watch, daemon=True,
@@ -243,7 +244,10 @@ class KokoroLoader:
                         record['admission'] = operation['operation_id']
                     else:
                         try:
-                            self._ledger('finish_operation', operation['operation_id'])
+                            if record is None:
+                                self._ledger('finish_operation', operation['operation_id'])
+                            else:
+                                self._finish_admission(record)
                         except Exception:
                             if record is not None:
                                 self._settle(record)
@@ -309,13 +313,19 @@ class KokoroLoader:
             if process is not None and process.poll() is None:
                 raise RuntimeError('still_running')
             self._ledger('release', record['reservation'])
-            if record.get('admission'):
-                self._ledger('finish_operation', record['admission'])
-                record['admission'] = None
+            self._finish_admission(record)
             record['process'] = None
             record['state'] = 'stopped'
         except Exception:
             record['state'] = 'cleanup_unknown'
+
+    def _finish_admission(self, record):
+        operation = record.get('admission')
+        if operation is not None:
+            result = self._ledger('finish_operation', operation)
+            if type(result.get('ok')) is not bool or result.get('retained') is not False:
+                raise RuntimeError('admission_release_unproven')
+            record['admission'] = None
 
     def _refresh_locked(self):
         for record in self._records.values():

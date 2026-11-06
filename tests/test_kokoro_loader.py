@@ -71,6 +71,7 @@ def rig(tmp_path, monkeypatch):
         ledger_path=tmp_path / 'claims.json', platform='win32', monitor=False,
         interpreter_probe=lambda *args: None,
     )
+    original_finish = claims.finish_operation
     yield manager, profile, profile_path, process, calls, reading
     manager.close()
     # A refused/unknown native process has no real child in these mocks. Drop
@@ -78,7 +79,7 @@ def rig(tmp_path, monkeypatch):
     # claiming successful worker cleanup or clearing its unknown receipt.
     for record in manager._records.values():
         if record.get('admission'):
-            claims.finish_operation(record['admission'], uncertain=True, path=manager.ledger_path)
+            original_finish(record['admission'], uncertain=True, path=manager.ledger_path)
 
 
 def load(manager, request='request-one', token='x' * 43):
@@ -285,7 +286,7 @@ def test_finalize_error_does_not_return_stale_launch_acceptance(rig, monkeypatch
         finish(*args, **kwargs)
         raise OSError('private error')
     monkeypatch.setattr(claims, 'finish_operation', fail)
-    assert load(manager)['outcome'] == 'failed'
+    assert load(manager)['outcome'] != 'succeeded'
     assert process.poll() is not None
     assert claims.list_claims(path=manager.ledger_path) == []
 
@@ -510,3 +511,33 @@ def test_known_unsettled_child_keeps_startup_admission_until_verified_exit(rig):
     process.code = -9
     assert manager.status('hermes-preview', result['operation_id'])['state'] == 'stopped'
     assert claims.list_coordination(path=manager.ledger_path)['operations'] == []
+
+
+def test_failed_admission_release_stays_unknown_until_retry_proves_release(rig, monkeypatch):
+    manager, _, _, process, _, _ = rig
+    finish = claims.finish_operation
+    failing = True
+    def unavailable(*args, **kwargs):
+        if failing:
+            raise OSError('synthetic admission release failure')
+        return finish(*args, **kwargs)
+    monkeypatch.setattr(claims, 'finish_operation', unavailable)
+    result = load(manager)
+    assert process.poll() is not None
+    assert result['outcome'] == 'unknown' and result['state'] == 'cleanup_unknown'
+    assert claims.list_coordination(path=manager.ledger_path)['operations']
+    assert manager.status('hermes-preview', result['operation_id'])['outcome'] == 'unknown'
+    failing = False
+    recovered = manager.status('hermes-preview', result['operation_id'])
+    assert recovered['state'] == 'stopped' and recovered['outcome'] == 'failed'
+    assert claims.list_coordination(path=manager.ledger_path)['operations'] == []
+
+
+def test_retained_admission_result_cannot_be_reported_as_released(rig, monkeypatch):
+    manager, _, _, process, _, _ = rig
+    monkeypatch.setattr(claims, 'finish_operation', lambda *args, **kwargs:
+                        {'ok': True, 'retained': True})
+    result = load(manager)
+    assert result['outcome'] == 'unknown' and result['state'] == 'cleanup_unknown'
+    assert process.poll() is not None
+    assert claims.list_coordination(path=manager.ledger_path)['operations']
