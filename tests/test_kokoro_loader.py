@@ -558,3 +558,30 @@ def test_status_without_matching_live_operation_cannot_trigger_its_cleanup(rig, 
     monkeypatch.setattr(claims, 'renew', lambda *args, **kwargs: {'ok': False})
     assert manager.status('hermes-preview', first['operation_id'])['state'] == 'stopped'
     assert second.poll() is None
+
+
+def test_prelaunch_admission_cleanup_error_requires_scoped_server_shutdown(rig, monkeypatch):
+    manager, profile, _, _, calls, _ = rig
+    manager.gpu_reading = lambda: Observation([{'index': 0, 'uuid': profile['gpu_uuid'],
+                                               'free_mb': 1024}], 'fake')
+    finish = claims.finish_operation
+    def unavailable(*args, **kwargs):
+        raise OSError('synthetic prelaunch admission release failure')
+    monkeypatch.setattr(claims, 'finish_operation', unavailable)
+    try:
+        result = load(manager)
+        assert result['outcome'] == 'unknown' and result['state'] == 'cleanup_unknown'
+        assert result['reason'] == 'scoped_server_shutdown_required'
+        assert result['operation_id'] is None and calls == []
+        other = claims.begin_operation('personal', 'warm', path=manager.ledger_path)
+        try:
+            assert other['ok'] is False and other['reason'] == 'capacity_pending'
+        finally:
+            if other['ok']:
+                finish(other['operation_id'], path=manager.ledger_path)
+        assert load(manager, 'request-two')['reason'] == 'scoped_server_shutdown_required'
+    finally:
+        # Simulate scoped-server death releasing its private OS leases. This is
+        # test cleanup, not a production reconciliation or successful receipt.
+        for operation in claims.list_coordination(path=manager.ledger_path)['operations']:
+            finish(operation['operation_id'], uncertain=True, path=manager.ledger_path)

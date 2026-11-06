@@ -129,6 +129,7 @@ class KokoroLoader:
         self._lock = threading.RLock()
         self._records = {}
         self._closed = False
+        self._shutdown_required = False
         self._wake = threading.Event()
         self._thread = None
         self._monitor = monitor
@@ -144,6 +145,7 @@ class KokoroLoader:
             answer = None
             try:
                 require(not self._closed, 'closed')
+                require(not self._shutdown_required, 'scoped_server_shutdown_required')
                 require(self.platform == 'win32', 'unsupported_platform')
                 require(type(owner) is str and _LABEL.fullmatch(owner), 'request_schema')
                 require(type(request_id) is str and _LABEL.fullmatch(request_id), 'request_schema')
@@ -245,7 +247,7 @@ class KokoroLoader:
                     else:
                         try:
                             if record is None:
-                                self._ledger('finish_operation', operation['operation_id'])
+                                self._finish_admission({'admission': operation['operation_id']})
                             else:
                                 self._finish_admission(record)
                         except Exception:
@@ -254,13 +256,16 @@ class KokoroLoader:
                                 record['failure'] = 'admission_finalize_failed'
                                 answer = self._view(handle, record)
                             else:
-                                answer = _result('failed', 'stopped', 'admission_finalize_failed')
+                                self._shutdown_required = True
+                                answer = _result('unknown', 'cleanup_unknown',
+                                                 'scoped_server_shutdown_required')
                 if reservation is not None and (record is None or (
                         record['process'] is None and not record['spawn_unknown'])):
                     try:
                         self._ledger('release', reservation)
                     except Exception:
-                        answer = _result('unknown', 'cleanup_unknown', 'reservation_release_unproven')
+                        if not self._shutdown_required:
+                            answer = _result('unknown', 'cleanup_unknown', 'reservation_release_unproven')
             if record is not None and record['state'] == 'cleanup_unknown':
                 return self._view(handle, record)
             return answer

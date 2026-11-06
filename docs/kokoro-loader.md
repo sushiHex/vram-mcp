@@ -88,6 +88,13 @@ or expired reservation cannot admit competing cooperative loads while this
 server still owns the operation. Known successful launch rechecks its reservation
 before returning acceptance and releases the warm lock for normal service use.
 
+If admission cleanup fails before a child operation handle exists, the reply is
+`unknown` / `cleanup_unknown` with `scoped_server_shutdown_required`. The client
+must close that scoped MCP server and must not retry there. No child was started;
+the existing module-owned admission lock stays held until server exit, and the
+server refuses further loads rather than claiming a stopped operation or trying
+to reconcile an unpublished handle.
+
 The token, request arguments, arbitrary exception details and private profile
 paths are neither returned nor placed in vram-mcp's action audit. Keep private
 MCP control traffic out of public evidence. Operation results expose only fixed
