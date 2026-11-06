@@ -11,6 +11,7 @@ So these tests assert key-set EQUALITY rather than containment, across every
 outcome a tool can produce. Equality catches both directions at the point the
 result is built, instead of at the point an agent notices something missing.
 """
+import asyncio
 from typing import get_type_hints
 
 import pytest
@@ -81,10 +82,25 @@ def _release_operation_locks():
     server._claims._OPERATION_LOCKS.clear()
 
 
+def _kokoro_refused(monkeypatch, tool):
+    from vram_mcp.kokoro_loader import KokoroLoader
+    loader = KokoroLoader(None, gpu_reading=lambda: None, platform='win32', monitor=False)
+    monkeypatch.setattr(server, '_kokoro_loader', loader)
+    if tool == 'load_kokoro':
+        return asyncio.run(server.load_kokoro('owner', 'request', 12345, 'x' * 43))
+    return asyncio.run(getattr(server, tool)('owner', 'not-an-operation'))
+
+
 # (tool, schema, builder) — builder returns the raw impl result for one path.
 # Every tool with a declared output schema must appear here; the completeness
 # test below fails if one is added without coverage.
 CASES = [
+    ('load_kokoro', schemas.KokoroResult, 'refused',
+     lambda mp: _kokoro_refused(mp, 'load_kokoro')),
+    ('kokoro_status', schemas.KokoroResult, 'refused',
+     lambda mp: _kokoro_refused(mp, 'kokoro_status')),
+    ('stop_kokoro', schemas.KokoroResult, 'refused',
+     lambda mp: _kokoro_refused(mp, 'stop_kokoro')),
     ("claim", schemas.ClaimResult, "succeeded",
      lambda mp: server._claim_impl("m:1", "owner", "purpose", 60)),
     ("claim", schemas.ClaimResult, "ledger_error",

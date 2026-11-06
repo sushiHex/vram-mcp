@@ -208,6 +208,7 @@ The client's MCP schema provides full arguments and defaults.
 | `list_claims` | See active model claims and capacity reservations. |
 | `history`, `trend` | Review recorded actions, observed changes, and memory samples. |
 | `advise` | Get configuration suggestions; no settings are changed. |
+| `load_kokoro`, `kokoro_status`, `stop_kokoro` | Optional Windows-only launch and settlement of the operator-configured reviewed Kokoro worker; launch acceptance is not GPU readiness. |
 
 ## Guides
 
@@ -216,6 +217,7 @@ The client's MCP schema provides full arguments and defaults.
 | [Configuration](docs/configuration.md) | Source installation, environment variables, and connection troubleshooting. |
 | [Coordination and diagnostics](docs/coordination.md) | Claims, reservations, protection limits, pressure, and audit history. |
 | [Hardware acceptance](docs/acceptance.md) | The opt-in run against a real GPU and Ollama, and the environments it has validated. |
+| [Owned Kokoro worker](docs/kokoro-loader.md) | Optional private profile, supported worker pin, admission, process ownership and separate deployment/qualification limits. |
 
 ## Development
 

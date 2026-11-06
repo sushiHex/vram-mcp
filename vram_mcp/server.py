@@ -19,6 +19,7 @@ import os
 import math
 import re
 import sys
+import threading
 
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any, Optional, get_args, get_origin, get_type_hints
@@ -40,7 +41,7 @@ from .ollama import OllamaClient
 from .ollama_correlate import runner_pid_map
 from .schemas import (
     ClaimResult, EnsureFreeResult, ListClaimsResult, ReleaseResult,
-    RenewResult, ReserveResult, ResidencyResult,
+    RenewResult, ReserveResult, ResidencyResult, KokoroResult,
 )
 
 mcp = FastMCP("vram-mcp")
@@ -104,6 +105,56 @@ def _fit_margin_setting():
 _LOAD_TIMEOUT = _load_timeout_setting()
 _FIT_MARGIN_MB = _fit_margin_setting()
 _ollama = OllamaClient(base_url=_OLLAMA_BASE_URL, residency_timeout=_LOAD_TIMEOUT)
+_kokoro_loader = None
+_kokoro_lock = threading.Lock()
+
+
+def _owned_kokoro():
+    """Optional operator profile; importing the server never launches anything."""
+    global _kokoro_loader
+    with _kokoro_lock:
+        if _kokoro_loader is None:
+            from .kokoro_loader import KokoroLoader
+            _kokoro_loader = KokoroLoader(os.environ.get("VRAM_MCP_KOKORO_PROFILE"),
+                                          gpu_reading=lambda: _gpu_reading())
+        return _kokoro_loader
+
+
+@mcp.tool()
+async def load_kokoro(owner: Any = None, request_id: Any = None, connect_port: Any = None,
+                      auth_token: Any = None) -> KokoroResult:
+    """Admit and own the configured Kokoro worker, without claiming GPU readiness.
+
+    No command or path is accepted. auth_token is private one-use loopback
+    authentication data: it is never returned or audited. The configured worker
+    uses the admitted GPU exclusively through CUDA_VISIBLE_DEVICES. Hermes must
+    independently validate the worker's authenticated CUDA-ready handshake.
+    Reuse request_id with identical arguments after an uncertain response;
+    never start a second operation as a timeout fallback.
+    """
+    # Validate inside the payload-free loader: SDK argument-validation errors
+    # can otherwise render the entire argument dict, including auth_token.
+    loader = _owned_kokoro()
+    try:
+        return await _in_thread(loader.load, owner, request_id, connect_port, auth_token)
+    except BaseException:
+        # Do not lose custody when an MCP client cancels while the launch thread
+        # is finishing. No untrusted arguments or exception details are logged.
+        with anyio.CancelScope(shield=True):
+            await _in_thread(loader.cancel_request, owner, request_id)
+        raise
+
+
+@mcp.tool()
+async def kokoro_status(owner: Any = None, operation_id: Any = None) -> KokoroResult:
+    """Read only this server's owner-bound worker operation; never GPU-ready proof."""
+    return await _in_thread(_owned_kokoro().status, owner, operation_id)
+
+
+@mcp.tool()
+async def stop_kokoro(owner: Any = None, operation_id: Any = None) -> KokoroResult:
+    """Settle only the matching owned worker before releasing its capacity."""
+    return await _in_thread(_owned_kokoro().stop, owner, operation_id)
 
 
 def _lease_for(timeout) -> int:
@@ -1039,7 +1090,11 @@ def main() -> None:
     """Console entry point: run the MCP server over stdio."""
     if _paging is not None:
         _paging.start()
-    mcp.run()
+    try:
+        mcp.run()
+    finally:
+        if _kokoro_loader is not None:
+            _kokoro_loader.close()
 
 
 if __name__ == "__main__":

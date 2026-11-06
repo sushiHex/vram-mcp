@@ -66,6 +66,15 @@ class ListClaimsResult(TypedDict):
     summary: str
 
 
+class KokoroResult(TypedDict):
+    ok: bool
+    outcome: Outcome
+    state: Literal["launch_accepted", "stopped", "refused", "cleanup_unknown"]
+    reason: str | None
+    operation_id: str | None
+    gpu_ready: Literal[False]
+
+
 class ClaimResult(CoordinationBase):
     claim_id: str | None
     expires_at: str | None
