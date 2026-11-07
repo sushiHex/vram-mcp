@@ -19,8 +19,8 @@ from pathlib import Path
 from . import claims, core
 
 # Reviewed Hermes worker: parent HANDLE watchdog starts before any CUDA import.
-# Source authority: sushiHex/hermes-realtime, worker at 0fbb06e35e96ee435b90cd58aa90a1d83b61bbfe.
-WORKER_SHA256 = 'a63835d3268dadc2683aaf3db4f2dfdf8fe629f484ef7771d119f7988f7a5053'
+# Source authority: sushiHex/hermes-realtime, worker at 8036ba15b8d1d9ee768736639423545812307cc6.
+WORKER_SHA256 = '5b7a6da3623c7896c14494b9edbe9bca831057f628b01852a249ab4495cb82c3'
 MODEL_SHA256 = 'beb0d1848dee9a49da392cc3df26958d46cfa35d321edf434f52949153f0df3a'
 VOICES_SHA256 = 'bca610b8308e8d99f32e6fe4197e7ec01679264efed0cac9140fe9c29f1fbf7d'
 _TOKEN_ENV = 'HERMES_KOKORO_WORKER_TOKEN'
