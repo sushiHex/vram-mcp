@@ -21,7 +21,9 @@ The version-1 profile has exactly these keys, with only `execution_policy` optio
 | `voice`, `language` | Currently `bf_isabella` and `en-gb`. |
 | `execution_policy` (optional) | `cuda-primary-profiled` (the unchanged default) or `cuda-primary-profiled-kokoro-v1-benchmark`. No other policy or operation list is accepted. |
 
-The benchmark policy is an explicit operator-only opt-in for a private comparison.
+The benchmark policy is an explicit operator-owned opt-in for a private comparison
+or a managed host that has separately qualified and explicitly adopted the fixed
+model/runtime policy. The loader default remains strict.
 Absent or explicit strict policy preserves the exact legacy worker command. Only
 the benchmark policy appends the fixed `--execution-policy` argument; tool callers
 cannot select a policy or supply CPU-operation names. Existing servers that do not
@@ -34,12 +36,14 @@ coverage. The ready message identifies the selected policy exactly; a client
 expecting strict policy must reject benchmark readiness and vice versa. This is
 not a claim that those operations are universally metadata-only or cheap. It does
 not adopt GPU synthesis, change an existing CPU host, relax admission, or establish
-a speed benefit. Keep strict policy unless an explicitly scoped comparison is run.
+a speed benefit. Managed-host adoption requires a separate owner decision and
+qualification of ownership, device placement, resources and speech behavior;
+selecting this policy does not supply those results.
 
 Only the reviewed Hermes worker at
-[`3e21280a96b21d92bdedefe150cf610c16d2bae1`](https://github.com/sushiHex/hermes-realtime/blob/3e21280a96b21d92bdedefe150cf610c16d2bae1/src/hermes_realtime/providers/kokoro_worker.py)
+[`a65f654db0770289e44332d7e399f388aa1b8340`](https://github.com/sushiHex/hermes-realtime/blob/a65f654db0770289e44332d7e399f388aa1b8340/src/hermes_realtime/providers/kokoro_worker.py)
 is supported, with LF source SHA-256
-`9abe7de44fb5f1796adf8378c4e384c4bc6a7c8f63997686398871bcfc8a8e46`.
+`234af8023f021754185531aa1bbcb6e1edb6c7424b927074b630ada5257ecb72`.
 Its Windows parent-handle watchdog starts before CUDA initialization. The
 reviewed-source comparison accepts only LF/CRLF mechanical equivalence; the
 profile's independent raw digest must still match the exact on-disk file. New
