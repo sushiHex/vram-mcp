@@ -21,9 +21,9 @@ The profile has exactly these version-1 keys:
 | `voice`, `language` | Currently `bf_isabella` and `en-gb`. |
 
 Only the reviewed Hermes worker at
-[`8036ba15b8d1d9ee768736639423545812307cc6`](https://github.com/sushiHex/hermes-realtime/blob/8036ba15b8d1d9ee768736639423545812307cc6/src/hermes_realtime/providers/kokoro_worker.py)
+[`70c79e1dc88cc6dfc9ea356f5b6f1141037bfd3e`](https://github.com/sushiHex/hermes-realtime/blob/70c79e1dc88cc6dfc9ea356f5b6f1141037bfd3e/src/hermes_realtime/providers/kokoro_worker.py)
 is supported, with LF source SHA-256
-`5b7a6da3623c7896c14494b9edbe9bca831057f628b01852a249ab4495cb82c3`.
+`ec6324e32b543f32a60ac3d7eed3c4ac686e564249454d768d68cc21bd5db20f`.
 Its Windows parent-handle watchdog starts before CUDA initialization. The
 reviewed-source comparison accepts only LF/CRLF mechanical equivalence; the
 profile's independent raw digest must still match the exact on-disk file. New
