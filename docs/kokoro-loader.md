@@ -101,6 +101,41 @@ MCP control traffic out of public evidence. Operation results expose only fixed
 categories and an opaque operation handle; they never establish CUDA readiness,
 desktop usability, audible quality, or an attributable exact VRAM peak.
 
+Owned results also include nullable `worker_exit_code` and `worker_exit_category`.
+The code is an observed exact integer in the signed/unsigned 32-bit OS domain;
+unknown codes retain their number with a null category. Non-integer or out-of-range
+values, unowned handles, and unwitnessed spawn outcomes expose neither field.
+These observations survive settlement but do not alter outcome, state, readiness,
+or the requirement to prove process exit and release capacity. No stderr is captured.
+
+Only a natural exit observed before any loader termination attempt receives one
+of the reviewed worker's fixed categories. An attempted termination permanently
+disables category attribution, including races or a failed termination call.
+Watchdog exits 70/71 and native crashes have no category. Code 93 is a neutral
+worker-service boundary, and does not imply startup failure or previous readiness.
+
+| Code | Worker boundary |
+| --- | --- |
+| 80 | `authentication_failed` |
+| 81 | `parent_watchdog_failed` |
+| 82 | `asset_attestation_failed` |
+| 83 | `dependency_import_failed` |
+| 84 | `dll_preload_failed` |
+| 85 | `cuda_session_failed` |
+| 86 | `cuda_provider_rejected` |
+| 87 | `kokoro_engine_failed` |
+| 88 | `attestation_synthesis_failed` |
+| 89 | `cuda_profile_unavailable_or_invalid` |
+| 90 | `cuda_profile_missing_core_ops` |
+| 91 | `cuda_profile_forbidden_cpu_ops` |
+| 92 | `loopback_connection_failed` |
+| 93 | `worker_service_failed` |
+
+Categories locate a failure boundary; they do not establish its underlying cause.
+The reviewed worker source pin and operator profile's exact file hash must both
+be explicitly upgraded together before using a changed worker. Installing this
+code alone does not reload a server or activate a new worker/profile.
+
 The existing coordination model remains cooperative: other processes and force
 overrides can bypass reservations. A failed OS or ledger operation is reported
 as unknown, not as successful cleanup. This feature does not replace broader

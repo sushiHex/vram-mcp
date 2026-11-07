@@ -86,6 +86,133 @@ def load(manager, request='request-one', token='x' * 43):
     return manager.load('hermes-preview', request, 12345, token)
 
 
+@pytest.mark.parametrize('code', (0, 17, 70, 71, -9, 4294967295))
+def test_natural_exit_code_survives_settlement_without_invented_category(rig, code):
+    manager, _, _, process, _, _ = rig
+    accepted = load(manager)
+    assert accepted['worker_exit_code'] is None
+    assert accepted['worker_exit_category'] is None
+    process.code = code
+    stopped = manager.status('hermes-preview', accepted['operation_id'])
+    assert stopped['state'] == 'stopped' and stopped['gpu_ready'] is False
+    assert stopped['worker_exit_code'] == code
+    assert stopped['worker_exit_category'] is None
+    assert not process.terminated
+    assert manager.stop('hermes-preview', accepted['operation_id']) == stopped
+    assert load(manager) == stopped
+    refused = manager.status('another-owner', accepted['operation_id'])
+    assert refused['worker_exit_code'] is None
+    assert refused['worker_exit_category'] is None
+
+
+@pytest.mark.parametrize(('code', 'category'), (
+    (80, 'authentication_failed'), (81, 'parent_watchdog_failed'),
+    (82, 'asset_attestation_failed'), (83, 'dependency_import_failed'),
+    (84, 'dll_preload_failed'), (85, 'cuda_session_failed'),
+    (86, 'cuda_provider_rejected'), (87, 'kokoro_engine_failed'),
+    (88, 'attestation_synthesis_failed'), (89, 'cuda_profile_unavailable_or_invalid'),
+    (90, 'cuda_profile_missing_core_ops'), (91, 'cuda_profile_forbidden_cpu_ops'),
+    (92, 'loopback_connection_failed'), (93, 'worker_service_failed'),
+))
+def test_pinned_worker_natural_exit_maps_only_fixed_boundary(rig, code, category):
+    manager, _, _, process, _, _ = rig
+    accepted = load(manager)
+    process.code = code
+    stopped = manager.status('hermes-preview', accepted['operation_id'])
+    assert stopped['worker_exit_code'] == code
+    assert stopped['worker_exit_category'] == category
+    assert stopped['gpu_ready'] is False
+    assert manager.stop('hermes-preview', accepted['operation_id']) == stopped
+    from vram_mcp import server
+    for name in ('load_kokoro', 'kokoro_status', 'stop_kokoro'):
+        tool = server.mcp._tool_manager.get_tool(name)
+        validated = tool.fn_metadata.output_model.model_validate(stopped).model_dump()
+        assert validated['worker_exit_code'] == code
+        assert validated['worker_exit_category'] == category
+
+
+def test_loader_termination_never_claims_worker_startup_category(rig):
+    manager, _, _, process, _, _ = rig
+    accepted = load(manager)
+    def terminated_with_reserved_code():
+        process.terminated = True
+        process.code = 80
+    process.terminate = terminated_with_reserved_code
+    stopped = manager.stop('hermes-preview', accepted['operation_id'])
+    assert stopped['worker_exit_code'] == 80
+    assert stopped['worker_exit_category'] is None
+    assert manager.status('hermes-preview', accepted['operation_id']) == stopped
+
+
+def test_failed_termination_retains_attribution_latch_until_later_exit(rig):
+    manager, _, _, process, _, _ = rig
+    accepted = load(manager)
+    def failed_terminate():
+        raise OSError('synthetic private detail')
+    process.terminate = failed_terminate
+    uncertain = manager.stop('hermes-preview', accepted['operation_id'])
+    assert uncertain['state'] == 'cleanup_unknown'
+    assert uncertain['worker_exit_code'] is None
+    process.code = 83
+    stopped = manager.status('hermes-preview', accepted['operation_id'])
+    assert stopped['worker_exit_code'] == 83
+    assert stopped['worker_exit_category'] is None
+
+
+def test_loader_kill_retains_code_without_worker_category(rig):
+    manager, _, _, process, _, _ = rig
+    accepted = load(manager)
+    process.terminate = lambda: None
+    def killed_with_reserved_code():
+        process.killed = True
+        process.code = 85
+    process.kill = killed_with_reserved_code
+    stopped = manager.stop('hermes-preview', accepted['operation_id'])
+    assert process.killed and stopped['state'] == 'stopped'
+    assert stopped['worker_exit_code'] == 85
+    assert stopped['worker_exit_category'] is None
+
+
+def test_unwitnessed_spawn_has_no_exit_diagnostics(rig):
+    manager, _, _, _, _, _ = rig
+    def spawn(*args, **kwargs):
+        raise OSError('synthetic private detail')
+    manager.spawn = spawn
+    unknown = load(manager)
+    assert unknown['state'] == 'cleanup_unknown'
+    assert unknown['worker_exit_code'] is None
+    assert unknown['worker_exit_category'] is None
+
+
+@pytest.mark.parametrize('code', (True, '80', -(2 ** 31) - 1, 2 ** 32))
+def test_noninteger_process_exit_value_cannot_become_diagnostic_metadata(rig, code):
+    manager, _, _, process, _, _ = rig
+    accepted = load(manager)
+    process.code = code
+    stopped = manager.status('hermes-preview', accepted['operation_id'])
+    assert stopped['worker_exit_code'] is None
+    assert stopped['worker_exit_category'] is None
+
+
+def test_exit_metadata_never_bypasses_unproven_reservation_cleanup(rig, monkeypatch):
+    manager, _, _, process, _, _ = rig
+    accepted = load(manager)
+    process.code = 80
+    original = manager._ledger
+    def ledger(method, *args, **kwargs):
+        if method == 'release':
+            raise OSError('synthetic private detail')
+        return original(method, *args, **kwargs)
+    monkeypatch.setattr(manager, '_ledger', ledger)
+    uncertain = manager.status('hermes-preview', accepted['operation_id'])
+    assert uncertain['state'] == 'cleanup_unknown' and uncertain['gpu_ready'] is False
+    assert uncertain['worker_exit_code'] == 80
+    assert claims.list_claims(path=manager.ledger_path)
+    monkeypatch.setattr(manager, '_ledger', original)
+    stopped = manager.stop('hermes-preview', accepted['operation_id'])
+    assert stopped['state'] == 'stopped' and stopped['worker_exit_code'] == 80
+
+
 def test_load_owns_cpu_ineligible_worker_and_device_without_claiming_gpu_ready(rig):
     manager, _, _, process, calls, _ = rig
     result = load(manager)

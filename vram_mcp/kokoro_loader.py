@@ -19,11 +19,20 @@ from pathlib import Path
 from . import claims, core
 
 # Reviewed Hermes worker: parent HANDLE watchdog starts before any CUDA import.
-# Source authority: sushiHex/hermes-realtime, worker at 34cbd4c34e6759134762748812353c9af2863563.
-WORKER_SHA256 = '9667176d0a132490f95caf35b592aca4254fd8a7e70f648899bc6100b03d3a35'
+# Source authority: sushiHex/hermes-realtime, worker at 0fbb06e35e96ee435b90cd58aa90a1d83b61bbfe.
+WORKER_SHA256 = 'a63835d3268dadc2683aaf3db4f2dfdf8fe629f484ef7771d119f7988f7a5053'
 MODEL_SHA256 = 'beb0d1848dee9a49da392cc3df26958d46cfa35d321edf434f52949153f0df3a'
 VOICES_SHA256 = 'bca610b8308e8d99f32e6fe4197e7ec01679264efed0cac9140fe9c29f1fbf7d'
 _TOKEN_ENV = 'HERMES_KOKORO_WORKER_TOKEN'
+WORKER_EXIT_CATEGORIES = {
+    80: 'authentication_failed', 81: 'parent_watchdog_failed',
+    82: 'asset_attestation_failed', 83: 'dependency_import_failed',
+    84: 'dll_preload_failed', 85: 'cuda_session_failed',
+    86: 'cuda_provider_rejected', 87: 'kokoro_engine_failed',
+    88: 'attestation_synthesis_failed', 89: 'cuda_profile_unavailable_or_invalid',
+    90: 'cuda_profile_missing_core_ops', 91: 'cuda_profile_forbidden_cpu_ops',
+    92: 'loopback_connection_failed', 93: 'worker_service_failed',
+}
 _TTL = 120
 _LABEL = re.compile(r'[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z')
 _TOKEN = re.compile(r'[A-Za-z0-9_-]{32,128}\Z')
@@ -113,9 +122,11 @@ def verify_interpreter(profile, environment):
             and Path(values[2]).resolve() == profile['venv_python'], 'interpreter_binding')
 
 
-def _result(outcome, state, reason=None, handle=None):
+def _result(outcome, state, reason=None, handle=None, record=None):
     return {'ok': outcome == 'succeeded', 'outcome': outcome, 'state': state,
-            'reason': reason, 'operation_id': handle, 'gpu_ready': False}
+            'reason': reason, 'operation_id': handle, 'gpu_ready': False,
+            'worker_exit_code': record.get('worker_exit_code') if record else None,
+            'worker_exit_category': record.get('worker_exit_category') if record else None}
 
 
 class KokoroLoader:
@@ -194,6 +205,8 @@ class KokoroLoader:
                 record = {'owner': owner, 'request': request_id, 'binding': binding,
                           'reservation': reservation, 'process': None, 'state': 'launching',
                           'failure': None, 'spawn_unknown': False,
+                          'worker_exit_code': None, 'worker_exit_category': None,
+                          'termination_started': False,
                           'admission': operation['operation_id']}
                 self._records[handle] = record
                 if self._monitor and self._thread is None:
@@ -273,11 +286,12 @@ class KokoroLoader:
     def _view(self, handle, record):
         state = record['state']
         if state == 'stopped' and record.get('failure'):
-            return _result('failed', state, record['failure'], handle)
+            return _result('failed', state, record['failure'], handle, record)
         if record.get('spawn_unknown'):
             return _result('unknown', 'cleanup_unknown', 'launch_outcome_unknown', handle)
         return _result('unknown' if state == 'cleanup_unknown' else 'succeeded',
-                       state, 'cleanup_unproven' if state == 'cleanup_unknown' else None, handle)
+                       state, 'cleanup_unproven' if state == 'cleanup_unknown' else None,
+                       handle, record)
 
     def status(self, owner, handle):
         with self._lock:
@@ -308,14 +322,21 @@ class KokoroLoader:
             return
         process = record['process']
         try:
-            if process is not None and process.poll() is None:
+            code = process.poll() if process is not None else None
+            self._capture_exit(record, code)
+            if process is not None and code is None:
+                # A raced exit after this point cannot establish a natural
+                # worker category, even if terminate itself raises.
+                record['termination_started'] = True
                 process.terminate()
                 try:
                     process.wait(timeout=2)
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait(timeout=2)
-            if process is not None and process.poll() is None:
+            code = process.poll() if process is not None else None
+            self._capture_exit(record, code)
+            if process is not None and code is None:
                 raise RuntimeError('still_running')
             self._ledger('release', record['reservation'])
             self._finish_admission(record)
@@ -323,6 +344,14 @@ class KokoroLoader:
             record['state'] = 'stopped'
         except Exception:
             record['state'] = 'cleanup_unknown'
+
+    @staticmethod
+    def _capture_exit(record, code):
+        if (type(code) is int and -(2 ** 31) <= code <= 2 ** 32 - 1
+                and record['worker_exit_code'] is None):
+            record['worker_exit_code'] = code
+            if not record['termination_started']:
+                record['worker_exit_category'] = WORKER_EXIT_CATEGORIES.get(code)
 
     def _finish_admission(self, record):
         operation = record.get('admission')
