@@ -208,7 +208,7 @@ The client's MCP schema provides full arguments and defaults.
 | `list_claims` | See active model claims and capacity reservations. |
 | `history`, `trend` | Review recorded actions, observed changes, and memory samples. |
 | `advise` | Get configuration suggestions; no settings are changed. |
-| `load_kokoro`, `kokoro_status`, `stop_kokoro` | Optional Windows-only launch and settlement of the operator-configured reviewed Kokoro worker; launch acceptance is not GPU readiness. |
+| `load_kokoro`, `kokoro_status`, `stop_kokoro` | Optional Windows-only launch and settlement of the operator-configured reviewed Kokoro worker, with bounded exit diagnostics; launch acceptance is not GPU readiness. |
 
 ## Guides
 

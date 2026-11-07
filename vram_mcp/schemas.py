@@ -73,6 +73,14 @@ class KokoroResult(TypedDict):
     reason: str | None
     operation_id: str | None
     gpu_ready: Literal[False]
+    worker_exit_code: int | None
+    worker_exit_category: Literal[
+        "authentication_failed", "parent_watchdog_failed", "asset_attestation_failed",
+        "dependency_import_failed", "dll_preload_failed", "cuda_session_failed",
+        "cuda_provider_rejected", "kokoro_engine_failed", "attestation_synthesis_failed",
+        "cuda_profile_unavailable_or_invalid", "cuda_profile_missing_core_ops",
+        "cuda_profile_forbidden_cpu_ops", "loopback_connection_failed", "worker_service_failed",
+    ] | None
 
 
 class ClaimResult(CoordinationBase):
