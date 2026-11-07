@@ -7,7 +7,7 @@ server**. Installing or merging this code does not reload an existing server,
 enable CUDA, or establish a GPU performance result. Other platforms refuse
 before starting a worker.
 
-The profile has exactly these version-1 keys:
+The version-1 profile has exactly these keys, with only `execution_policy` optional:
 
 | Fields | Meaning |
 | --- | --- |
@@ -19,11 +19,27 @@ The profile has exactly these version-1 keys:
 | `gpu_index`, `gpu_uuid` | Nonnegative integer index and full physical GPU UUID, matching the fresh selected-GPU reading. |
 | `reserve_gb`, `headroom_mb` | Positive estimated footprint up to 128 GiB and integer headroom of at least 1024 MiB. These are admission inputs, not a hard allocation cap or measured peak. |
 | `voice`, `language` | Currently `bf_isabella` and `en-gb`. |
+| `execution_policy` (optional) | `cuda-primary-profiled` (the unchanged default) or `cuda-primary-profiled-kokoro-v1-benchmark`. No other policy or operation list is accepted. |
+
+The benchmark policy is an explicit operator-only opt-in for a private comparison.
+Absent or explicit strict policy preserves the exact legacy worker command. Only
+the benchmark policy appends the fixed `--execution-policy` argument; tool callers
+cannot select a policy or supply CPU-operation names. Existing servers that do not
+support this optional key refuse the extended profile rather than falling back.
+
+The reviewed benchmark worker requires the pinned model and ONNX Runtime 1.28.0.
+It permits only the unchanged strict CPU set plus `ReduceProd`, `Reshape`, `Shape`
+and `SplitToSequence`, with complete CPU-operation metadata and required CUDA core
+coverage. The ready message identifies the selected policy exactly; a client
+expecting strict policy must reject benchmark readiness and vice versa. This is
+not a claim that those operations are universally metadata-only or cheap. It does
+not adopt GPU synthesis, change an existing CPU host, relax admission, or establish
+a speed benefit. Keep strict policy unless an explicitly scoped comparison is run.
 
 Only the reviewed Hermes worker at
-[`37998f67ac09915e42d1476739118ef72323a09d`](https://github.com/sushiHex/hermes-realtime/blob/37998f67ac09915e42d1476739118ef72323a09d/src/hermes_realtime/providers/kokoro_worker.py)
+[`3e21280a96b21d92bdedefe150cf610c16d2bae1`](https://github.com/sushiHex/hermes-realtime/blob/3e21280a96b21d92bdedefe150cf610c16d2bae1/src/hermes_realtime/providers/kokoro_worker.py)
 is supported, with LF source SHA-256
-`aeea3aaa3e834b799127d94a19c7136eae2b54f51bdbff52501edf129f1eca49`.
+`9abe7de44fb5f1796adf8378c4e384c4bc6a7c8f63997686398871bcfc8a8e46`.
 Its Windows parent-handle watchdog starts before CUDA initialization. The
 reviewed-source comparison accepts only LF/CRLF mechanical equivalence; the
 profile's independent raw digest must still match the exact on-disk file. New

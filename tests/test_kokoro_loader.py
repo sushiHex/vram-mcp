@@ -86,6 +86,61 @@ def load(manager, request='request-one', token='x' * 43):
     return manager.load('hermes-preview', request, 12345, token)
 
 
+@pytest.mark.parametrize('policy', (None, 'cuda-primary-profiled'))
+def test_optional_strict_policy_preserves_exact_legacy_command(rig, policy):
+    manager, profile, profile_path, _, calls, _ = rig
+    if policy is not None:
+        profile['execution_policy'] = policy
+        profile_path.write_text(json.dumps(profile))
+    assert load(manager)['state'] == 'launch_accepted'
+    command = calls[0][0][0]
+    assert '--execution-policy' not in command
+    assert command[-2:] == ['--max-pcm-bytes', str(16 * 1024 * 1024)]
+    assert len(command) == 22
+
+
+def test_benchmark_policy_is_profile_owned_fixed_command_extension(rig):
+    manager, profile, profile_path, process, calls, _ = rig
+    strict = load(manager)
+    legacy_command = calls[0][0][0]
+    manager.stop('hermes-preview', strict['operation_id'])
+    process.code = None
+    profile['execution_policy'] = 'cuda-primary-profiled-kokoro-v1-benchmark'
+    profile_path.write_text(json.dumps(profile))
+    accepted = load(manager, request='benchmark-request')
+    assert accepted['state'] == 'launch_accepted' and accepted['gpu_ready'] is False
+    assert calls[1][0][0] == legacy_command + [
+        '--execution-policy', 'cuda-primary-profiled-kokoro-v1-benchmark',
+    ]
+    assert manager.status('hermes-preview', accepted['operation_id'])['gpu_ready'] is False
+
+
+@pytest.mark.parametrize('policy', (None, True, 1, '', 'unknown-policy', [], {},
+                                  'cuda-primary-profiled-kokoro-v1-benchmark extra'))
+def test_unknown_profile_policy_refuses_before_any_admission_or_launch(rig, policy):
+    manager, profile, profile_path, _, calls, _ = rig
+    profile['execution_policy'] = policy
+    profile_path.write_text(json.dumps(profile))
+    admission_calls = []
+    original = manager._ledger
+    def ledger(method, *args, **kwargs):
+        admission_calls.append(method)
+        return original(method, *args, **kwargs)
+    manager._ledger = ledger
+    result = load(manager)
+    assert result['state'] == 'refused' and result['reason'] == 'profile_policy'
+    assert admission_calls == [] and calls == []
+
+
+def test_profile_policy_does_not_allow_caller_operation_arrays(rig):
+    manager, profile, profile_path, _, calls, _ = rig
+    profile['execution_policy'] = 'cuda-primary-profiled-kokoro-v1-benchmark'
+    profile['cpu_operations'] = ['arbitrary_operation']
+    profile_path.write_text(json.dumps(profile))
+    assert load(manager)['reason'] == 'profile_schema'
+    assert calls == [] and claims.list_claims(path=manager.ledger_path) == []
+
+
 @pytest.mark.parametrize('code', (0, 17, 70, 71, -9, 4294967295))
 def test_natural_exit_code_survives_settlement_without_invented_category(rig, code):
     manager, _, _, process, _, _ = rig

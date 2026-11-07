@@ -19,11 +19,13 @@ from pathlib import Path
 from . import claims, core
 
 # Reviewed Hermes worker: parent HANDLE watchdog starts before any CUDA import.
-# Source authority: sushiHex/hermes-realtime, worker at 37998f67ac09915e42d1476739118ef72323a09d.
-WORKER_SHA256 = 'aeea3aaa3e834b799127d94a19c7136eae2b54f51bdbff52501edf129f1eca49'
+# Source authority: sushiHex/hermes-realtime, worker at 3e21280a96b21d92bdedefe150cf610c16d2bae1.
+WORKER_SHA256 = '9abe7de44fb5f1796adf8378c4e384c4bc6a7c8f63997686398871bcfc8a8e46'
 MODEL_SHA256 = 'beb0d1848dee9a49da392cc3df26958d46cfa35d321edf434f52949153f0df3a'
 VOICES_SHA256 = 'bca610b8308e8d99f32e6fe4197e7ec01679264efed0cac9140fe9c29f1fbf7d'
 _TOKEN_ENV = 'HERMES_KOKORO_WORKER_TOKEN'
+STRICT_EXECUTION_POLICY = 'cuda-primary-profiled'
+BENCHMARK_EXECUTION_POLICY = 'cuda-primary-profiled-kokoro-v1-benchmark'
 WORKER_EXIT_CATEGORIES = {
     80: 'authentication_failed', 81: 'parent_watchdog_failed',
     82: 'asset_attestation_failed', 83: 'dependency_import_failed',
@@ -75,8 +77,13 @@ def read_profile(path):
         raw = stream.read(16385)
     require(len(raw) <= 16384, 'profile_bound')
     p = json.loads(raw, object_pairs_hook=_unique)
-    require(type(p) is dict and set(p) == _FIELDS and type(p['version']) is int
+    require(type(p) is dict and set(p) in (_FIELDS, _FIELDS | {'execution_policy'})
+            and type(p['version']) is int
             and p['version'] == 1, 'profile_schema')
+    policy = p.get('execution_policy', STRICT_EXECUTION_POLICY)
+    require(type(policy) is str and policy in (STRICT_EXECUTION_POLICY, BENCHMARK_EXECUTION_POLICY),
+            'profile_policy')
+    p['execution_policy'] = policy
     for name in ('python', 'venv_python', 'worker', 'model', 'voices'):
         value, digest = p[name], p[name + '_sha256']
         require(type(value) is str and type(digest) is str and _HEX.fullmatch(digest),
@@ -221,6 +228,8 @@ class KokoroLoader:
                            '--voices', str(p['voices']), '--voices-sha256', p['voices_sha256'],
                            '--attestation-voice', p['voice'], '--language', p['language'],
                            '--max-pcm-bytes', str(16 * 1024 * 1024)]
+                if p['execution_policy'] == BENCHMARK_EXECUTION_POLICY:
+                    command.extend(['--execution-policy', BENCHMARK_EXECUTION_POLICY])
                 try:
                     record['process'] = self.spawn(command, stdin=subprocess.DEVNULL,
                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=environment,
