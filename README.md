@@ -5,8 +5,9 @@ Give your AI agents a shared view of GPU memory. Through
 make room for [Ollama](https://ollama.com) models, and see which sessions are
 already relying on them.
 
-Each client runs its own server; sessions under the same OS user share claims,
-reservations, pending-operation records, and an audit log. Capacity and process
+Each client session runs its own server, of about 100 MB. Sessions under the
+same OS user share claims, reservations, pending-operation records, and an
+audit log, kept in `~/.cache/vram-mcp` by default. Capacity and process
 readings apply to one configured GPU. Claimed or recently busy models are
 protected from eviction by default.
 
@@ -243,6 +244,8 @@ The client's MCP schema provides full arguments and defaults.
 | [Coordination and diagnostics](docs/coordination.md) | Claims, reservations, protection limits, pressure, and audit history. |
 | [Hardware acceptance](docs/acceptance.md) | The opt-in run against a real GPU and Ollama, and the environments it has validated. |
 | [Owned Kokoro worker](docs/kokoro-loader.md) | Optional private profile, supported worker pin, admission, process ownership and separate deployment/qualification limits. |
+| [Release notes](docs/releases/) | What changed in each version, and how to upgrade. |
+| [Releasing](docs/releasing.md) | How a GitHub Release builds, attests and publishes the distributions. |
 
 ## Development
 
@@ -266,6 +269,8 @@ Validation on real hardware is a separate, opt-in run; see
 CI covers Python 3.10–3.14 on Windows and Linux. Current model management targets
 Ollama and NVIDIA. Runners outside Ollama are reported, not managed;
 AMD/Intel telemetry and vLLM/llama.cpp management are future work.
+Contributors, human or agent, should read [AGENTS.md](AGENTS.md) for layout,
+style and testing conventions.
 
 ## License
 
