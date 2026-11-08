@@ -10,6 +10,11 @@ reservations, pending-operation records, and an audit log. Capacity and process
 readings apply to one configured GPU. Claimed or recently busy models are
 protected from eviction by default.
 
+On Windows, vram-mcp also measures whether the driver is paging VRAM, so
+`pressure` tells a GPU that is merely full from one that is thrashing. It also
+names model runtimes on the GPU that the configured Ollama does not serve, such
+as a separate `llama-server`.
+
 ## Get started
 
 Use **Python 3.10+**, a running **Ollama** instance, and an **NVIDIA GPU with
@@ -27,6 +32,12 @@ server environment to select the same device; the default is GPU index `0`.
 With [uv](https://docs.astral.sh/uv/getting-started/installation/) and Git
 installed, choose your client below. `uvx` fetches vram-mcp from GitHub into an
 isolated environment; no source checkout is needed.
+
+These commands install **0.3.1**, the latest release. This page describes
+`main`, which is ahead of it: paging detection on Windows, `warm` with
+`num_ctx`, `strict_fit` and partial-fit reporting, unmonitored-runtime
+reporting, and the Kokoro worker are unreleased. To run `main`, drop `@v0.3.1`
+from the Git URL.
 
 **[Claude Code](https://code.claude.com/docs/en/mcp):**
 
@@ -73,6 +84,13 @@ Windows paths need escaped backslashes, such as `C:\\tools\\uvx.exe`.
 On Windows, the MCP SDK needs `pywin32`, which has no free-threaded build. If
 `uv` picks a free-threaded Python (`3.14t`) and the install fails, add
 `--python 3.13` right after `uvx`.
+
+Some clients start servers with a minimal environment that lacks
+`ProgramFiles`. Under it, `nvidia-smi` fails with "Failed to initialize NVML:
+Unknown Error", and every GPU reading is unavailable. Add `ProgramFiles` (for
+example `C:\Program Files`) to the server's environment in the client
+configuration. [#52](https://github.com/sushiHex/vram-mcp/pull/52) makes
+vram-mcp supply it.
 
 Reconnect your client after registration. It launches the server over stdio;
 running `vram-mcp` by hand waits for MCP input. Prefer a local installation?
@@ -184,13 +202,20 @@ the server. On Linux no such reading exists, so `pressure` reads `unknown`
 where it would read `ok`. The detection is a measured correlation, not a WDDM
 contract; see [the acceptance notes](docs/acceptance.md#paging-non-local-memory-and-why-linux-cannot-read-ok).
 Non-local memory is reported but does not decide the verdict. CPU
-offload is tracked separately. Disabling auditing
+offload is tracked separately.
+
+`vram_status` lists, under `unmonitored_runtimes`, model runners (`llama-server`,
+`ollama_llama_server`) on the selected GPU that no model in the configured
+Ollama accounts for, and its summary names them. Their models are not in
+`loaded`, and vram-mcp can't unload them. Check `list_claims()` before acting
+on one: another session may own it. Disabling auditing
 stops history detection and trend sampling, but does not disable current GPU or
 process observations.
 
 Use `history()` to investigate a model disappearing and `trend(hours=1)` to
-review memory changes. Trends are sampled when `vram_status()` reads the GPU;
-there is no background sampler. See [diagnostics](docs/coordination.md#diagnostics).
+review memory changes. Trends are sampled when `vram_status()` reads the GPU,
+not in the background. The Windows paging sampler is separate: it only informs
+`pressure`. See [diagnostics](docs/coordination.md#diagnostics).
 
 ## Tools
 
@@ -239,8 +264,8 @@ Tests use mocked GPU, process, and HTTP calls; no GPU or Ollama daemon is needed
 Validation on real hardware is a separate, opt-in run; see
 [hardware acceptance](docs/acceptance.md).
 CI covers Python 3.10–3.14 on Windows and Linux. Current model management targets
-Ollama and NVIDIA; AMD/Intel telemetry and vLLM/llama.cpp management are future
-work.
+Ollama and NVIDIA. Runners outside Ollama are reported, not managed;
+AMD/Intel telemetry and vLLM/llama.cpp management are future work.
 
 ## License
 
