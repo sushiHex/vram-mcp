@@ -121,3 +121,44 @@ def test_max_free_mb_rejects_cross_device_maximum():
 
 def test_max_free_mb_empty_is_none():
     assert gpu.max_free_mb([]) is None
+
+
+# An MCP client's default environment on Windows: no ProgramFiles.
+_MINIMAL_ENV = {"PATH": r"C:\Windows\system32", "SYSTEMROOT": r"C:\Windows"}
+
+
+def test_nvidia_smi_gets_program_files_under_a_minimal_windows_env():
+    env = gpu._nvidia_smi_env(
+        _MINIMAL_ENV, program_files=lambda: r"C:\Program Files", windows=True,
+    )
+    assert env == {**_MINIMAL_ENV, "ProgramFiles": r"C:\Program Files"}
+
+
+def test_nvidia_smi_inherits_an_env_that_has_program_files():
+    for name in ("ProgramFiles", "PROGRAMW6432"):
+        environ = {**_MINIMAL_ENV, name: r"D:\Apps"}
+        assert gpu._nvidia_smi_env(
+            environ, program_files=lambda: r"C:\Program Files", windows=True,
+        ) is None
+
+
+def test_nvidia_smi_inherits_the_env_off_windows_or_without_a_registry_value():
+    assert gpu._nvidia_smi_env(
+        _MINIMAL_ENV, program_files=lambda: "/opt", windows=False,
+    ) is None
+    assert gpu._nvidia_smi_env(
+        _MINIMAL_ENV, program_files=lambda: None, windows=True,
+    ) is None
+
+
+def test_run_passes_the_nvidia_smi_env(monkeypatch):
+    seen = {}
+
+    def fake_run(cmd, **kwargs):
+        seen.update(kwargs)
+        return subprocess.CompletedProcess(cmd, 0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(gpu, "_nvidia_smi_env", lambda: {"ProgramFiles": "X"})
+    monkeypatch.setattr(gpu.subprocess, "run", fake_run)
+    assert gpu._run(["nvidia-smi"]) == "ok"
+    assert seen["env"] == {"ProgramFiles": "X"}
